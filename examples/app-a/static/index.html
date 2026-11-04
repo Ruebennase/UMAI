@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Application A — UMAI 0.1</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div id="auth-container" class="auth-box" style="display: none;">
+    <h2 style="margin-bottom: 8px;">Application A — Login</h2>
+    <p style="color: var(--text-muted); font-size: 13px; margin-bottom: 16px;">
+      Demo authentication (Default: <code>admin</code> / <code>umai123</code>)
+    </p>
+
+    <div id="iframe-cookie-notice" class="banner banner-warning" style="display: none;">
+      <strong>Note on iframe cookies:</strong> If your browser blocks third-party cookies in embedded frames,
+      <a href="/" target="_blank" style="color: inherit; text-decoration: underline; font-weight: 600;">click here to log in in a top-level tab</a>,
+      then return and refresh.
+    </div>
+
+    <form id="login-form">
+      <div class="form-group">
+        <label for="login-username">Username</label>
+        <input type="text" id="login-username" value="admin" required>
+      </div>
+      <div class="form-group">
+        <label for="login-password">Password</label>
+        <input type="password" id="login-password" value="umai123" required>
+      </div>
+      <div id="login-error" style="color: var(--danger); font-size: 12px; margin-bottom: 8px; display: none;"></div>
+      <button type="submit" class="btn" style="width: 100%;">Sign In</button>
+    </form>
+  </div>
+
+  <div id="app-container" style="display: none;">
+    <header>
+      <div class="header-left">
+        <h1 id="app-title">Application A</h1>
+        <span id="conn-badge" class="badge badge-disconnected">Disconnected</span>
+      </div>
+      <div class="header-right">
+        <button id="btn-sync" class="btn btn-secondary btn-sm" title="Trigger UMAI reconciliation">Sync Now</button>
+        <button id="btn-logout" class="btn btn-secondary btn-sm">Logout</button>
+      </div>
+    </header>
+
+    <div class="grid">
+      <!-- Documents Card -->
+      <div class="card">
+        <div class="card-title">
+          <span>Local Documents (<code>docs/</code>)</span>
+          <span id="docs-count" class="count-pill">0</span>
+        </div>
+        <form id="upload-doc-form" style="display: flex; gap: 8px; margin-bottom: 12px;">
+          <input type="file" id="file-input" style="flex: 1;" required>
+          <button type="submit" class="btn btn-sm">Upload</button>
+        </form>
+        <ul id="docs-list" class="doc-list">
+          <li class="empty-state">No local documents yet.</li>
+        </ul>
+      </div>
+
+      <!-- Create Message Card -->
+      <div class="card">
+        <div class="card-title">
+          <span>Create Outgoing UMAI Message</span>
+        </div>
+        <form id="create-msg-form">
+          <div class="form-group">
+            <label for="msg-subject">Subject</label>
+            <input type="text" id="msg-subject" placeholder="e.g. Monthly Report" required>
+          </div>
+          <div class="form-group">
+            <label for="msg-text">Message Content / Note</label>
+            <textarea id="msg-text" rows="2" placeholder="Structured JSON payload..."></textarea>
+          </div>
+          <div class="form-group">
+            <label>Attach Documents</label>
+            <div id="attach-docs-container" style="max-height: 90px; overflow-y: auto; border: 1px solid var(--border-color); padding: 6px; border-radius: 6px; font-size: 12px;">
+              <span class="empty-state">Upload documents above to attach them.</span>
+            </div>
+          </div>
+          <button type="submit" class="btn" style="width: 100%;">Create & Queue for Transfer</button>
+        </form>
+      </div>
+
+      <!-- Outbox Card -->
+      <div class="card">
+        <div class="card-title">
+          <span>Outbox (Pending Acceptance)</span>
+          <span id="outbox-count" class="count-pill">0</span>
+        </div>
+        <ul id="outbox-list" class="msg-list">
+          <li class="empty-state">Outbox empty.</li>
+        </ul>
+      </div>
+
+      <!-- Inbox Card -->
+      <div class="card">
+        <div class="card-title">
+          <span>Received Messages (Inbox)</span>
+          <span id="inbox-count" class="count-pill">0</span>
+        </div>
+        <ul id="inbox-list" class="msg-list">
+          <li class="empty-state">No messages received yet.</li>
+        </ul>
+      </div>
+
+      <!-- Protocol Activity Log -->
+      <div class="card">
+        <div class="card-title">
+          <span>UMAI Protocol Activity</span>
+          <button id="btn-clear-log" class="btn btn-secondary btn-sm">Clear</button>
+        </div>
+        <div id="log-box" class="log-box"></div>
+      </div>
+    </div>
+  </div>
+
+  <script src="/js/umai.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

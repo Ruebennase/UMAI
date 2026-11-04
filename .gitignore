@@ -1,0 +1,26 @@
+# Binaries
+bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+/app-a
+/app-b
+
+# Test artifacts
+*.test
+*.out
+
+# Data directories created at runtime
+examples/app-a/data/
+examples/app-b/data/
+data/
+
+# OS and Editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*~

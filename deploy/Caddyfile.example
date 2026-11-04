@@ -1,0 +1,69 @@
+# Caddyfile.example — UMAI 0.1 Production Deployment Configuration
+#
+# Reverse-proxy setup for two independent domains hosting Application A and Application B
+# on a single VPS with automatic TLS certificate provisioning.
+#
+# Replace 'app-a.example.ch' and 'app-b.example.net' with your actual registered domain names.
+
+# ==============================================================================
+# Application A (Embedded Peer)
+# ==============================================================================
+app-a.example.ch {
+    # Reverse proxy to local Go server for App A
+    reverse_proxy 127.0.0.1:8081 {
+        header_up Host {host}
+        header_up X-Real-IP {remote_host}
+        header_up X-Forwarded-For {remote_host}
+        header_up X-Forwarded-Proto https
+    }
+
+    # Security Headers:
+    # Content-Security-Policy frame-ancestors explicitly allows https://app-b.example.net
+    # to embed Application A within an iframe.
+    header {
+        Content-Security-Policy "frame-ancestors 'self' https://app-b.example.net; default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'"
+        X-Content-Type-Options "nosniff"
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        -X-Frame-Options
+    }
+
+    # Enable compression
+    encode gzip zstd
+
+    # Logging
+    log {
+        output file /var/log/caddy/app-a.access.log
+        format console
+    }
+}
+
+# ==============================================================================
+# Application B (Host Page)
+# ==============================================================================
+app-b.example.net {
+    # Reverse proxy to local Go server for App B
+    reverse_proxy 127.0.0.1:8082 {
+        header_up Host {host}
+        header_up X-Real-IP {remote_host}
+        header_up X-Forwarded-For {remote_host}
+        header_up X-Forwarded-Proto https
+    }
+
+    # Security Headers:
+    # Application B is the host and embeds App A via frame-src, but does not allow itself to be framed.
+    header {
+        Content-Security-Policy "frame-ancestors 'none'; frame-src 'self' https://app-a.example.ch; default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'"
+        X-Content-Type-Options "nosniff"
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Frame-Options "DENY"
+    }
+
+    # Enable compression
+    encode gzip zstd
+
+    # Logging
+    log {
+        output file /var/log/caddy/app-b.access.log
+        format console
+    }
+}
