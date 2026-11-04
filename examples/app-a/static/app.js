@@ -40,11 +40,23 @@
     iframeCookieNotice.style.display = 'block';
   }
 
+  let sessionToken = sessionStorage.getItem('umai_token_a') || '';
+
   // --- API Utilities ---
   async function api(path, options = {}) {
     options.credentials = 'include';
+    options.headers = options.headers || {};
+    if (sessionToken) {
+      if (options.headers instanceof Headers) {
+        options.headers.set('X-UMAI-Session', sessionToken);
+      } else {
+        options.headers['X-UMAI-Session'] = sessionToken;
+      }
+    }
     const res = await fetch(path, options);
     if (res.status === 401) {
+      sessionToken = '';
+      sessionStorage.removeItem('umai_token_a');
       showAuth();
       throw new Error('Unauthorized');
     }
@@ -71,6 +83,10 @@
       const res = await api('/api/auth/me');
       const data = await res.json();
       if (data.authenticated) {
+        if (data.session_id) {
+          sessionToken = data.session_id;
+          sessionStorage.setItem('umai_token_a', sessionToken);
+        }
         showApp();
       } else {
         showAuth();
@@ -110,6 +126,8 @@
       });
       const data = await res.json();
       if (res.ok && data.authenticated) {
+        sessionToken = data.session_id || '';
+        sessionStorage.setItem('umai_token_a', sessionToken);
         showApp();
       } else {
         loginError.textContent = data.error || 'Login failed';
@@ -125,6 +143,8 @@
     try {
       await api('/api/auth/logout', { method: 'POST' });
     } finally {
+      sessionToken = '';
+      sessionStorage.removeItem('umai_token_a');
       showAuth();
     }
   });
@@ -441,7 +461,7 @@
   btnSync.addEventListener('click', () => {
     if (umaiSession) {
       appendLog('info', 'Manual synchronization requested');
-      umaiSession.reconcile();
+      umaiSession.reconcile(true);
     }
   });
 

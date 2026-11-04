@@ -118,6 +118,15 @@
         window.addEventListener('message', this._windowListener);
       }
 
+      // Start periodic reconciliation heartbeat once connected
+      if (!this._syncInterval) {
+        this._syncInterval = setInterval(() => {
+          if (this.state === 'connected') {
+            this.reconcile(false);
+          }
+        }, 3000);
+      }
+
       if (this.role === 'embedded') {
         // Embedded app informs parent window that it is ready
         this._sendReadySignal();
@@ -141,6 +150,10 @@
      * Stop and cleanup session.
      */
     stop() {
+      if (this._syncInterval) {
+        clearInterval(this._syncInterval);
+        this._syncInterval = null;
+      }
       if (this._readyInterval) {
         clearInterval(this._readyInterval);
         this._readyInterval = null;
@@ -310,22 +323,32 @@
 
     /**
      * Trigger reconciliation: announces all local outbox message IDs via OFFER.
+     * @param {boolean} [force=true] If false, skips sending OFFER when outbox is empty
      */
-    async reconcile() {
+    async reconcile(force = true) {
       if (this.state !== 'connected') {
-        this.log('warn', 'Reconciliation requested while disconnected; ignoring');
+        if (force) {
+          this.log('warn', 'Reconciliation requested while disconnected; ignoring');
+        }
         return;
       }
 
       try {
         const outboxIds = await this.storage.getOutboxIds();
-        this.log('info', `Reconciling: offering ${outboxIds.length} outbox message(s)`, outboxIds);
+        const ids = Array.isArray(outboxIds) ? outboxIds : [];
+
+        // If background periodic check and outbox is empty, avoid log noise
+        if (!force && ids.length === 0) {
+          return;
+        }
+
+        this.log('info', `Reconciling: offering ${ids.length} outbox message(s)`, ids);
 
         const offerMsg = {
           protocol: PROTOCOL_NAME,
           version: PROTOCOL_VERSION,
           type: 'OFFER',
-          ids: Array.isArray(outboxIds) ? outboxIds : []
+          ids: ids
         };
 
         this._sendToPort(offerMsg);
@@ -346,6 +369,12 @@
       const offeredIds = Array.isArray(offer.ids) ? offer.ids : [];
       this.log('info', `Received OFFER with ${offeredIds.length} message(s)`, offeredIds);
       this.onTransfer({ direction: 'incoming', type: 'OFFER', ids: offeredIds });
+
+      // Symmetrical reconciliation: ensure our own outbox is offered in return
+      if (!this._peerOfferedOnce) {
+        this._peerOfferedOnce = true;
+        this.reconcile(false);
+      }
 
       if (offeredIds.length === 0) return;
 

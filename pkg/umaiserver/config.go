@@ -17,6 +17,7 @@ type Config struct {
 	PeerEmbedURL    string // URL used by App B to embed App A (e.g. "http://127.0.0.1:8081?embedded=true")
 	AuthUsername    string // Demo username
 	AuthPassword    string // Demo password
+	CookieName      string // Scoped cookie name to prevent collisions across ports on 127.0.0.1
 	MaxUploadSize   int64  // Maximum upload size in bytes (e.g. 100MB)
 	SessionSecret   string // Secret for signing/validating sessions
 	AllowEmbedding  bool   // Whether CSP should allow embedding by PeerOrigin
@@ -34,6 +35,7 @@ func DefaultConfig(role string) Config {
 			PeerEmbedURL:   getEnv("UMAI_PEER_EMBED_URL", "http://127.0.0.1:8081?embedded=true"),
 			AuthUsername:   getEnv("UMAI_AUTH_USER", "admin"),
 			AuthPassword:   getEnv("UMAI_AUTH_PASS", "umai123"),
+			CookieName:     getEnv("UMAI_COOKIE_NAME", "umai_session_b"),
 			MaxUploadSize:  getEnvInt64("UMAI_MAX_UPLOAD_SIZE", 100*1024*1024), // 100 MB default
 			SessionSecret:  randomHex(16),
 			AllowEmbedding: false,
@@ -50,6 +52,7 @@ func DefaultConfig(role string) Config {
 		PeerEmbedURL:   "",
 		AuthUsername:   getEnv("UMAI_AUTH_USER", "admin"),
 		AuthPassword:   getEnv("UMAI_AUTH_PASS", "umai123"),
+		CookieName:     getEnv("UMAI_COOKIE_NAME", "umai_session_a"),
 		MaxUploadSize:  getEnvInt64("UMAI_MAX_UPLOAD_SIZE", 100*1024*1024), // 100 MB default
 		SessionSecret:  randomHex(16),
 		AllowEmbedding: true,

@@ -28,7 +28,7 @@ func NewServer(cfg Config, staticDir string) (*Server, error) {
 		return nil, fmt.Errorf("initializing storage: %w", err)
 	}
 
-	auth := NewAuthManager(cfg.AuthUsername, cfg.AuthPassword)
+	auth := NewAuthManager(cfg.CookieName, cfg.AuthUsername, cfg.AuthPassword)
 
 	s := &Server{
 		cfg:     cfg,

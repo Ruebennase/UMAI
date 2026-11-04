@@ -61,6 +61,7 @@ func authenticatedRequest(method, url string, sessionID string, body io.Reader, 
 	if err != nil {
 		return nil, err
 	}
+	req.Header.Set("X-UMAI-Session", sessionID)
 	req.AddCookie(&http.Cookie{
 		Name:  umaiserver.SessionCookieName,
 		Value: sessionID,

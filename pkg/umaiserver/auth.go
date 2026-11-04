@@ -26,17 +26,27 @@ type Session struct {
 type AuthManager struct {
 	mu            sync.RWMutex
 	sessions      map[string]*Session
+	cookieName    string
 	validUsername string
 	validPassword string
 }
 
 // NewAuthManager initializes session management.
-func NewAuthManager(username, password string) *AuthManager {
+func NewAuthManager(cookieName, username, password string) *AuthManager {
+	if cookieName == "" {
+		cookieName = SessionCookieName
+	}
 	return &AuthManager{
 		sessions:      make(map[string]*Session),
+		cookieName:    cookieName,
 		validUsername: username,
 		validPassword: password,
 	}
+}
+
+// CookieName returns the configured cookie name.
+func (am *AuthManager) CookieName() string {
+	return am.cookieName
 }
 
 // Authenticate verifies credentials and returns a new session ID if valid.
@@ -100,7 +110,7 @@ func (am *AuthManager) SetSessionCookie(w http.ResponseWriter, r *http.Request, 
 	}
 
 	cookie := &http.Cookie{
-		Name:     SessionCookieName,
+		Name:     am.cookieName,
 		Value:    sessionID,
 		Path:     "/",
 		Expires:  time.Now().Add(SessionDuration),
@@ -115,7 +125,7 @@ func (am *AuthManager) SetSessionCookie(w http.ResponseWriter, r *http.Request, 
 func (am *AuthManager) ClearSessionCookie(w http.ResponseWriter, r *http.Request) {
 	isSecure := r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https"
 	cookie := &http.Cookie{
-		Name:     SessionCookieName,
+		Name:     am.cookieName,
 		Value:    "",
 		Path:     "/",
 		Expires:  time.Unix(0, 0),
@@ -128,18 +138,23 @@ func (am *AuthManager) ClearSessionCookie(w http.ResponseWriter, r *http.Request
 
 // GetSessionID extracts the session ID from cookie or Authorization header.
 func (am *AuthManager) GetSessionID(r *http.Request) string {
-	// First check cookie
-	if c, err := r.Cookie(SessionCookieName); err == nil && c.Value != "" {
-		return c.Value
+	// First check explicit headers (takes precedence, preventing cross-port cookie collisions)
+	if h := r.Header.Get("X-UMAI-Session"); h != "" {
+		return h
 	}
-
-	// Fallback to Bearer token or custom header (for cross-origin/iframe environments where 3rd-party cookies are blocked)
 	authHeader := r.Header.Get("Authorization")
 	if strings.HasPrefix(authHeader, "Bearer ") {
 		return strings.TrimPrefix(authHeader, "Bearer ")
 	}
-	if h := r.Header.Get("X-UMAI-Session"); h != "" {
-		return h
+
+	// Fallback to scoped cookie
+	if c, err := r.Cookie(am.cookieName); err == nil && c.Value != "" {
+		return c.Value
+	}
+
+	// Legacy fallback to default cookie name
+	if c, err := r.Cookie(SessionCookieName); err == nil && c.Value != "" {
+		return c.Value
 	}
 
 	return ""
