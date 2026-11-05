@@ -191,20 +191,31 @@
         }
       }
 
-      return { id: meta.id, payload: meta.payload || {}, attachments: files };
+      return {
+        id: meta.id,
+        payload: meta.payload || {},
+        attachments: files,
+        signature: meta.signature || ''
+      };
     },
 
     async isAccepted(id) {
-      const res = await api('/api/accepted');
+      const res = await api('/api/accepted/receipts');
       if (!res.ok) return false;
-      const list = await res.json();
-      return Array.isArray(list) && list.includes(id);
+      const receiptsMap = await res.json();
+      if (receiptsMap && Object.prototype.hasOwnProperty.call(receiptsMap, id)) {
+        return receiptsMap[id] || true;
+      }
+      return false;
     },
 
     async acceptMessage(msg) {
       const formData = new FormData();
       formData.append('id', msg.id);
       formData.append('payload', JSON.stringify(msg.payload || {}));
+      if (msg.signature) {
+        formData.append('signature', msg.signature);
+      }
       for (const f of msg.attachments || []) {
         formData.append('attachments', f, f.name);
       }
@@ -215,17 +226,18 @@
       });
 
       if (res.ok) {
+        const data = await res.json();
         refreshInbox();
-        return true;
+        return data.ack_receipt || true;
       }
       return false;
     },
 
-    async onAcknowledged(ids) {
+    async onAcknowledged(ids, receipts) {
       await api('/api/outbox/ack', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ids: ids })
+        body: JSON.stringify({ ids: ids, receipts: receipts || {} })
       });
       refreshOutboxCount();
     }

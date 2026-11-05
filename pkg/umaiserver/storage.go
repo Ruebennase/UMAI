@@ -1,6 +1,7 @@
 package umaiserver
 
 import (
+	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
@@ -15,12 +16,16 @@ import (
 	"time"
 )
 
+const MaxAttachmentsPerMessage = 50
+
 var (
-	ErrNotFound       = errors.New("not found")
-	ErrInvalidID      = errors.New("invalid identifier")
-	ErrAlreadyAccepted = errors.New("message already accepted")
-	ErrTraversal      = errors.New("invalid file path / directory traversal detected")
-	ErrFileTooLarge   = errors.New("file exceeds maximum allowed size")
+	ErrNotFound            = errors.New("not found")
+	ErrInvalidID           = errors.New("invalid identifier")
+	ErrAlreadyAccepted     = errors.New("message already accepted")
+	ErrTraversal           = errors.New("invalid file path / directory traversal detected")
+	ErrFileTooLarge        = errors.New("file exceeds maximum allowed size")
+	ErrDuplicateAttachment = errors.New("duplicate attachment filename in message")
+	ErrTooManyAttachments  = errors.New("too many attachments in message")
 )
 
 // DocumentInfo describes a document stored in the local documents directory.
@@ -44,6 +49,8 @@ type Message struct {
 	CreatedAt   time.Time        `json:"created_at"`
 	Payload     any              `json:"payload"`
 	Attachments []AttachmentInfo `json:"attachments"`
+	Signature   string           `json:"signature,omitempty"`
+	AckReceipt  string           `json:"ack_receipt,omitempty"`
 }
 
 // Storage manages local documents, outbox snapshots, inbox messages and accepted IDs.
@@ -56,6 +63,9 @@ type Storage struct {
 	acceptedFile  string
 	maxUploadSize int64
 	acceptedIDs   map[string]bool
+	ownPubKey     ed25519.PublicKey
+	ownPrivKey    ed25519.PrivateKey
+	peerPubKey    ed25519.PublicKey
 }
 
 // NewStorage initializes storage directories and loads accepted message IDs.
@@ -91,6 +101,29 @@ func NewStorage(dataDir string, maxUploadSize int64) (*Storage, error) {
 	}
 
 	return s, nil
+}
+
+// SetKeys configures the Ed25519 signing key pair and the expected peer public key.
+func (s *Storage) SetKeys(ownPub ed25519.PublicKey, ownPriv ed25519.PrivateKey, peerPub ed25519.PublicKey) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.ownPubKey = ownPub
+	s.ownPrivKey = ownPriv
+	s.peerPubKey = peerPub
+}
+
+// PublicKeyHex returns this server's Ed25519 public key in hex.
+func (s *Storage) PublicKeyHex() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return hex.EncodeToString(s.ownPubKey)
+}
+
+// PeerPublicKeyHex returns the configured peer Ed25519 public key in hex.
+func (s *Storage) PeerPublicKeyHex() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return hex.EncodeToString(s.peerPubKey)
 }
 
 // sanitizeFilename strips directory elements and keeps only the base filename.
@@ -267,6 +300,10 @@ func (s *Storage) DeleteDocument(filename string) error {
 
 // CreateOutboxMessage creates an immutable message snapshot in outboxDir.
 func (s *Storage) CreateOutboxMessage(payload any, docNames []string) (*Message, error) {
+	if len(docNames) > MaxAttachmentsPerMessage {
+		return nil, ErrTooManyAttachments
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -279,6 +316,7 @@ func (s *Storage) CreateOutboxMessage(payload any, docNames []string) (*Message,
 	}
 
 	var attachments []AttachmentInfo
+	seenNames := make(map[string]bool)
 
 	// Copy selected documents into snapshot directory
 	for _, rawName := range docNames {
@@ -287,6 +325,11 @@ func (s *Storage) CreateOutboxMessage(payload any, docNames []string) (*Message,
 			_ = os.RemoveAll(msgDir)
 			return nil, err
 		}
+		if seenNames[cleanName] {
+			_ = os.RemoveAll(msgDir)
+			return nil, fmt.Errorf("%w: %s", ErrDuplicateAttachment, cleanName)
+		}
+		seenNames[cleanName] = true
 
 		srcPath := filepath.Join(s.docsDir, cleanName)
 		srcFile, err := os.Open(srcPath)
@@ -329,11 +372,18 @@ func (s *Storage) CreateOutboxMessage(payload any, docNames []string) (*Message,
 		})
 	}
 
+	sigHex, err := SignPutMessage(s.ownPrivKey, msgID, payload, attachments)
+	if err != nil {
+		_ = os.RemoveAll(msgDir)
+		return nil, err
+	}
+
 	msg := &Message{
 		ID:          msgID,
 		CreatedAt:   time.Now().UTC(),
 		Payload:     payload,
 		Attachments: attachments,
+		Signature:   sigHex,
 	}
 
 	if err := s.writeAtomicJSON(filepath.Join(msgDir, "message.json"), msg); err != nil {
@@ -434,6 +484,12 @@ func (s *Storage) GetOutboxAttachmentPath(id, filename string) (string, error) {
 
 // AcknowledgeMessages removes acknowledged messages from outbox (Rule 6).
 func (s *Storage) AcknowledgeMessages(ids []string) error {
+	return s.AcknowledgeMessagesVerified(ids, nil)
+}
+
+// AcknowledgeMessagesVerified removes acknowledged messages from outbox (Rule 6),
+// verifying any provided cryptographic ACK receipts against the peer's public key.
+func (s *Storage) AcknowledgeMessagesVerified(ids []string, receipts map[string]string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -443,6 +499,22 @@ func (s *Storage) AcknowledgeMessages(ids []string) error {
 			continue
 		}
 		msgDir := filepath.Join(s.outboxDir, cleanID)
+		msgFile := filepath.Join(msgDir, "message.json")
+		if len(receipts) > 0 && len(s.peerPubKey) > 0 {
+			receiptHex, hasReceipt := receipts[cleanID]
+			if !hasReceipt || receiptHex == "" {
+				return fmt.Errorf("missing ACK receipt for %s: %w", cleanID, ErrInvalidReceipt)
+			}
+			data, err := os.ReadFile(msgFile)
+			if err == nil {
+				var outMsg Message
+				if err := json.Unmarshal(data, &outMsg); err == nil && outMsg.Signature != "" {
+					if err := VerifyAckReceipt(s.peerPubKey, cleanID, outMsg.Signature, receiptHex); err != nil {
+						return fmt.Errorf("ACK receipt verification failed for %s: %w", cleanID, err)
+					}
+				}
+			}
+		}
 		_ = os.RemoveAll(msgDir)
 	}
 	return nil
@@ -473,6 +545,26 @@ func (s *Storage) ListAccepted() []string {
 		ids = append(ids, id)
 	}
 	return ids
+}
+
+// ListAcceptedReceipts returns a map of accepted message ID -> cryptographic ACK receipt.
+func (s *Storage) ListAcceptedReceipts() map[string]string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	receipts := make(map[string]string, len(s.acceptedIDs))
+	for id := range s.acceptedIDs {
+		msgFile := filepath.Join(s.inboxDir, id, "message.json")
+		if data, err := os.ReadFile(msgFile); err == nil {
+			var m Message
+			if err := json.Unmarshal(data, &m); err == nil && m.AckReceipt != "" {
+				receipts[id] = m.AckReceipt
+				continue
+			}
+		}
+		receipts[id] = ""
+	}
+	return receipts
 }
 
 // ListInbox returns all accepted messages stored in inbox.
@@ -558,6 +650,16 @@ type AttachmentReader struct {
 
 // AcceptMessage performs all-or-nothing acceptance of a PUT message (Rule 3 & 4).
 func (s *Storage) AcceptMessage(id string, payload any, attachments []AttachmentReader) (*Message, error) {
+	return s.AcceptSignedMessage(id, payload, attachments, "")
+}
+
+// AcceptSignedMessage performs all-or-nothing acceptance of a PUT message (Rule 3 & 4),
+// verifying the sender's Ed25519 signature when provided (or when required by server config).
+func (s *Storage) AcceptSignedMessage(id string, payload any, attachments []AttachmentReader, sigHex string) (*Message, error) {
+	if len(attachments) > MaxAttachmentsPerMessage {
+		return nil, ErrTooManyAttachments
+	}
+
 	cleanID, err := sanitizeID(id)
 	if err != nil {
 		return nil, err
@@ -566,7 +668,7 @@ func (s *Storage) AcceptMessage(id string, payload any, attachments []Attachment
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// If already accepted, return existing message without re-importing
+	// If already accepted, return existing message (including its stored AckReceipt) without re-importing
 	if s.acceptedIDs[cleanID] {
 		msgFile := filepath.Join(s.inboxDir, cleanID, "message.json")
 		if data, err := os.ReadFile(msgFile); err == nil {
@@ -586,12 +688,18 @@ func (s *Storage) AcceptMessage(id string, payload any, attachments []Attachment
 	}
 
 	var attInfos []AttachmentInfo
+	seenNames := make(map[string]bool)
 	for _, att := range attachments {
 		cleanName, err := sanitizeFilename(att.Name)
 		if err != nil {
 			_ = os.RemoveAll(tmpDir)
 			return nil, err
 		}
+		if seenNames[cleanName] {
+			_ = os.RemoveAll(tmpDir)
+			return nil, fmt.Errorf("%w: %s", ErrDuplicateAttachment, cleanName)
+		}
+		seenNames[cleanName] = true
 
 		dstPath := filepath.Join(tmpAttachmentsDir, cleanName)
 		dstFile, err := os.OpenFile(dstPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
@@ -631,11 +739,26 @@ func (s *Storage) AcceptMessage(id string, payload any, attachments []Attachment
 		})
 	}
 
+	// Verify Ed25519 signature if provided
+	if sigHex != "" && len(s.peerPubKey) > 0 {
+		if err := VerifyPutMessage(s.peerPubKey, cleanID, payload, attInfos, sigHex); err != nil {
+			_ = os.RemoveAll(tmpDir)
+			return nil, err
+		}
+	}
+
+	ackReceipt := ""
+	if len(s.ownPrivKey) > 0 {
+		ackReceipt = SignAckReceipt(s.ownPrivKey, cleanID, sigHex)
+	}
+
 	msg := &Message{
 		ID:          cleanID,
 		CreatedAt:   time.Now().UTC(),
 		Payload:     payload,
 		Attachments: attInfos,
+		Signature:   sigHex,
+		AckReceipt:  ackReceipt,
 	}
 
 	if err := s.writeAtomicJSON(filepath.Join(tmpDir, "message.json"), msg); err != nil {

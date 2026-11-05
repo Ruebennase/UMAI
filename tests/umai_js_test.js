@@ -111,6 +111,58 @@ function createMockChannel() {
 
   console.log('✓ Test 2: Symmetric MessagePort exchange with repeated-ACK (Rule 5) passed');
 
+  // Test 3: Security — Unsolicited PUT is dropped & Unoffered ACK IDs are ignored
+  let unsolicitedAccepted = false;
+  let unofferedAcked = [];
+
+  const secSession = new UmaiSession({
+    peerOrigin: 'http://peer.example',
+    role: 'embedded',
+    storage: {
+      getOutboxIds: async () => ['msg-real-100'],
+      getMessage: async (id) => ({ id, payload: {}, attachments: [] }),
+      isAccepted: async () => false,
+      acceptMessage: async () => {
+        unsolicitedAccepted = true;
+        return true;
+      },
+      onAcknowledged: async (ids) => {
+        unofferedAcked.push(...ids);
+      }
+    }
+  });
+
+  const secChannel = createMockChannel();
+  secSession.port = secChannel.port1;
+  secChannel.port1.onmessage = secSession._portListener;
+  secSession.state = 'connected';
+
+  // Offer msg-real-100 so only msg-real-100 is in _offeredIds
+  await secSession.reconcile();
+
+  // Send unsolicited PUT (not in _inFlightGets)
+  await secSession._handlePut({
+    protocol: PROTOCOL_NAME,
+    version: PROTOCOL_VERSION,
+    type: 'PUT',
+    id: 'msg-unsolicited-999',
+    payload: {},
+    attachments: []
+  });
+  assert.strictEqual(unsolicitedAccepted, false, 'Unsolicited PUT must be dropped without calling acceptMessage');
+
+  // Send ACK containing an unoffered ID ('msg-not-offered') alongside the offered ID ('msg-real-100')
+  await secSession._handleAck({
+    protocol: PROTOCOL_NAME,
+    version: PROTOCOL_VERSION,
+    type: 'ACK',
+    ids: ['msg-not-offered', 'msg-real-100']
+  });
+  assert.deepStrictEqual(unofferedAcked, ['msg-real-100'], 'Only offered IDs should be passed to onAcknowledged');
+
+  console.log('✓ Test 3: State-machine security (unsolicited PUT & unoffered ACK rejection) passed');
+
+  secSession.stop();
   sessionA.stop();
   sessionB.stop();
 

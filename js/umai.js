@@ -108,8 +108,11 @@
       this._putQueue = [];
       this._isSendingPut = false;
 
-      // Track in-flight PUT requests to avoid redundant GETs
+      // Track in-flight PUT requests to avoid redundant GETs and reject unsolicited PUTs
       this._inFlightGets = new Set();
+
+      // Track message IDs offered to the peer so only offered IDs can be acknowledged
+      this._offeredIds = new Set();
     }
 
     /**
@@ -232,6 +235,7 @@
       this._putQueue = [];
       this._isSendingPut = false;
       this._inFlightGets.clear();
+      this._offeredIds.clear();
       this._setState('disconnected');
     }
 
@@ -295,6 +299,9 @@
       }
 
       if (this.role === 'host') {
+        if (this.iframe && this.iframe.contentWindow && event.source && event.source !== this.iframe.contentWindow) {
+          return;
+        }
         if (data.type === 'READY') {
           this.log('info', 'Received READY from embedded peer');
           // If embedded peer reloaded or restarted, reset port and re-initiate handshake
@@ -309,6 +316,9 @@
           this._initiateHostHandshake(event.origin);
         }
       } else if (this.role === 'embedded') {
+        if (typeof window !== 'undefined' && window.parent && event.source && event.source !== window.parent) {
+          return;
+        }
         if (data.type === 'INIT' && event.ports && event.ports.length > 0) {
           if (this._readyInterval) {
             clearInterval(this._readyInterval);
@@ -413,6 +423,10 @@
           return;
         }
 
+        for (const id of ids) {
+          this._offeredIds.add(id);
+        }
+
         this.log('info', `Reconciling: offering ${ids.length} outbox message(s)`, ids);
 
         const offerMsg = {
@@ -450,12 +464,18 @@
       if (offeredIds.length === 0) return;
 
       const alreadyAccepted = [];
+      const repeatedReceipts = {};
       const toFetch = [];
 
       for (const id of offeredIds) {
-        const isAcc = await this.storage.isAccepted(id);
-        if (isAcc) {
+        const accResult = await this.storage.isAccepted(id);
+        if (accResult) {
           alreadyAccepted.push(id);
+          if (typeof accResult === 'string' && accResult.length > 0) {
+            repeatedReceipts[id] = accResult;
+          } else if (typeof accResult === 'object' && accResult.ackReceipt) {
+            repeatedReceipts[id] = accResult.ackReceipt;
+          }
         } else {
           // If not currently in-flight
           if (!this._inFlightGets.has(id)) {
@@ -472,7 +492,8 @@
           protocol: PROTOCOL_NAME,
           version: PROTOCOL_VERSION,
           type: 'ACK',
-          ids: alreadyAccepted
+          ids: alreadyAccepted,
+          receipts: repeatedReceipts
         };
         this._sendToPort(ackMsg);
         this.onTransfer({ direction: 'outgoing', type: 'ACK', ids: alreadyAccepted, repeated: true });
@@ -507,6 +528,7 @@
       this.onTransfer({ direction: 'incoming', type: 'GET', ids: requestedIds });
 
       for (const id of requestedIds) {
+        this._offeredIds.add(id);
         this._queuePut(id);
       }
     }
@@ -550,7 +572,8 @@
           type: 'PUT',
           id: msg.id,
           payload: msg.payload || {},
-          attachments: attachments
+          attachments: attachments,
+          signature: msg.signature || ''
         };
 
         this.log(
@@ -578,6 +601,7 @@
 
     /**
      * Handles incoming PUT:
+     * - Rule 2: Enforces receiver-controlled transfer (rejects unsolicited PUTs not in _inFlightGets).
      * - Rule 3: Complete messages only. Either accepts entire message or rejects.
      * - Checks duplicate: if already accepted, sends ACK again without re-importing.
      * - Stores payload and all attachments atomically on receiver server.
@@ -585,6 +609,10 @@
      */
     async _handlePut(put) {
       const id = put.id;
+      if (!this._inFlightGets.has(id)) {
+        this.log('warn', `Ignored unsolicited PUT for message ${id} (not requested via GET)`);
+        return;
+      }
       this._inFlightGets.delete(id);
 
       const attachments = Array.isArray(put.attachments) ? put.attachments : [];
@@ -604,11 +632,18 @@
       const alreadyAccepted = await this.storage.isAccepted(id);
       if (alreadyAccepted) {
         this.log('info', `Message ${id} already accepted; sending ACK without re-importing`);
+        const receipts = {};
+        if (typeof alreadyAccepted === 'string' && alreadyAccepted.length > 0) {
+          receipts[id] = alreadyAccepted;
+        } else if (typeof alreadyAccepted === 'object' && alreadyAccepted.ackReceipt) {
+          receipts[id] = alreadyAccepted.ackReceipt;
+        }
         const ackMsg = {
           protocol: PROTOCOL_NAME,
           version: PROTOCOL_VERSION,
           type: 'ACK',
-          ids: [id]
+          ids: [id],
+          receipts: receipts
         };
         this._sendToPort(ackMsg);
         this.onTransfer({ direction: 'outgoing', type: 'ACK', ids: [id], repeated: true });
@@ -618,19 +653,27 @@
 
       // Rule 3 & 4: Attempt atomic acceptance
       try {
-        const success = await this.storage.acceptMessage({
+        const result = await this.storage.acceptMessage({
           id: put.id,
           payload: put.payload,
-          attachments: attachments
+          attachments: attachments,
+          signature: put.signature || ''
         });
 
-        if (success) {
+        if (result) {
           this.log('info', `Successfully accepted message ${id}. Sending ACK.`);
+          const receipts = {};
+          if (typeof result === 'string' && result.length > 0) {
+            receipts[id] = result;
+          } else if (typeof result === 'object' && result.ackReceipt) {
+            receipts[id] = result.ackReceipt;
+          }
           const ackMsg = {
             protocol: PROTOCOL_NAME,
             version: PROTOCOL_VERSION,
             type: 'ACK',
-            ids: [id]
+            ids: [id],
+            receipts: receipts
           };
           this._sendToPort(ackMsg);
           this.onTransfer({ direction: 'outgoing', type: 'ACK', ids: [id] });
@@ -649,18 +692,28 @@
     /**
      * Handles incoming ACK:
      * - Rule 6: Sender cleanup upon receiving ACK.
+     * - Only acknowledges IDs that were actually offered by this sender.
      * - Removes acknowledged message from outbox.
      */
     async _handleAck(ack) {
-      const ids = Array.isArray(ack.ids) ? ack.ids : [];
-      this.log('info', `Received ACK confirming acceptance of ${ids.length} message(s)`, ids);
-      this.onTransfer({ direction: 'incoming', type: 'ACK', ids: ids });
+      const rawIds = Array.isArray(ack.ids) ? ack.ids : [];
+      const validIds = rawIds.filter(id => this._offeredIds.has(id));
+      if (validIds.length !== rawIds.length) {
+        this.log('warn', `Ignored unoffered ACK ID(s)`, rawIds.filter(id => !this._offeredIds.has(id)));
+      }
+      this.log('info', `Received ACK confirming acceptance of ${validIds.length} message(s)`, validIds);
+      this.onTransfer({ direction: 'incoming', type: 'ACK', ids: validIds });
 
-      if (ids.length === 0) return;
+      if (validIds.length === 0) return;
+
+      const receipts = (ack.receipts && typeof ack.receipts === 'object') ? ack.receipts : {};
 
       try {
-        await this.storage.onAcknowledged(ids);
-        this.log('info', `Removed acknowledged message(s) from outbox:`, ids);
+        await this.storage.onAcknowledged(validIds, receipts);
+        for (const id of validIds) {
+          this._offeredIds.delete(id);
+        }
+        this.log('info', `Removed acknowledged message(s) from outbox:`, validIds);
       } catch (err) {
         this.log('error', 'Error processing ACK in local storage', err.message);
         this.onError(err);

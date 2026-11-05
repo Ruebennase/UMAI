@@ -116,12 +116,13 @@ func TestProtocol_BasicExchange_WithIntegrity(t *testing.T) {
 	f1Data, _ := os.ReadFile(attPath1)
 	f2Data, _ := os.ReadFile(attPath2)
 
-	// Prepare multipart form for B's /api/inbox
+	// Prepare multipart form for B's /api/inbox (including A's Ed25519 signature)
 	var buf bytes.Buffer
 	mw := multipart.NewWriter(&buf)
 	_ = mw.WriteField("id", msgA.ID)
 	payloadJSON, _ := json.Marshal(msgA.Payload)
 	_ = mw.WriteField("payload", string(payloadJSON))
+	_ = mw.WriteField("signature", msgA.Signature)
 
 	part1, _ := mw.CreateFormFile("attachments", "binary.bin")
 	_, _ = part1.Write(f1Data)
@@ -138,6 +139,15 @@ func TestProtocol_BasicExchange_WithIntegrity(t *testing.T) {
 
 	if res.StatusCode != http.StatusOK {
 		t.Fatalf("Expected 200 OK from B, got %d", res.StatusCode)
+	}
+
+	var acceptResp struct {
+		Accepted   bool   `json:"accepted"`
+		AckReceipt string `json:"ack_receipt"`
+	}
+	_ = json.NewDecoder(res.Body).Decode(&acceptResp)
+	if acceptResp.AckReceipt == "" {
+		t.Fatalf("Expected B to return a cryptographic ack_receipt")
 	}
 
 	// 5. App B must now report message as accepted (Rule 4)
@@ -178,9 +188,9 @@ func TestProtocol_BasicExchange_WithIntegrity(t *testing.T) {
 		t.Errorf("Attachment 2 SHA-256 on B differs from original!")
 	}
 
-	// 6. App B sends ACK -> App A cleans its outbox (Rule 6)
-	if err := appA.Server.Storage().AcknowledgeMessages([]string{msgA.ID}); err != nil {
-		t.Fatalf("App A failed to acknowledge: %v", err)
+	// 6. App B sends signed ACK -> App A verifies receipt and cleans its outbox (Rule 6)
+	if err := appA.Server.Storage().AcknowledgeMessagesVerified([]string{msgA.ID}, map[string]string{msgA.ID: acceptResp.AckReceipt}); err != nil {
+		t.Fatalf("App A failed to verify and acknowledge receipt: %v", err)
 	}
 
 	outboxA, _ := appA.Server.Storage().ListOutbox()
@@ -301,4 +311,94 @@ func TestProtocol_InterruptedTransfer_AllOrNothing(t *testing.T) {
 func sha256New(b []byte) []byte {
 	h := sha256.Sum256(b)
 	return h[:]
+}
+
+func TestSecurity_SignedMessages_TamperAndForgeryRejection(t *testing.T) {
+	appA := setupApp(t, "app-a", "http://127.0.0.1:8082")
+	appB := setupApp(t, "app-b", "http://127.0.0.1:8081")
+
+	_, _ = appA.Server.Storage().SaveDocument("invoice.pdf", bytes.NewReader([]byte("Original Amount: CHF 100")))
+	msgA, err := appA.Server.Storage().CreateOutboxMessage(map[string]any{"amount": 100}, []string{"invoice.pdf"})
+	if err != nil {
+		t.Fatalf("CreateOutboxMessage: %v", err)
+	}
+	if msgA.Signature == "" {
+		t.Fatalf("Expected CreateOutboxMessage to produce an Ed25519 signature")
+	}
+
+	// 1. Attempt to tamper with the attachment bytes in transit while keeping A's signature
+	var bufTamper bytes.Buffer
+	mw := multipart.NewWriter(&bufTamper)
+	_ = mw.WriteField("id", msgA.ID)
+	pJSON, _ := json.Marshal(msgA.Payload)
+	_ = mw.WriteField("payload", string(pJSON))
+	_ = mw.WriteField("signature", msgA.Signature)
+	part, _ := mw.CreateFormFile("attachments", "invoice.pdf")
+	_, _ = part.Write([]byte("Tampered Amount: CHF 999999"))
+	_ = mw.Close()
+
+	reqTamper, _ := authenticatedRequest("POST", "/api/inbox", appB.SessionID, &bufTamper, mw.FormDataContentType())
+	resTamper := appB.Do(reqTamper)
+	defer resTamper.Body.Close()
+
+	if resTamper.StatusCode == http.StatusOK {
+		t.Fatalf("Expected B to reject tampered attachment with invalid signature, but got 200 OK")
+	}
+	if appB.Server.Storage().IsAccepted(msgA.ID) {
+		t.Fatalf("Tampered message must not be marked accepted on B")
+	}
+
+	// 2. Attempt to forge an ACK receipt on A without B having accepted it
+	err = appA.Server.Storage().AcknowledgeMessagesVerified([]string{msgA.ID}, map[string]string{
+		msgA.ID: "0000000000000000000000000000000000000000000000000000000000000000",
+	})
+	if err == nil {
+		t.Fatalf("Expected A to reject forged ACK receipt")
+	}
+	outboxAfterForgedAck, _ := appA.Server.Storage().ListOutbox()
+	if len(outboxAfterForgedAck) != 1 {
+		t.Fatalf("Outbox message on A must not be deleted on forged ACK receipt")
+	}
+}
+
+func TestSecurity_CSRF_StatusLeak_And_DuplicateAttachment(t *testing.T) {
+	appA := setupApp(t, "app-a", "http://127.0.0.1:8082")
+	_, _ = appA.Server.Storage().CreateOutboxMessage(map[string]string{"s": "secret"}, nil)
+
+	// 1. Unauthenticated /api/status must not leak outbox_ids or accepted_ids
+	reqStatus, _ := http.NewRequest("GET", "/api/status", nil)
+	resStatus := appA.Do(reqStatus)
+	defer resStatus.Body.Close()
+	var statusData map[string]any
+	_ = json.NewDecoder(resStatus.Body).Decode(&statusData)
+	if _, leaked := statusData["outbox_ids"]; leaked {
+		t.Errorf("Unauthenticated /api/status leaked outbox_ids!")
+	}
+	if _, leaked := statusData["accepted_ids"]; leaked {
+		t.Errorf("Unauthenticated /api/status leaked accepted_ids!")
+	}
+
+	// 2. Cross-origin POST with foreign Origin header must be blocked (CSRF protection)
+	reqCSRF, _ := authenticatedRequest("POST", "/api/outbox/ack", appA.SessionID, bytes.NewReader([]byte(`{"ids":["msg-1"]}`)), "application/json")
+	reqCSRF.Header.Set("Origin", "https://evil.example.org")
+	resCSRF := appA.Do(reqCSRF)
+	defer resCSRF.Body.Close()
+	if resCSRF.StatusCode != http.StatusForbidden {
+		t.Errorf("Expected 403 Forbidden for cross-origin POST, got %d", resCSRF.StatusCode)
+	}
+
+	// 3. POST /api/outbox/ack with text/plain Content-Type must be rejected (415 Unsupported Media Type)
+	reqPlain, _ := authenticatedRequest("POST", "/api/outbox/ack", appA.SessionID, bytes.NewReader([]byte(`{"ids":["msg-1"]}`)), "text/plain")
+	resPlain := appA.Do(reqPlain)
+	defer resPlain.Body.Close()
+	if resPlain.StatusCode != http.StatusUnsupportedMediaType {
+		t.Errorf("Expected 415 Unsupported Media Type for text/plain JSON POST, got %d", resPlain.StatusCode)
+	}
+
+	// 4. Duplicate attachment filename in a single message must be rejected
+	_, _ = appA.Server.Storage().SaveDocument("dup.txt", bytes.NewReader([]byte("hello")))
+	_, err := appA.Server.Storage().CreateOutboxMessage(map[string]string{}, []string{"dup.txt", "dup.txt"})
+	if err == nil {
+		t.Errorf("Expected error when creating message with duplicate attachment filenames")
+	}
 }

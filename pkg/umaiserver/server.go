@@ -37,6 +37,12 @@ func NewServer(cfg Config, staticDir string) (*Server, error) {
 		return nil, fmt.Errorf("initializing storage: %w", err)
 	}
 
+	ownPub, ownPriv, peerPub, err := ParseKeyPair(cfg.Role, cfg.SigningPrivateKey, cfg.PeerPublicKey)
+	if err != nil {
+		return nil, fmt.Errorf("initializing signing keys: %w", err)
+	}
+	storage.SetKeys(ownPub, ownPriv, peerPub)
+
 	auth := NewAuthManager(cfg.CookieName, cfg.AuthUsername, cfg.AuthPassword)
 
 	s := &Server{
@@ -125,22 +131,47 @@ func (s *Server) securityMiddleware(next http.Handler) http.Handler {
 		}
 		w.Header().Set("Content-Security-Policy", csp)
 
-		// CORS: Restrictive, allow local same-origin or explicit peer origin for specific endpoints
-		origin := r.Header.Get("Origin")
-		if origin != "" && (origin == s.cfg.PeerOrigin || origin == altPeer) {
-			w.Header().Set("Access-Control-Allow-Origin", origin)
-			w.Header().Set("Access-Control-Allow-Credentials", "true")
-			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS, DELETE")
-			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-UMAI-Session")
-		}
-
+		// No cross-origin CORS headers are emitted: UMAI frontends communicate with their
+		// peer exclusively via browser MessagePort and only call their own origin's HTTP API.
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
 
+		// CSRF protection on state-changing requests (POST, PUT, DELETE, PATCH):
+		// If an Origin header is present, it must match this server's own origin.
+		if r.Method == http.MethodPost || r.Method == http.MethodPut || r.Method == http.MethodDelete || r.Method == http.MethodPatch {
+			if origin := r.Header.Get("Origin"); origin != "" {
+				if !s.isSameServerOrigin(origin, r) {
+					writeJSON(w, http.StatusForbidden, map[string]string{
+						"error": "forbidden: cross-origin state-changing request rejected",
+					})
+					return
+				}
+			}
+		}
+
 		next.ServeHTTP(w, r)
 	})
+}
+
+// isSameServerOrigin checks whether the HTTP Origin header matches this server's own host/listen address
+// (allowing localhost <-> 127.0.0.1 loopback equivalence on the same port).
+func (s *Server) isSameServerOrigin(origin string, r *http.Request) bool {
+	u, err := url.Parse(origin)
+	if err != nil || u.Host == "" {
+		return false
+	}
+	reqHost := r.Host
+	if reqHost == "" {
+		reqHost = s.cfg.ListenAddr
+	}
+	if strings.EqualFold(u.Host, reqHost) || strings.EqualFold(u.Host, s.cfg.ListenAddr) {
+		return true
+	}
+	altHost := loopbackAlt(reqHost)
+	altListen := loopbackAlt(s.cfg.ListenAddr)
+	return strings.EqualFold(u.Host, altHost) || strings.EqualFold(u.Host, altListen)
 }
 
 // requireAuth middleware ensures an active session exists.
@@ -189,6 +220,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /api/inbox/{id}", s.requireAuth(s.handleGetInboxMessage))
 	s.mux.HandleFunc("GET /api/inbox/{id}/attachments/{filename}", s.requireAuth(s.handleGetInboxAttachment))
 	s.mux.HandleFunc("GET /api/accepted", s.requireAuth(s.handleListAccepted))
+	s.mux.HandleFunc("GET /api/accepted/receipts", s.requireAuth(s.handleListAcceptedReceipts))
 	s.mux.HandleFunc("POST /api/inbox", s.requireAuth(s.handleAcceptMessage))
 
 	// Serve the common JavaScript library from /js/umai.js
@@ -210,19 +242,27 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	sessionID := s.auth.GetSessionID(r)
 	_, authenticated := s.auth.ValidateSession(sessionID)
 
-	writeJSON(w, http.StatusOK, map[string]any{
-		"app_name":       s.cfg.AppName,
-		"role":           s.cfg.Role,
-		"listen_addr":    s.cfg.ListenAddr,
-		"peer_origin":    s.cfg.PeerOrigin,
-		"peer_embed_url": s.cfg.PeerEmbedURL,
-		"authenticated":  authenticated,
-		"outbox_count":   len(outboxIDs),
-		"inbox_count":    len(inboxMsgs),
-		"accepted_count": len(acceptedIDs),
-		"outbox_ids":     outboxIDs,
-		"accepted_ids":   acceptedIDs,
-	})
+	resp := map[string]any{
+		"app_name":        s.cfg.AppName,
+		"role":            s.cfg.Role,
+		"listen_addr":     s.cfg.ListenAddr,
+		"peer_origin":     s.cfg.PeerOrigin,
+		"peer_embed_url":  s.cfg.PeerEmbedURL,
+		"authenticated":   authenticated,
+		"public_key":      s.storage.PublicKeyHex(),
+		"peer_public_key": s.storage.PeerPublicKeyHex(),
+		"outbox_count":    len(outboxIDs),
+		"inbox_count":     len(inboxMsgs),
+		"accepted_count":  len(acceptedIDs),
+	}
+
+	// Only expose message IDs when authenticated (prevents pre-emptive ID squatting)
+	if authenticated {
+		resp["outbox_ids"] = outboxIDs
+		resp["accepted_ids"] = acceptedIDs
+	}
+
+	writeJSON(w, http.StatusOK, resp)
 }
 
 type loginRequest struct {
@@ -231,6 +271,11 @@ type loginRequest struct {
 }
 
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
+	if !isJSONContentType(r) {
+		writeJSON(w, http.StatusUnsupportedMediaType, map[string]string{"error": "Content-Type must be application/json"})
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 64*1024)
 	var req loginRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
@@ -294,6 +339,7 @@ func (s *Server) handleListDocs(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleUploadDoc(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, s.cfg.MaxUploadSize+10*1024*1024)
 	if err := r.ParseMultipartForm(s.cfg.MaxUploadSize); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "failed to parse multipart form"})
 		return
@@ -302,6 +348,10 @@ func (s *Server) handleUploadDoc(w http.ResponseWriter, r *http.Request) {
 	files := r.MultipartForm.File["file"]
 	if len(files) == 0 {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "no file uploaded"})
+		return
+	}
+	if len(files) > MaxAttachmentsPerMessage {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": ErrTooManyAttachments.Error()})
 		return
 	}
 
@@ -382,6 +432,11 @@ type createOutboxRequest struct {
 }
 
 func (s *Server) handleCreateOutbox(w http.ResponseWriter, r *http.Request) {
+	if !isJSONContentType(r) {
+		writeJSON(w, http.StatusUnsupportedMediaType, map[string]string{"error": "Content-Type must be application/json"})
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 4*1024*1024)
 	var req createOutboxRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json body"})
@@ -430,18 +485,24 @@ func (s *Server) handleGetOutboxAttachment(w http.ResponseWriter, r *http.Reques
 }
 
 type ackRequest struct {
-	IDs []string `json:"ids"`
+	IDs      []string          `json:"ids"`
+	Receipts map[string]string `json:"receipts,omitempty"`
 }
 
 func (s *Server) handleAckOutbox(w http.ResponseWriter, r *http.Request) {
+	if !isJSONContentType(r) {
+		writeJSON(w, http.StatusUnsupportedMediaType, map[string]string{"error": "Content-Type must be application/json"})
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 4*1024*1024)
 	var req ackRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json body"})
 		return
 	}
 
-	if err := s.storage.AcknowledgeMessages(req.IDs); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+	if err := s.storage.AcknowledgeMessagesVerified(req.IDs, req.Receipts); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
 
@@ -504,12 +565,19 @@ func (s *Server) handleListAccepted(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, accepted)
 }
 
+func (s *Server) handleListAcceptedReceipts(w http.ResponseWriter, r *http.Request) {
+	receipts := s.storage.ListAcceptedReceipts()
+	writeJSON(w, http.StatusOK, receipts)
+}
+
 // handleAcceptMessage receives a PUT message transmitted from peer through browser.
 // Multipart form contains:
 // - "id": string message ID
 // - "payload": JSON string of metadata
+// - "signature": optional/expected Ed25519 signature hex of canonical PUT digest
 // - "attachments": one or more binary files
 func (s *Server) handleAcceptMessage(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, s.cfg.MaxUploadSize*int64(MaxAttachmentsPerMessage)+10*1024*1024)
 	if err := r.ParseMultipartForm(s.cfg.MaxUploadSize); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "failed parsing multipart form"})
 		return
@@ -520,6 +588,8 @@ func (s *Server) handleAcceptMessage(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing message id"})
 		return
 	}
+
+	signatureHex := r.FormValue("signature")
 
 	// Payload JSON
 	payloadStr := r.FormValue("payload")
@@ -533,6 +603,11 @@ func (s *Server) handleAcceptMessage(w http.ResponseWriter, r *http.Request) {
 	// Attachments
 	var attReaders []AttachmentReader
 	fileHeaders := r.MultipartForm.File["attachments"]
+	if len(fileHeaders) > MaxAttachmentsPerMessage {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": ErrTooManyAttachments.Error()})
+		return
+	}
+
 	var openFiles []io.Closer
 	defer func() {
 		for _, f := range openFiles {
@@ -553,15 +628,16 @@ func (s *Server) handleAcceptMessage(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	msg, err := s.storage.AcceptMessage(msgID, payload, attReaders)
+	msg, err := s.storage.AcceptSignedMessage(msgID, payload, attReaders, signatureHex)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"accepted": true,
-		"message":  msg,
+		"accepted":    true,
+		"ack_receipt": msg.AckReceipt,
+		"message":     msg,
 	})
 }
 
@@ -596,6 +672,11 @@ func writeJSON(w http.ResponseWriter, status int, data any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(data)
+}
+
+func isJSONContentType(r *http.Request) bool {
+	ct := r.Header.Get("Content-Type")
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(ct)), "application/json")
 }
 
 func loopbackAlt(origin string) string {

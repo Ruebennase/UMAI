@@ -79,7 +79,7 @@
     </form>
   </div>
 
-  <script src="/js/umai.js?v=0.1.3"></script>
+  <script src="/js/umai.js?v=0.1.5"></script>
   <script>
     (function () {
       const activeContainer = document.getElementById('sync-active-container');
@@ -198,20 +198,31 @@
               }
             }
 
-            return { id: meta.id, payload: meta.payload || {}, attachments: files };
+            return {
+              id: meta.id,
+              payload: meta.payload || {},
+              attachments: files,
+              signature: meta.signature || ''
+            };
           },
 
           async isAccepted(id) {
-            const res = await api('/api/accepted');
+            const res = await api('/api/accepted/receipts');
             if (!res.ok) return false;
-            const list = await res.json();
-            return Array.isArray(list) && list.includes(id);
+            const receiptsMap = await res.json();
+            if (receiptsMap && Object.prototype.hasOwnProperty.call(receiptsMap, id)) {
+              return receiptsMap[id] || true;
+            }
+            return false;
           },
 
           async acceptMessage(msg) {
             const formData = new FormData();
             formData.append('id', msg.id);
             formData.append('payload', JSON.stringify(msg.payload || {}));
+            if (msg.signature) {
+              formData.append('signature', msg.signature);
+            }
             for (const f of msg.attachments || []) {
               formData.append('attachments', f, f.name);
             }
@@ -219,14 +230,16 @@
               method: 'POST',
               body: formData
             });
-            return res.ok;
+            if (!res.ok) return false;
+            const data = await res.json();
+            return data.ack_receipt || true;
           },
 
-          async onAcknowledged(ids) {
+          async onAcknowledged(ids, receipts) {
             await api('/api/outbox/ack', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ ids: ids })
+              body: JSON.stringify({ ids: ids, receipts: receipts || {} })
             });
           }
         };
