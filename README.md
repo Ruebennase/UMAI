@@ -14,16 +14,27 @@ A minimal, vendor-neutral open-source protocol for exchanging immutable messages
 
 It enables two completely independent web applications running on different domains to securely exchange structured data and binary files (PDFs, spreadsheets, contracts, images) without requiring direct server-to-server network integrations, API gateways, VPNs, or cloud message brokers.
 
-### Key Characteristics
+### Core Characteristics of the UMAI Protocol (`js/umai.js`)
 - **Symmetric:** Either application can send and receive simultaneously.
 - **Message-Oriented:** Messages consist of structured JSON payloads and native binary attachments.
 - **User-Mediated:** Transfers occur exclusively while an authorized user's browser session connects both applications.
 - **Zero Cross-Origin HTTP / Zero CORS Required:** Each application's frontend talks exclusively to its own backend. Cross-domain data moves strictly in-memory over a browser `MessagePort`, so neither server ever needs to open CORS (`Access-Control-Allow-Origin`) to the peer domain.
-- **End-to-End Signed Envelopes & Receipts:** Outbox messages and `ACK` receipts are cryptographically signed and verified server-side (`crypto/ed25519`) while carried as opaque fields (`signature`, `receipts`) by the browser—requiring zero cryptography in the browser.
 - **Receiver-Controlled:** Receivers inspect offers and decide which messages they need.
 - **Resumable & Fault-Tolerant:** Interrupted transfers cleanly resume on subsequent sessions.
-- **Application-Agnostic:** Does not dictate business schemas or database engines.
-- **Zero Heavy Infrastructure:** Built using Go standard library, vanilla JavaScript, and native browser primitives.
+- **Application-Agnostic:** Does not dictate business schemas, user authentication mechanisms, or database engines.
+- **Opaque Cryptographic Pass-Through:** The `PUT` and `ACK` envelopes natively carry optional opaque `signature` and `receipts` fields so backends can attach end-to-end cryptographic proofs without needing any cryptography in the browser.
+
+### Core Protocol vs. Implementer Choices (What This Repository Demonstrates)
+
+To keep the protocol minimal and adaptable, UMAI cleanly separates **what the protocol itself defines** from **architectural choices left to each implementer** (for which our Go reference server `pkg/umaiserver` provides ready-to-run best-practice examples):
+
+| Layer | Provided by UMAI Core (`js/umai.js` & `SPEC.md`) | Implementer's Choice (Demonstrated as Best Practices in `pkg/umaiserver`) |
+|---|---|---|
+| **Transport & State Machine** | `READY`/`INIT`/`INIT_ACK` handshake, private `MessagePort`, `OFFER`/`GET`/`PUT`/`ACK` state machine, and the 5-method JS storage adapter. | How the frontend talks to its own backend (REST, GraphQL, WebSockets, or pure client-side IndexedDB). |
+| **Authenticity & Integrity** | Carries opaque `signature` (on `PUT`) and `receipts` (on `ACK`) fields through the browser without touching them. | **Recommended Best Practice (Implemented in `pkg/umaiserver`):** Server-side `Ed25519` message signing and signed `ACK` receipt verification so the browser mediator cannot alter messages or forge acknowledgements. |
+| **Payload Confidentiality** | Transfers opaque `payload` JSON and binary `File` objects over `MessagePort`. | **Optional Best Practice (Documented in `SECURITY.md`):** Server-to-server asymmetric encryption ("Blind Courier" mode) when the mediating user's browser should not read sensitive data in transit. |
+| **Channel Scoping & Multi-User Concurrency** | Guaranteed idempotent reconciliation (Rules 4 & 5) so concurrent deliveries never cause duplicate imports. | **Implementer's Choice (Implemented in `pkg/umaiserver`):** Scoping a channel to *only the logged-in user's messages* vs. pooling *all online users' channels* to transfer system-wide messages (using soft in-flight leases and per-session rotation). |
+| **User Authentication & Storage** | Agnostic—operates inside whatever session the user has established in each application. | Production apps use their own IAM (OIDC, SAML, MFA, Passkeys) and databases; `pkg/umaiserver` includes a self-contained demo login and atomic filesystem store for zero-dependency evaluation. |
 
 ---
 
@@ -37,19 +48,19 @@ Modern organizations frequently use separate, siloed web applications (e.g. an E
 
 **The UMAI approach:** The authorized human user is *already* authenticated to both applications in their browser. By turning the browser tab into a secure mediator via standard Web APIs (`postMessage`, `MessageChannel`, `File` Structured Clone), applications can exchange verified, immutable records and large documents without server-to-server coupling.
 
-### Two Operating Topologies: User-Scoped vs. System-Wide Opportunistic Pool
+### Implementer's Choice: User-Scoped vs. System-Wide Opportunistic Pool
 
-Depending on an implementation's goals, a UMAI channel can be scoped in two ways:
+Because UMAI leaves backend storage and queuing policy to the implementer, applications can choose how to scope an open UMAI channel depending on their business goal:
 
-1. **User-Scoped Channel ("My Messages Only"):**
-   - Each user's UMAI session only offers and accepts messages belonging to that specific authenticated user (or tenant).
-2. **System-Wide Opportunistic Pool ("Crowdsourced System Bridge"):**
-   - Any authenticated user who has both applications open acts as an opportunistic courier for **all pending system-to-system messages** between Application A and Application B.
-   - If 10 employees are online simultaneously, the two systems can use all 10 open browser channels in parallel to drain the outbox queue.
-   - **Why this is both safe and efficient:**
-     - *Cryptographic Integrity & Blind Transit:* Server-side `Ed25519` signing (plus optional asymmetric encryption) ensures a mediating user's browser cannot tamper with—or even read—another user's message while ferrying it.
-     - *Withstanding Double Efforts (Idempotency):* Even if two browsers transfer the same message concurrently, Rule 4 and Rule 5 ensure the receiver commits the message once and returns the stored `ack_receipt` to both.
-     - *Picking the Next-Best Message (Soft Leases & Session Rotation):* In `pkg/umaiserver`, fetching a message (`GET /api/outbox/{id}`) places a 15-second soft in-flight lease on it and rotates the unclaimed queue per session. Concurrent browsers automatically pick the next unclaimed message rather than duplicating bandwidth, while if a browser tab closes mid-transfer, the soft lease expires and another online user's browser seamlessly takes over.
+1. **Option A — User-Scoped Channel ("My Messages Only"):**
+   - The backend filters the outbox and inbox by the authenticated user. Each user's UMAI session only transfers messages belonging to that specific user (or tenant).
+2. **Option B — System-Wide Opportunistic Pool ("Crowdsourced System Bridge"):**
+   - The backend uses *any* authenticated user's open UMAI channel to transfer **all pending messages** relevant between System A and System B.
+   - If 10 users are online simultaneously, the two systems can use all 10 open browser channels in parallel to drain the shared queue.
+   - **Best-Practice Hardening Demonstrated in `pkg/umaiserver`:**
+     - *Protocol-Level Safety Against Double Efforts:* Even if two browsers transfer the same message concurrently, UMAI's Rule 4 and Rule 5 ensure the receiver commits the message once and returns the stored `ack_receipt` to both.
+     - *Server-Side Next-Best Message Selection:* As a best-practice example in `pkg/umaiserver`, fetching an outbox message (`GET /api/outbox/{id}`) places a 15-second soft in-flight lease on it and rotates the unclaimed queue per session. Concurrent browsers automatically pick the next unclaimed message instead of duplicating bandwidth—and if a browser tab closes mid-transfer, the soft lease expires after 15 seconds so another online browser seamlessly takes over.
+     - *Server-Side Signing & Optional Encryption:* Combining our reference server's `Ed25519` signing with optional asymmetric encryption ensures a mediating user's browser cannot modify—or even inspect—another user's message while ferrying it.
 
 ---
 
@@ -245,21 +256,24 @@ To demonstrate fault tolerance and Rule 5 (repeated acknowledgements), `tests/lo
 
 ---
 
-## 9. Security Architecture & Cryptographic Verification
+## 9. Security Architecture: Protocol Guarantees vs. Reference Server Best Practices
 
-UMAI separates **in-browser transport mediation** from **server-side cryptographic verification**:
+UMAI clearly separates **what the browser protocol enforces directly** from **server-side best practices** implemented in `pkg/umaiserver`:
 
-1. **Zero CORS Exposure:** Because Application A's frontend only calls Application A's backend, and Application B's frontend only calls Application B's backend, neither server exposes cross-origin CORS headers (`Access-Control-Allow-Origin` / `Access-Control-Allow-Credentials`). All cross-origin exchange happens over a private browser `MessagePort` pinned via `Content-Security-Policy: frame-ancestors`, `event.origin`, and `event.source`.
-2. **State-Machine & CSRF Hardening:**
-   - `js/umai.js` strictly enforces receiver-controlled transfers (dropping any unsolicited `PUT` not preceded by an in-flight `GET` and ignoring any `ACK` for unoffered IDs).
-   - `pkg/umaiserver` enforces same-origin `Origin` header checks on all state-changing routes, requires `Content-Type: application/json` on JSON endpoints, and never leaks pending message IDs on unauthenticated status endpoints.
+### Guaranteed by the UMAI Browser Protocol (`js/umai.js`)
+1. **Zero CORS Exposure:** Because Application A's frontend only calls Application A's backend, and Application B's frontend only calls Application B's backend, neither server needs to expose cross-origin CORS headers (`Access-Control-Allow-Origin` / `Access-Control-Allow-Credentials`). All cross-origin exchange happens over a private browser `MessagePort` pinned via `Content-Security-Policy: frame-ancestors`, `event.origin`, and `event.source`.
+2. **Receiver-Controlled State Machine:** `js/umai.js` strictly drops any unsolicited `PUT` not preceded by an in-flight `GET` and ignores any `ACK` for unoffered IDs.
+
+### Demonstrated as Server-Side Best Practices (`pkg/umaiserver`)
 3. **End-to-End Signed Messages & Signed `ACK` Receipts (`crypto/ed25519`):**
-   - While signing happens server-side, the UMAI `PUT` and `ACK` wire schemas include first-class opaque fields (`signature` on `PUT`, and `receipts` on `ACK`).
-   - The sending server signs the canonical message ID, JSON payload hash, and attachment SHA-256 digests (`UMAI-PUT-V1`). The receiving server verifies this signature before atomic commit and returns a signed receipt (`UMAI-ACK-V1`). The sending server verifies the receipt before deleting its outbox copy—preventing browser-level tampering or forged acknowledgements without needing any cryptography in the browser.
-4. **Optional Asymmetric Encryption ("Blind Courier" Mode):**
-   - Because `js/umai.js` treats payloads and attachments as opaque objects, servers that wish to hide sensitive content from the mediating user's browser or extensions in transit can encrypt outgoing snapshots using the peer server's public key (e.g., `X25519` + `AES-256-GCM`) and decrypt upon inbox ingestion with zero changes to `js/umai.js`.
+   - UMAI's `PUT` and `ACK` wire schemas provide optional opaque fields (`signature` on `PUT`, and `receipts` on `ACK`) so implementers can verify authenticity server-to-server without browser cryptography.
+   - Our reference server (`pkg/umaiserver`) demonstrates this best practice out of the box: the sending server signs the sender role, message ID, canonical JSON payload hash, and attachment SHA-256 digests (`UMAI-PUT-V1`). The receiving server verifies this signature before atomic commit and returns a signed receipt (`UMAI-ACK-V1`), which the sending server verifies before deleting its outbox copy.
+4. **Same-Origin CSRF & Endpoint Hardening:**
+   - `pkg/umaiserver` demonstrates standard web hardening: same-origin `Origin` header checks on state-changing routes, strict `Content-Type: application/json` enforcement, and keeping pending message IDs restricted to authenticated sessions.
+5. **Optional Asymmetric Encryption ("Blind Courier" Mode):**
+   - Because `js/umai.js` treats payloads and attachments as opaque objects, implementers who want to hide sensitive content from the mediating browser in transit can encrypt outgoing snapshots on the sending server using the peer server's public key (e.g., `X25519` + `AES-256-GCM`) and decrypt upon inbox ingestion with zero changes to `js/umai.js`.
 
-👉 **See [SECURITY.md](SECURITY.md) for the complete threat model and cryptographic specification.**
+👉 **See [SECURITY.md](SECURITY.md) for the complete separation of concerns, threat model, and cryptographic specification.**
 
 ---
 
