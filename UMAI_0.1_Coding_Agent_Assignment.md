@@ -216,6 +216,8 @@ Do not send documents before both applications are ready and the communication c
 
 Use exact configured origins, never a wildcard target origin for sensitive communication.
 
+When testing locally on `localhost` vs `127.0.0.1`, browsers treat them as distinct origins. The handshake origin check should either recognize `localhost` and `127.0.0.1` as equivalent loopback origins on the matching port, or enforce consistent use of one loopback hostname across both applications.
+
 Do not assume that iframe embedding grants access to the other application's DOM.
 
 ## 5. Two independent Go demo applications
@@ -269,18 +271,22 @@ Display both applications side by side, allowing the user to see the contents an
 
 ### File storage
 
-Use simple local directories.
+Use simple local directories. To ensure that both applications remain strictly isolated when run concurrently on the same machine from the repository root, each application must default to its own dedicated storage directory (for example, `./data-a` and `./data-b`), while remaining fully configurable via command-line flags or environment variables.
 
 For example:
 
 ```text
-app-a/
+data-a/ (or app-a/)
   docs/
-  messages/
+  outbox/
+  inbox/
+  accepted.json
 
-app-b/
+data-b/ (or app-b/)
   docs/
-  messages/
+  outbox/
+  inbox/
+  accepted.json
 ```
 
 Actual document files will be provided manually.
@@ -357,6 +363,8 @@ As soon as the user visits B's synchronisation page:
 
 There must be no need to click a separate Synchronise button, although a manual Retry button is acceptable.
 
+Whenever an application receives an `OFFER` (even an empty offer `ids: []`), if it has not yet offered its own outbox, it should symmetrically trigger its own `OFFER` in response. In addition, implementations should include a lightweight periodic reconciliation check (for example, every few seconds while connected) so that messages prepared while the remote application was still authenticating or logging in are automatically announced without manual intervention.
+
 When the browser page is reopened, the applications automatically reconcile their outstanding messages again.
 
 Both directions should work without requiring the user to choose a sender and receiver.
@@ -376,6 +384,10 @@ Requirements:
 - Do not share passwords, session cookies or authentication tokens through UMAI messages.
 
 Keep authentication deliberately simple.
+
+**Important cookie scoping rule (RFC 6265 § 8.5):**
+
+In web browsers, cookies are scoped by host/domain, not by port number. When running both demo applications locally on the same host (such as `127.0.0.1:8081` and `127.0.0.1:8082`), using the same cookie name will cause one application's session cookie to overwrite the other's! Applications must use scoped cookie names (such as `umai_session_a` and `umai_session_b`) and/or provide session tokens via an explicit HTTP header (such as `X-UMAI-Session`). This also protects authentication when third-party cookies are blocked inside cross-origin iframes.
 
 Document that cross-site cookie policies can prevent an existing top-level session from being available inside an iframe.
 
@@ -401,6 +413,8 @@ Implement at least:
 - No wildcard iframe embedding permissions.
 - Reasonable upload and request limits.
 - Protection against unintended duplicate processing.
+- Explicit static asset MIME types (ensure `Content-Type: text/css; charset=utf-8` is served with `nosniff`, preventing strict browsers from rejecting stylesheets).
+- Anti-cache headers (`Cache-Control: no-cache, no-store, must-revalidate`) during local development to avoid browsers serving stale cached stylesheets or Service Workers from other projects tested on the same local port.
 
 Both applications must explicitly configure which other origin they trust.
 
