@@ -531,7 +531,7 @@ func (s *Storage) GetOutboxAttachmentPath(id, filename string) (string, error) {
 	defer s.mu.RUnlock()
 
 	filePath := filepath.Join(s.outboxDir, cleanID, "attachments", cleanFile)
-	if fi, err := os.Stat(filePath); err != nil || fi.IsDir() {
+	if fi, err := os.Lstat(filePath); err != nil || !fi.Mode().IsRegular() {
 		return "", ErrNotFound
 	}
 	return filePath, nil
@@ -709,7 +709,7 @@ func (s *Storage) GetInboxAttachmentPath(id, filename string) (string, error) {
 	defer s.mu.RUnlock()
 
 	filePath := filepath.Join(s.inboxDir, cleanID, "attachments", cleanFile)
-	if fi, err := os.Stat(filePath); err != nil || fi.IsDir() {
+	if fi, err := os.Lstat(filePath); err != nil || !fi.Mode().IsRegular() {
 		return "", ErrNotFound
 	}
 	return filePath, nil

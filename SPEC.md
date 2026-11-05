@@ -47,7 +47,7 @@ UMAI defines exactly four operations. No additional message types are required f
 Every message is assigned a globally unique identifier (Message ID) upon creation. Once offered, its payload and attachments MUST NEVER change. Any modification to metadata or attachments constitutes a new message and requires a distinct Message ID.
 
 #### Rule 2 — Receiver-Controlled Transfer
-The sender does not push messages uninvited. The sender advertises available message IDs using `OFFER`. The receiver evaluates the offer against its Accepted Set and requests only those IDs it does not possess using `GET`.
+The sender does not push messages uninvited. The sender advertises available message IDs using `OFFER`. The receiver evaluates the offer against its Accepted Set and requests only those IDs it does not possess using `GET`. Conversely, a sender MUST ignore `GET` or `ACK` messages referencing Message IDs that it has not offered, and a receiver MUST ignore unsolicited `PUT` messages that it did not request via `GET`.
 
 #### Rule 3 — Complete Messages Only (All-or-Nothing Acceptance)
 A `PUT` operation transmits one complete logical message including all associated binary attachments.
