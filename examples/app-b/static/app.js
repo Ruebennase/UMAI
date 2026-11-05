@@ -183,12 +183,22 @@
       await loadInbox();
 
       // Load App A in iframe
-      const embedUrl = serverConfig.peer_embed_url || serverConfig.peer_origin;
+      let embedUrl = serverConfig.peer_embed_url || serverConfig.peer_origin;
+      let peerOrigin = serverConfig.peer_origin;
+
+      if (window.location.hostname === 'localhost') {
+        embedUrl = embedUrl.replace('127.0.0.1', 'localhost');
+        peerOrigin = peerOrigin.replace('127.0.0.1', 'localhost');
+      } else if (window.location.hostname === '127.0.0.1') {
+        embedUrl = embedUrl.replace('localhost', '127.0.0.1');
+        peerOrigin = peerOrigin.replace('localhost', '127.0.0.1');
+      }
+
       if (peerIframe.src !== embedUrl) {
         peerIframe.src = embedUrl;
       }
 
-      initUmaiSession(serverConfig.peer_origin);
+      initUmaiSession(peerOrigin);
     } catch (err) {
       appendLog('error', 'Initialization error:', err.message);
     }

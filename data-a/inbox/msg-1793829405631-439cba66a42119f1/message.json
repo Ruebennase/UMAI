@@ -1,0 +1,21 @@
+{
+  "id": "msg-1793829405631-439cba66a42119f1",
+  "created_at": "2026-11-04T21:56:55.382956Z",
+  "payload": {
+    "subject": "My two files",
+    "text": "",
+    "timestamp": "2026-11-04T21:56:45.614Z"
+  },
+  "attachments": [
+    {
+      "name": "MPrintz-2026-10 Google-Gemini Ultra-Settings.pdf",
+      "size": 60337,
+      "sha256": "5785686cd2456a99e614310635fdbf9a968687b21db8713ee462390fed8426cc"
+    },
+    {
+      "name": "MPrintz-2026-10-03 Swisscom Mobil September 2026.pdf",
+      "size": 173347,
+      "sha256": "d464ada84de2e612724145d0c645d46aa62a383913a14d3c73ec831c5b8d3ade"
+    }
+  ]
+}

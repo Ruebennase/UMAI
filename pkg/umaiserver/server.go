@@ -6,11 +6,20 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"mime"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 )
+
+func init() {
+	_ = mime.AddExtensionType(".css", "text/css; charset=utf-8")
+	_ = mime.AddExtensionType(".js", "application/javascript; charset=utf-8")
+	_ = mime.AddExtensionType(".html", "text/html; charset=utf-8")
+	_ = mime.AddExtensionType(".json", "application/json; charset=utf-8")
+}
 
 // Server coordinates HTTP routes, static files, auth, and storage.
 type Server struct {
@@ -35,11 +44,28 @@ func NewServer(cfg Config, staticDir string) (*Server, error) {
 		storage: storage,
 		auth:    auth,
 		mux:     http.NewServeMux(),
-		fs:      http.FileServer(http.Dir(staticDir)),
+		fs:      newStaticFileHandler(staticDir),
 	}
 
 	s.registerRoutes()
 	return s, nil
+}
+
+func newStaticFileHandler(staticDir string) http.Handler {
+	fileServer := http.FileServer(http.Dir(staticDir))
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path := r.URL.Path
+		ext := filepath.Ext(path)
+		if ext == ".css" {
+			w.Header().Set("Content-Type", "text/css; charset=utf-8")
+		} else if ext == ".js" {
+			w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
+		}
+		w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+		w.Header().Set("Pragma", "no-cache")
+		w.Header().Set("Expires", "0")
+		fileServer.ServeHTTP(w, r)
+	})
 }
 
 // Handler returns the HTTP handler with global middleware.
@@ -81,20 +107,27 @@ func (s *Server) securityMiddleware(next http.Handler) http.Handler {
 		// Strict security headers
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 
+		// Prevent browser from caching stale files from previous projects on this port
+		w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+		w.Header().Set("Pragma", "no-cache")
+		w.Header().Set("Expires", "0")
+
+		altPeer := loopbackAlt(s.cfg.PeerOrigin)
+
 		// Content Security Policy
 		var csp string
 		if s.cfg.AllowEmbedding {
 			// Permitted to be embedded by peer origin
-			csp = fmt.Sprintf("frame-ancestors 'self' %s; default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'", s.cfg.PeerOrigin)
+			csp = fmt.Sprintf("frame-ancestors 'self' %s %s; default-src 'self' 'unsafe-inline' localhost:* 127.0.0.1:*; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' localhost:* 127.0.0.1:*", s.cfg.PeerOrigin, altPeer)
 		} else {
 			// Host page embedding peer
-			csp = fmt.Sprintf("frame-ancestors 'none'; default-src 'self'; frame-src 'self' %s; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'", s.cfg.PeerOrigin)
+			csp = fmt.Sprintf("frame-ancestors 'none'; default-src 'self' 'unsafe-inline' localhost:* 127.0.0.1:*; frame-src 'self' %s %s; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' localhost:* 127.0.0.1:*", s.cfg.PeerOrigin, altPeer)
 		}
 		w.Header().Set("Content-Security-Policy", csp)
 
-		// CORS: Restrictive, allow only local same-origin or explicit peer origin for specific endpoints
+		// CORS: Restrictive, allow local same-origin or explicit peer origin for specific endpoints
 		origin := r.Header.Get("Origin")
-		if origin != "" && (origin == s.cfg.PeerOrigin) {
+		if origin != "" && (origin == s.cfg.PeerOrigin || origin == altPeer) {
 			w.Header().Set("Access-Control-Allow-Origin", origin)
 			w.Header().Set("Access-Control-Allow-Credentials", "true")
 			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS, DELETE")
@@ -563,4 +596,14 @@ func writeJSON(w http.ResponseWriter, status int, data any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(data)
+}
+
+func loopbackAlt(origin string) string {
+	if strings.Contains(origin, "127.0.0.1") {
+		return strings.Replace(origin, "127.0.0.1", "localhost", 1)
+	}
+	if strings.Contains(origin, "localhost") {
+		return strings.Replace(origin, "localhost", "127.0.0.1", 1)
+	}
+	return origin
 }

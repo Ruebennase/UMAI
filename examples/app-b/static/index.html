@@ -4,7 +4,15 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Application B — UMAI 0.1 Host</title>
-  <link rel="stylesheet" href="style.css">
+  <link rel="stylesheet" href="/style.css?v=0.1.2">
+  <script>
+    // Clean up stale service workers or caches from other projects on this port
+    if ('serviceWorker' in navigator) {
+      navigator.serviceWorker.getRegistrations().then(function(regs) {
+        for (var r of regs) r.unregister();
+      });
+    }
+  </script>
 </head>
 <body>
   <!-- Auth Screen for App B -->
@@ -29,7 +37,7 @@
   </div>
 
   <!-- Main Split Dashboard -->
-  <div id="app-container" style="display: none; height: 100%; display: flex; flex-direction: column;">
+  <div id="app-container" style="display: none; height: 100%; flex-direction: column;">
     <header class="top-nav">
       <div>
         <div class="top-title">

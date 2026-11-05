@@ -41,6 +41,26 @@
   }
 
   /**
+   * Validates whether incoming origin matches expected origin,
+   * supporting local loopback synonyms (localhost <-> 127.0.0.1 on matching port).
+   */
+  function isAllowedOrigin(incomingOrigin, expectedOrigin) {
+    if (!incomingOrigin || !expectedOrigin) return false;
+    if (incomingOrigin === expectedOrigin) return true;
+    try {
+      const inc = new URL(incomingOrigin);
+      const exp = new URL(expectedOrigin);
+      const isLoopback = (host) => host === 'localhost' || host === '127.0.0.1';
+      if (isLoopback(inc.hostname) && isLoopback(exp.hostname) && inc.port === exp.port && inc.protocol === exp.protocol) {
+        return true;
+      }
+    } catch (e) {
+      // ignore parse errors
+    }
+    return false;
+  }
+
+  /**
    * Main UMAI Session Adapter.
    */
   class UmaiSession {
@@ -194,11 +214,13 @@
     /**
      * Host initializes MessageChannel and posts port2 to embedded iframe.
      */
-    _initiateHostHandshake() {
+    _initiateHostHandshake(targetOrigin = null) {
       if (!this.iframe || !this.iframe.contentWindow) {
         this.log('warn', 'Cannot initiate handshake: iframe or contentWindow missing');
         return;
       }
+
+      const destOrigin = targetOrigin || this.peerOrigin;
 
       try {
         const channel = new MessageChannel();
@@ -207,11 +229,11 @@
 
         this.iframe.contentWindow.postMessage(
           { protocol: PROTOCOL_NAME, version: PROTOCOL_VERSION, type: 'INIT' },
-          this.peerOrigin,
+          destOrigin,
           [channel.port2]
         );
 
-        this.log('info', 'Sent INIT and MessagePort to embedded application');
+        this.log('info', `Sent INIT and MessagePort to embedded application (${destOrigin})`);
       } catch (err) {
         this.log('error', 'Error creating MessageChannel/sending port', err.message);
         this.onError(err);
@@ -222,8 +244,8 @@
      * Top-level window message handler (used for the initial secure handshake).
      */
     _handleWindowMessage(event) {
-      // Validate origin strictly
-      if (event.origin !== this.peerOrigin) {
+      // Validate origin strictly (supports localhost/127.0.0.1 synonym on matching port)
+      if (!isAllowedOrigin(event.origin, this.peerOrigin)) {
         return;
       }
 
@@ -235,7 +257,7 @@
       if (this.role === 'host') {
         if (data.type === 'READY') {
           this.log('info', 'Received READY from embedded peer');
-          this._initiateHostHandshake();
+          this._initiateHostHandshake(event.origin);
         }
       } else if (this.role === 'embedded') {
         if (data.type === 'INIT' && event.ports && event.ports.length > 0) {

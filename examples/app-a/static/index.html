@@ -4,7 +4,14 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Application A — UMAI 0.1</title>
-  <link rel="stylesheet" href="style.css">
+  <link rel="stylesheet" href="/style.css?v=0.1.2">
+  <script>
+    if ('serviceWorker' in navigator) {
+      navigator.serviceWorker.getRegistrations().then(function(regs) {
+        for (var r of regs) r.unregister();
+      });
+    }
+  </script>
 </head>
 <body>
   <div id="auth-container" class="auth-box" style="display: none;">
