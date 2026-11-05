@@ -1,0 +1,288 @@
+# Developer Integration Guide: Integrating Applications with UMAI
+
+**How to connect legacy, enterprise, or modern web applications without server-to-server APIs**
+
+---
+
+## 1. The Core Philosophy of UMAI
+
+Traditional enterprise integration typically requires direct server-to-server communication:
+- Complex firewall exceptions and VPN tunnels between corporate networks.
+- Mutual TLS certificates, API gateways, and service accounts.
+- Heavy middleware (message brokers, iPaaS, ETL pipelines).
+- Weeks or months of cross-department security reviews and coordination.
+
+For legacy systems, adding modern server-to-server REST or gRPC APIs is often high-risk, expensive, or impossible.
+
+### The UMAI Alternative: User-Mediated Integration
+
+In enterprise workflows, **the authorized human user is already authenticated to both applications in their browser**:
+
+```text
+┌─────────────────────────────────────────────────────────────┐
+│                       User's Browser                        │
+│                                                             │
+│  ┌─────────────────────────┐   ┌─────────────────────────┐  │
+│  │  Host Application (B)   │   │ Embedded Application (A)│  │
+│  │   (e.g. Accounting)     │   │     (e.g. Legacy ERP)   │  │
+│  │                         │   │                         │  │
+│  │    [ UMAI Adapter ]     │◄─►│    [ UMAI Adapter ]     │  │
+│  └────────────┬────────────┘   └────────────┬────────────┘  │
+└───────────────┼─────────────────────────────┼───────────────┘
+                │                             │
+       (Local HTTP Session)          (Local HTTP Session)
+                │                             │
+                ▼                             ▼
+     ┌─────────────────────┐       ┌─────────────────────┐
+     │  App B Server (DB)  │       │  App A Server (DB)  │
+     │   (e.g. Internal)   │       │   (e.g. Isolated)   │
+     └─────────────────────┘       └─────────────────────┘
+         ▲                                     ▲
+         │                                     │
+         └────── NO DIRECT SERVER CONNECTION ──┘
+```
+
+The browser acts as a secure, sandboxed mediator:
+1. Applications communicate purely via client-side Web APIs (`postMessage`, `MessageChannel`, Structured Clone).
+2. Binary files (`File` / `Blob`) are transferred in-memory with byte-level integrity.
+3. Neither server needs public API exposure, inbound ports, or cross-network access.
+4. Legacy applications only need a lightweight UI extension and a few internal endpoints (or local browser storage).
+
+---
+
+## 2. Architecture: Separation of Concerns
+
+UMAI is strictly disentangled into three distinct layers:
+
+```mermaid
+graph TD
+    subgraph Layer 1: Application UI & Logic
+        A1[Your Application Web Pages]
+        A2[User Actions: Upload, View, Approve]
+    end
+
+    subgraph Layer 2: UMAI Storage Adapter
+        B1[getOutboxIds]
+        B2[getMessage]
+        B3[isAccepted]
+        B4[acceptMessage]
+        B5[onAcknowledged]
+    end
+
+    subgraph Layer 3: UMAI Protocol Engine
+        C1[umai.js / UmaiSession]
+        C2[OFFER / GET / PUT / ACK State Machine]
+        C3[MessageChannel & File Transport]
+    end
+
+    A1 --> B1
+    A2 --> B4
+    B1 --> C1
+    B2 --> C1
+    B3 --> C1
+    B4 --> C1
+    B5 --> C1
+```
+
+- **Layer 3 (`js/umai.js`):** Pure, standalone protocol engine. Has **zero** DOM knowledge, zero styling, zero framework dependencies, and no knowledge of your server technology.
+- **Layer 2 (The Storage Adapter):** A small 5-method JavaScript object that tells UMAI how your application reads and writes messages.
+- **Layer 1 (Application UI):** Your existing user interface (PHP, Java, ASP.NET, Rails, React, Vue, or static HTML).
+
+---
+
+## 3. The 5-Method Storage Contract
+
+To integrate an application with UMAI, you only need to provide a JavaScript object implementing five methods:
+
+```typescript
+interface UmaiStorageAdapter {
+  // 1. Returns a list of pending message IDs waiting in the local outbox
+  getOutboxIds(): Promise<string[]>;
+
+  // 2. Returns the complete message payload and native File objects for a given ID
+  getMessage(id: string): Promise<{
+    id: string;
+    payload: any;
+    attachments: File[];
+  } | null>;
+
+  // 3. Checks whether a message ID has already been accepted in the past (Rule 5)
+  isAccepted(id: string): Promise<boolean>;
+
+  // 4. Commits an incoming complete message and its File attachments (Rule 3 & 4)
+  // Must return true on successful commitment, false on error
+  acceptMessage(msg: {
+    id: string;
+    payload: any;
+    attachments: File[];
+  }): Promise<boolean>;
+
+  // 5. Cleans up acknowledged message IDs from the outbox (Rule 6)
+  onAcknowledged(ids: string[]): Promise<void>;
+}
+```
+
+---
+
+## 4. Step-by-Step Integration
+
+### Step 1: Prepare the Embedded Application (e.g. Legacy App A)
+
+If Application A is embedded inside Application B via an `<iframe>`:
+
+#### A. Set Content-Security-Policy (Server-side)
+Allow Application B's origin to embed Application A:
+```http
+Content-Security-Policy: frame-ancestors 'self' https://app-b.company.com
+```
+
+#### B. Include `umai.js` and Initialize the Session
+In Application A's web page:
+
+```html
+<script src="/js/umai.js"></script>
+<script>
+  // 1. Implement the 5 storage methods connecting to your existing backend
+  const storage = {
+    async getOutboxIds() {
+      const res = await fetch('/api/outbox/ids');
+      return await res.json(); // e.g. ["inv-2026-001"]
+    },
+
+    async getMessage(id) {
+      const meta = await (await fetch(`/api/outbox/${id}`)).json();
+      
+      // Fetch attachments as native File objects
+      const files = [];
+      for (const att of meta.attachments) {
+        const fileRes = await fetch(`/api/outbox/${id}/files/${att.filename}`);
+        const blob = await fileRes.blob();
+        files.push(new File([blob], att.filename, { type: blob.type }));
+      }
+
+      return { id: meta.id, payload: meta.payload, attachments: files };
+    },
+
+    async isAccepted(id) {
+      const res = await fetch(`/api/accepted/check?id=${encodeURIComponent(id)}`);
+      const data = await res.json();
+      return data.accepted === true;
+    },
+
+    async acceptMessage(msg) {
+      const formData = new FormData();
+      formData.append('id', msg.id);
+      formData.append('payload', JSON.stringify(msg.payload));
+      for (const file of msg.attachments) {
+        formData.append('files', file, file.name);
+      }
+
+      const res = await fetch('/api/inbox/accept', { method: 'POST', body: formData });
+      return res.ok;
+    },
+
+    async onAcknowledged(ids) {
+      await fetch('/api/outbox/acknowledge', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ids })
+      });
+    }
+  };
+
+  // 2. Start UMAI session as embedded peer
+  const umai = new UMAI.UmaiSession({
+    peerOrigin: 'https://app-b.company.com',
+    role: 'embedded',
+    storage: storage,
+    onStatusChange({ state }) {
+      console.log('UMAI status:', state);
+    }
+  });
+
+  umai.start();
+</script>
+```
+
+---
+
+### Step 2: Prepare the Host Application (e.g. Modern App B)
+
+#### A. Add the Iframe in Your HTML
+```html
+<iframe id="legacy-app-frame" src="https://app-a.company.com/embedded-view" style="width: 100%; height: 600px; border: 1px solid #ccc;"></iframe>
+```
+
+#### B. Initialize `UmaiSession` as Host
+```html
+<script src="/js/umai.js"></script>
+<script>
+  const iframeElement = document.getElementById('legacy-app-frame');
+
+  // Implement the same 5-method storage adapter for App B
+  const storage = {
+    async getOutboxIds() { /* ... */ },
+    async getMessage(id) { /* ... */ },
+    async isAccepted(id) { /* ... */ },
+    async acceptMessage(msg) { /* ... */ },
+    async onAcknowledged(ids) { /* ... */ }
+  };
+
+  const umai = new UMAI.UmaiSession({
+    peerOrigin: 'https://app-a.company.com',
+    role: 'host',
+    iframe: iframeElement,
+    storage: storage,
+    onTransfer({ direction, type, id }) {
+      console.log(`UMAI Transfer: ${direction} ${type} ${id || ''}`);
+    }
+  });
+
+  // When iframe loads, start handshake
+  iframeElement.addEventListener('load', () => {
+    umai.start();
+  });
+</script>
+```
+
+---
+
+## 5. Backend Options for Legacy Applications
+
+Legacy applications have two primary ways to support the 5-method contract:
+
+### Option A: Four Simple Internal HTTP Endpoints (Recommended)
+Add 4 lightweight endpoints to your existing web backend in any language (PHP, C#, Java, Python, Go):
+
+1. `GET /api/outbox`: Returns pending messages that the user wants to transfer.
+2. `GET /api/outbox/{id}/files/{filename}`: Streams attachment files to the user's browser.
+3. `POST /api/inbox/accept`: Receives a standard multipart form with files and stores them into your database or document folder.
+4. `POST /api/outbox/acknowledge`: Marks message IDs as completed/sent.
+
+*Notice that these endpoints only talk to the authenticated user's browser session. They require zero firewall rules, zero public exposure, and zero cross-network tunnels.*
+
+### Option B: Pure Client-Side (Zero Backend Changes!)
+If a legacy backend cannot be modified at all, you can implement the storage adapter completely in the browser using **IndexedDB**:
+- Outgoing documents are selected from client-side files or downloaded blobs.
+- Incoming documents are saved to IndexedDB or downloaded directly to the user's filesystem via the File System Access API.
+
+---
+
+## 6. Key Invariants to Remember
+
+1. **Rule 1 — Immutability:** Never modify a message once offered. If data changes, generate a new message ID.
+2. **Rule 3 — All-or-Nothing Acceptance:** If saving any file fails in `acceptMessage`, return `false`. Never acknowledge or store a partial message.
+3. **Rule 5 — Repeated Acknowledgements:** If `isAccepted(id)` returns `true` for an offered message, UMAI automatically sends `ACK` without re-requesting the message. Ensure your `isAccepted` method checks persistent storage (disk or database) so accepted IDs survive browser restarts.
+4. **Cookie Scoping (RFC 6265 § 8.5):** If testing both applications locally on `127.0.0.1`, use distinct cookie names (e.g. `session_app_a` and `session_app_b`) or `X-UMAI-Session` headers to prevent cookies from colliding across ports.
+
+---
+
+## 7. Summary
+
+| Integration Type | Server-to-Server REST/gRPC | UMAI Browser Mediation |
+|---|---|---|
+| **Network Configuration** | VPNs, NATs, firewall rules | Standard HTTPS browsing |
+| **Authentication** | Shared mTLS, API keys, OAuth client credentials | Existing user login session |
+| **Legacy Impact** | High (new network daemons, security reviews) | Low (a few UI scripts and standard HTTP handlers) |
+| **Data Immutability** | Complex distributed transactions | Built-in 4-message protocol with Rule 5 recovery |
+| **Implementation Effort** | Weeks / Months | An afternoon |

@@ -96,6 +96,7 @@ sequenceDiagram
 ```text
 umai/
 ├── README.md               # Overview, quickstart, and architecture guide
+├── INTEGRATION_GUIDE.md    # Developer guide for integrating legacy & custom apps
 ├── SPEC.md                 # Formal, vendor-neutral protocol specification
 ├── SECURITY.md             # Security model, threat analysis, and limitations
 ├── LICENSE                 # MIT License
@@ -121,7 +122,24 @@ umai/
 
 ---
 
-## 6. Getting Started
+## 6. Disentangled Architecture & Developer Integration
+
+UMAI is designed so that developers can integrate existing or legacy applications without adopting any frontend frameworks, server frameworks, or server-to-server networking:
+
+1. **Protocol Engine (`js/umai.js`):** Completely decoupled from UI and backend technology. It contains zero HTML, zero CSS, and zero framework code.
+2. **The 5-Method Storage Contract:** Any web application connects to `umai.js` by providing five simple asynchronous methods:
+   - `getOutboxIds()`
+   - `getMessage(id)`
+   - `isAccepted(id)`
+   - `acceptMessage(msg)`
+   - `onAcknowledged(ids)`
+3. **Legacy-Friendly:** Legacy applications (PHP, Java, ASP.NET, Rails) only need 4 simple internal endpoints to support this contract, or can store files purely client-side via IndexedDB.
+
+👉 **See the complete [Developer Integration Guide](INTEGRATION_GUIDE.md) for architecture patterns, step-by-step code samples, and legacy modernization recipes.**
+
+---
+
+## 7. Getting Started
 
 ### Prerequisites
 - Go 1.22 or later.
@@ -171,7 +189,7 @@ You will see the side-by-side dashboard:
 
 ---
 
-## 7. Running the Test Suite
+## 8. Running the Test Suite
 
 Execute the complete automated test suite using standard Go tooling:
 
@@ -200,7 +218,7 @@ To demonstrate fault tolerance and Rule 5 (repeated acknowledgements), `tests/lo
 
 ---
 
-## 8. Production Deployment Behind Caddy
+## 9. Production Deployment Behind Caddy
 
 For deployment over the public internet with TLS termination on two separate domains (e.g. `https://app-a.example.ch` and `https://app-b.example.net`):
 
@@ -217,7 +235,7 @@ For deployment over the public internet with TLS termination on two separate dom
 
 ---
 
-## 9. Known Limitations
+## 10. Known Limitations
 
 - **Experimental Reference Status:** UMAI 0.1 is an experimental protocol and reference implementation.
 - **Third-Party Cookies in Cross-Origin Frames:** Certain strict browser privacy configurations block third-party cookies in iframes. Application A provides a top-level fallback login button for these environments.
@@ -226,6 +244,6 @@ For deployment over the public internet with TLS termination on two separate dom
 
 ---
 
-## 10. License
+## 11. License
 
 Released under the [MIT License](LICENSE).
