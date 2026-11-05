@@ -130,16 +130,16 @@ umai/
 
 ### Running Application A and Application B Locally
 
-In separate terminal tabs:
+In separate terminal tabs (using dedicated local data directories so both applications operate independently):
 
 ```bash
-# Terminal 1: Start Application A
-go run ./examples/app-a/main.go -addr 127.0.0.1:8081 -peer http://127.0.0.1:8082
+# Terminal 1: Start Application A (stores docs & outbox in ./data-a)
+go run ./examples/app-a/main.go -addr 127.0.0.1:8081 -peer http://127.0.0.1:8082 -data ./data-a
 ```
 
 ```bash
-# Terminal 2: Start Application B (Host)
-go run ./examples/app-b/main.go -addr 127.0.0.1:8082 -peer http://127.0.0.1:8081
+# Terminal 2: Start Application B (Host, stores docs & outbox in ./data-b)
+go run ./examples/app-b/main.go -addr 127.0.0.1:8082 -peer http://127.0.0.1:8081 -data ./data-b
 ```
 
 Open your browser to:
