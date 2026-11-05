@@ -31,7 +31,7 @@
   const workerFrame = document.getElementById('umai-worker-frame');
 
   // State
-  let sessionToken = sessionStorage.getItem('umai_token_b') || sessionStorage.getItem('umai_session_token_b') || '';
+  let sessionToken = localStorage.getItem('umai_token_b') || sessionStorage.getItem('umai_token_b') || '';
   let peerOrigin = '';
   let embedUrl = '';
   let umaiSession = null;
@@ -86,8 +86,8 @@
         if (me.authenticated) {
           if (me.session_id) {
             sessionToken = me.session_id;
+            localStorage.setItem('umai_token_b', sessionToken);
             sessionStorage.setItem('umai_token_b', sessionToken);
-            sessionStorage.setItem('umai_session_token_b', sessionToken);
           }
           showPortal();
           return;
@@ -132,8 +132,8 @@
       const data = await res.json();
       if (res.ok && (data.authenticated || data.session_id)) {
         sessionToken = data.session_id || '';
+        localStorage.setItem('umai_token_b', sessionToken);
         sessionStorage.setItem('umai_token_b', sessionToken);
-        sessionStorage.setItem('umai_session_token_b', sessionToken);
         showPortal();
       } else {
         loginError.textContent = data.error || 'Login failed';
@@ -151,6 +151,7 @@
       await fetch('/api/auth/logout', { method: 'POST', headers: getAuthHeaders(), credentials: 'include' });
     } catch (e) {}
     sessionToken = '';
+    localStorage.removeItem('umai_token_b');
     sessionStorage.removeItem('umai_token_b');
     sessionStorage.removeItem('umai_session_token_b');
     if (umaiSession) umaiSession.stop();

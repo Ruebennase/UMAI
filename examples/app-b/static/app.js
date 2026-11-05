@@ -40,7 +40,7 @@
   const inboxCount = document.getElementById('inbox-count');
   const logBox = document.getElementById('log-box');
 
-  let sessionToken = sessionStorage.getItem('umai_token_b') || '';
+  let sessionToken = localStorage.getItem('umai_token_b') || sessionStorage.getItem('umai_token_b') || '';
 
   // --- API Utilities ---
   async function api(path, options = {}) {
@@ -56,6 +56,7 @@
     const res = await fetch(path, options);
     if (res.status === 401) {
       sessionToken = '';
+      localStorage.removeItem('umai_token_b');
       sessionStorage.removeItem('umai_token_b');
       showAuth();
       throw new Error('Unauthorized');
@@ -85,6 +86,7 @@
       if (data.authenticated) {
         if (data.session_id) {
           sessionToken = data.session_id;
+          localStorage.setItem('umai_token_b', sessionToken);
           sessionStorage.setItem('umai_token_b', sessionToken);
         }
         showApp();
@@ -127,6 +129,7 @@
       const data = await res.json();
       if (res.ok && data.authenticated) {
         sessionToken = data.session_id || '';
+        localStorage.setItem('umai_token_b', sessionToken);
         sessionStorage.setItem('umai_token_b', sessionToken);
         showApp();
       } else {
@@ -144,6 +147,7 @@
       await api('/api/auth/logout', { method: 'POST' });
     } finally {
       sessionToken = '';
+      localStorage.removeItem('umai_token_b');
       sessionStorage.removeItem('umai_token_b');
       showAuth();
     }

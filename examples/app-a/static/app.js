@@ -40,7 +40,7 @@
     iframeCookieNotice.style.display = 'block';
   }
 
-  let sessionToken = sessionStorage.getItem('umai_token_a') || '';
+  let sessionToken = localStorage.getItem('umai_token_a') || sessionStorage.getItem('umai_token_a') || '';
 
   // --- API Utilities ---
   async function api(path, options = {}) {
@@ -56,6 +56,7 @@
     const res = await fetch(path, options);
     if (res.status === 401) {
       sessionToken = '';
+      localStorage.removeItem('umai_token_a');
       sessionStorage.removeItem('umai_token_a');
       showAuth();
       throw new Error('Unauthorized');
@@ -85,6 +86,7 @@
       if (data.authenticated) {
         if (data.session_id) {
           sessionToken = data.session_id;
+          localStorage.setItem('umai_token_a', sessionToken);
           sessionStorage.setItem('umai_token_a', sessionToken);
         }
         showApp();
@@ -127,6 +129,7 @@
       const data = await res.json();
       if (res.ok && data.authenticated) {
         sessionToken = data.session_id || '';
+        localStorage.setItem('umai_token_a', sessionToken);
         sessionStorage.setItem('umai_token_a', sessionToken);
         showApp();
       } else {
@@ -144,6 +147,7 @@
       await api('/api/auth/logout', { method: 'POST' });
     } finally {
       sessionToken = '';
+      localStorage.removeItem('umai_token_a');
       sessionStorage.removeItem('umai_token_a');
       showAuth();
     }

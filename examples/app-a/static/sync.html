@@ -89,7 +89,7 @@
       const loginForm = document.getElementById('sync-login-form');
       const loginError = document.getElementById('sync-login-error');
 
-      let sessionToken = sessionStorage.getItem('umai_token_a') || sessionStorage.getItem('umai_session_token_a') || '';
+      let sessionToken = localStorage.getItem('umai_token_a') || sessionStorage.getItem('umai_token_a') || '';
       let peerOrigin = '';
       let umaiSession = null;
 
@@ -128,8 +128,8 @@
             if (me.authenticated) {
               if (me.session_id) {
                 sessionToken = me.session_id;
+                localStorage.setItem('umai_token_a', sessionToken);
                 sessionStorage.setItem('umai_token_a', sessionToken);
-                sessionStorage.setItem('umai_session_token_a', sessionToken);
               }
               startSyncWorker();
               return;
@@ -198,13 +198,28 @@
             for (const f of msg.attachments || []) {
               formData.append('attachments', f, f.name);
             }
-            const res = await fetch('/api/inbox', {
-              method: 'POST',
-              headers: getAuthHeaders(),
-              credentials: 'include',
-              body: formData
-            });
-            return res.ok;
+            try {
+              const res = await fetch('/api/inbox', {
+                method: 'POST',
+                headers: getAuthHeaders(),
+                credentials: 'include',
+                body: formData
+              });
+              if (!res.ok) {
+                console.error('[Sync Worker] acceptMessage failed with HTTP', res.status);
+                if (res.status === 401) {
+                  sessionToken = '';
+                  localStorage.removeItem('umai_token_a');
+                  sessionStorage.removeItem('umai_token_a');
+                  showAuthRequired();
+                }
+                return false;
+              }
+              return true;
+            } catch (err) {
+              console.error('[Sync Worker] acceptMessage network error:', err);
+              return false;
+            }
           },
 
           async onAcknowledged(ids) {
@@ -261,8 +276,8 @@
           const data = await res.json();
           if (res.ok && (data.authenticated || data.session_id)) {
             sessionToken = data.session_id || '';
+            localStorage.setItem('umai_token_a', sessionToken);
             sessionStorage.setItem('umai_token_a', sessionToken);
-            sessionStorage.setItem('umai_session_token_a', sessionToken);
             startSyncWorker();
           } else {
             loginError.textContent = data.error || 'Authentication failed';
