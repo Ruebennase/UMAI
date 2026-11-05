@@ -120,10 +120,11 @@ interface UmaiEnvelope {
   },
   attachments: [
     /* Native File or Blob objects */
-  ]
+  ],
+  signature: "optional-hex-encoded-sender-signature" // Optional opaque cryptographic signature from sender server
 }
 ```
-*Note:* Binary attachments are transmitted as native binary objects (`File` or `Blob`) via the browser Structured Clone Algorithm. Attachments MUST NOT be Base64-encoded.
+*Note:* Binary attachments are transmitted as native binary objects (`File` or `Blob`) via the browser Structured Clone Algorithm. Attachments MUST NOT be Base64-encoded. If the sender server signs outgoing messages, the `signature` field is carried opaquely by the browser and verified by the receiving server prior to acceptance.
 
 ### 4.4 ACK Message
 ```json
@@ -131,9 +132,13 @@ interface UmaiEnvelope {
   "protocol": "UMAI",
   "version": 1,
   "type": "ACK",
-  "ids": ["msg-1730750000-02"]
+  "ids": ["msg-1730750000-02"],
+  "receipts": {
+    "msg-1730750000-02": "optional-hex-encoded-receiver-ack-receipt"
+  }
 }
 ```
+*Note:* When server-side signing is enabled, the receiver server returns a signed acceptance receipt (`ack_receipt`) binding the accepted `id` to the sender's message signature. The browser carries `receipts` opaquely in the `ACK` envelope (including on Rule 5 repeated `ACK`s) so the sender server can verify authentic peer acceptance before deleting the outbox entry.
 
 ---
 

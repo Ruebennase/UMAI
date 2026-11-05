@@ -18,6 +18,8 @@ It enables two completely independent web applications running on different doma
 - **Symmetric:** Either application can send and receive simultaneously.
 - **Message-Oriented:** Messages consist of structured JSON payloads and native binary attachments.
 - **User-Mediated:** Transfers occur exclusively while an authorized user's browser session connects both applications.
+- **Zero Cross-Origin HTTP / Zero CORS Required:** Each application's frontend talks exclusively to its own backend. Cross-domain data moves strictly in-memory over a browser `MessagePort`, so neither server ever needs to open CORS (`Access-Control-Allow-Origin`) to the peer domain.
+- **End-to-End Signed Envelopes & Receipts:** Outbox messages and `ACK` receipts are cryptographically signed and verified server-side (`crypto/ed25519`) while carried as opaque fields (`signature`, `receipts`) by the browser—requiring zero cryptography in the browser.
 - **Receiver-Controlled:** Receivers inspect offers and decide which messages they need.
 - **Resumable & Fault-Tolerant:** Interrupted transfers cleanly resume on subsequent sessions.
 - **Application-Agnostic:** Does not dictate business schemas or database engines.
@@ -229,7 +231,25 @@ To demonstrate fault tolerance and Rule 5 (repeated acknowledgements), `tests/lo
 
 ---
 
-## 9. Production Deployment Behind Caddy
+## 9. Security Architecture & Cryptographic Verification
+
+UMAI separates **in-browser transport mediation** from **server-side cryptographic verification**:
+
+1. **Zero CORS Exposure:** Because Application A's frontend only calls Application A's backend, and Application B's frontend only calls Application B's backend, neither server exposes cross-origin CORS headers (`Access-Control-Allow-Origin` / `Access-Control-Allow-Credentials`). All cross-origin exchange happens over a private browser `MessagePort` pinned via `Content-Security-Policy: frame-ancestors`, `event.origin`, and `event.source`.
+2. **State-Machine & CSRF Hardening:**
+   - `js/umai.js` strictly enforces receiver-controlled transfers (dropping any unsolicited `PUT` not preceded by an in-flight `GET` and ignoring any `ACK` for unoffered IDs).
+   - `pkg/umaiserver` enforces same-origin `Origin` header checks on all state-changing routes, requires `Content-Type: application/json` on JSON endpoints, and never leaks pending message IDs on unauthenticated status endpoints.
+3. **End-to-End Signed Messages & Signed `ACK` Receipts (`crypto/ed25519`):**
+   - While signing happens server-side, the UMAI `PUT` and `ACK` wire schemas include first-class opaque fields (`signature` on `PUT`, and `receipts` on `ACK`).
+   - The sending server signs the canonical message ID, JSON payload hash, and attachment SHA-256 digests (`UMAI-PUT-V1`). The receiving server verifies this signature before atomic commit and returns a signed receipt (`UMAI-ACK-V1`). The sending server verifies the receipt before deleting its outbox copy—preventing browser-level tampering or forged acknowledgements without needing any cryptography in the browser.
+4. **Optional Asymmetric Encryption ("Blind Courier" Mode):**
+   - Because `js/umai.js` treats payloads and attachments as opaque objects, servers that wish to hide sensitive content from the mediating user's browser or extensions in transit can encrypt outgoing snapshots using the peer server's public key (e.g., `X25519` + `AES-256-GCM`) and decrypt upon inbox ingestion with zero changes to `js/umai.js`.
+
+👉 **See [SECURITY.md](SECURITY.md) for the complete threat model and cryptographic specification.**
+
+---
+
+## 10. Production Deployment Behind Caddy
 
 For deployment over the public internet with TLS termination on two separate domains (e.g. `https://app-a.example.ch` and `https://app-b.example.net`):
 
@@ -246,7 +266,7 @@ For deployment over the public internet with TLS termination on two separate dom
 
 ---
 
-## 10. Known Limitations
+## 11. Known Limitations
 
 - **Experimental Reference Status:** UMAI 0.1 is an experimental protocol and reference implementation.
 - **Third-Party Cookies in Cross-Origin Frames:** Certain strict browser privacy configurations block third-party cookies in iframes. Application A provides a top-level fallback login button for these environments.
@@ -255,6 +275,6 @@ For deployment over the public internet with TLS termination on two separate dom
 
 ---
 
-## 11. License
+## 12. License
 
 Released under the [MIT License](LICENSE).
