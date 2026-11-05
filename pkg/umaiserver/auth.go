@@ -110,13 +110,14 @@ func (am *AuthManager) SetSessionCookie(w http.ResponseWriter, r *http.Request, 
 	}
 
 	cookie := &http.Cookie{
-		Name:     am.cookieName,
-		Value:    sessionID,
-		Path:     "/",
-		Expires:  time.Now().Add(SessionDuration),
-		HttpOnly: true,
-		Secure:   isSecure,
-		SameSite: sameSite,
+		Name:        am.cookieName,
+		Value:       sessionID,
+		Path:        "/",
+		Expires:     time.Now().Add(SessionDuration),
+		HttpOnly:    true,
+		Secure:      isSecure,
+		SameSite:    sameSite,
+		Partitioned: isSecure,
 	}
 	http.SetCookie(w, cookie)
 }
@@ -124,14 +125,20 @@ func (am *AuthManager) SetSessionCookie(w http.ResponseWriter, r *http.Request, 
 // ClearSessionCookie clears the session cookie.
 func (am *AuthManager) ClearSessionCookie(w http.ResponseWriter, r *http.Request) {
 	isSecure := r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https"
+	sameSite := http.SameSiteLaxMode
+	if isSecure {
+		sameSite = http.SameSiteNoneMode
+	}
 	cookie := &http.Cookie{
-		Name:     am.cookieName,
-		Value:    "",
-		Path:     "/",
-		Expires:  time.Unix(0, 0),
-		MaxAge:   -1,
-		HttpOnly: true,
-		Secure:   isSecure,
+		Name:        am.cookieName,
+		Value:       "",
+		Path:        "/",
+		Expires:     time.Unix(0, 0),
+		MaxAge:      -1,
+		HttpOnly:    true,
+		Secure:      isSecure,
+		SameSite:    sameSite,
+		Partitioned: isSecure,
 	}
 	http.SetCookie(w, cookie)
 }

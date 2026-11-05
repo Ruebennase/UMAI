@@ -131,13 +131,18 @@ interface UmaiStorageAdapter {
 
 ### Step 1: Prepare the Embedded Application (e.g. Legacy App A)
 
-If Application A is embedded inside Application B via an `<iframe>`:
+If Application A (`https://app-a.company.com`) is embedded inside Application B (`https://app-b.company.org`) via an `<iframe>`:
 
-#### A. Set Content-Security-Policy (Server-side)
-Allow Application B's origin to embed Application A:
-```http
-Content-Security-Policy: frame-ancestors 'self' https://app-b.company.com
-```
+#### A. Set Content-Security-Policy & Session Cookie Attributes (Server-side)
+1. **Allow Application B's specific origin to embed Application A** (avoid wildcards `*`, and ensure any legacy `X-Frame-Options: DENY` or `SAMEORIGIN` header is removed on the embedded route):
+   ```http
+   Content-Security-Policy: frame-ancestors 'self' https://app-b.company.org;
+   ```
+2. **Configure Third-Party Session Cookies for Cross-Origin Iframes (CHIPS):**
+   Because Application A and Application B run on different domains, modern browsers treat Application A's cookies inside the iframe as third-party cookies. To prevent users from being logged out inside the iframe, Application A must issue its session cookie over HTTPS with `SameSite=None`, `Secure`, and the `Partitioned` attribute (CHIPS — *Cookies Having Independent Partitioned State*):
+   ```http
+   Set-Cookie: session_token=xyz; Path=/; Secure; HttpOnly; SameSite=None; Partitioned;
+   ```
 
 #### B. Include `umai.js` and Initialize the Session
 In Application A's web page:
@@ -211,12 +216,18 @@ In Application A's web page:
 
 ### Step 2: Prepare the Host Application (e.g. Modern App B)
 
-#### A. Add the Iframe in Your HTML
+#### A. Allow the Iframe in Host B's Content-Security-Policy (Server-side)
+If Application B serves a `Content-Security-Policy` header, explicitly allow loading frames from Application A's origin (and disallow external sites from framing Host B):
+```http
+Content-Security-Policy: frame-ancestors 'none'; frame-src 'self' https://app-a.company.com;
+```
+
+#### B. Add the Iframe in Your HTML
 ```html
 <iframe id="legacy-app-frame" src="https://app-a.company.com/embedded-view" style="width: 100%; height: 600px; border: 1px solid #ccc;"></iframe>
 ```
 
-#### B. Initialize `UmaiSession` as Host
+#### C. Initialize `UmaiSession` as Host
 ```html
 <script src="/js/umai.js"></script>
 <script>
@@ -411,12 +422,40 @@ const umai = new UMAI.UmaiSession({
 
 ---
 
-## 7. Key Invariants to Remember
+## 7. Browser Security, CSP & Cross-Origin Cookie Checklist
 
+When integrating two applications running on different origins (`https://app-a.company.com` and `https://app-b.company.org`) with separate user authentications, ensure your deployment satisfies these three browser security requirements:
+
+### 1. Content Security Policy (CSP) Configuration
+Both applications must explicitly trust the specific peer origin (never use `*`):
+- **Host (Application B):** Must allow loading the iframe from Application A:
+  ```http
+  Content-Security-Policy: frame-ancestors 'none'; frame-src 'self' https://app-a.company.com;
+  ```
+- **Embedded (Application A):** Must allow being framed by Application B (clickjacking protection) and must not send a conflicting `X-Frame-Options: DENY` or `SAMEORIGIN` header:
+  ```http
+  Content-Security-Policy: frame-ancestors 'self' https://app-b.company.org;
+  ```
+
+### 2. Authentication & Third-Party Cookie Restrictions (CHIPS)
+- **Production HTTPS Across Different Domains:** Modern browsers partition or block traditional third-party cookies inside cross-origin iframes. To maintain an authenticated session inside the embedded iframe, Application A should emit its session cookie with `Secure`, `SameSite=None`, and `Partitioned` (CHIPS):
+  ```http
+  Set-Cookie: session_token=xyz; Path=/; Secure; HttpOnly; SameSite=None; Partitioned;
+  ```
+  *(Note: `pkg/umaiserver` automatically sets `Secure`, `SameSite=None`, and `Partitioned` when served over HTTPS or behind a TLS-terminating proxy setting `X-Forwarded-Proto: https`, and also supports an `X-UMAI-Session` header fallback.)*
+- **Local Development on `127.0.0.1` / `localhost` (RFC 6265 § 8.5):** Because browser cookies are not isolated by port number on the same IP, if you test both applications locally on `127.0.0.1:8081` and `127.0.0.1:8082`, use distinct cookie names (e.g. `umai_session_app_a` and `umai_session_app_b`) or `X-UMAI-Session` headers so logging into one port does not overwrite the other port's cookie.
+
+### 3. Secure Cross-Document Messaging (`postMessage` Origin Pinning)
+- **Handled Automatically by `js/umai.js`:** When you pass `peerOrigin` to `new UMAI.UmaiSession({ peerOrigin: 'https://...' })`, `umai.js` automatically:
+  1. Passes the exact `peerOrigin` (never `'*'`) as the target origin on every `postMessage` call.
+  2. Verifies `event.origin === peerOrigin` and `event.source` (matching `iframe.contentWindow` or `window.parent`) before processing any handshake message.
+  3. Transfers a private `MessageChannel` (`MessagePort`) so all subsequent `OFFER`, `GET`, `PUT`, and `ACK` frames travel over a dedicated point-to-point port rather than the shared `window` event bus.
+- **Custom Control Messages:** If your UI sends any custom `window.postMessage` notifications outside `umai.js`, always specify the exact target origin (`iframeWindow.postMessage(data, 'https://app-a.company.com')`) and verify `if (event.origin !== 'https://expected-origin.com') return;` in your listener.
+
+### 4. Protocol Invariants
 1. **Rule 1 — Immutability:** Never modify a message once offered. If data changes, generate a new message ID.
 2. **Rule 3 — All-or-Nothing Acceptance:** If saving any file fails in `acceptMessage`, return `false`. Never acknowledge or store a partial message.
-3. **Rule 5 — Repeated Acknowledgements:** If `isAccepted(id)` returns `true` for an offered message, UMAI automatically sends `ACK` without re-requesting the message. Ensure your `isAccepted` method checks persistent storage (disk or database) so accepted IDs survive browser restarts.
-4. **Cookie Scoping (RFC 6265 § 8.5):** If testing both applications locally on `127.0.0.1`, use distinct cookie names (e.g. `session_app_a` and `session_app_b`) or `X-UMAI-Session` headers to prevent cookies from colliding across ports.
+3. **Rule 5 — Repeated Acknowledgements:** If `isAccepted(id)` returns `true` (or a stored cryptographic receipt string) for an offered message, UMAI automatically sends `ACK` without re-requesting the message. Ensure your `isAccepted` method checks persistent storage so accepted IDs survive browser restarts.
 
 ---
 
