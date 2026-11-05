@@ -58,11 +58,15 @@
     try {
       const statusRes = await fetch('/api/status', { credentials: 'include' });
       const status = await statusRes.json();
-      peerOrigin = status.peerOrigin;
-      embedUrl = status.embedUrl || peerOrigin;
+      peerOrigin = status.peer_origin || status.peerOrigin || 'http://127.0.0.1:8081';
+      embedUrl = status.peer_embed_url || status.peerEmbedURL || peerOrigin;
 
-      // Ensure iframe src points to the embed URL's sync.html
-      const syncUrl = new URL('/sync.html', embedUrl).toString();
+      // Ensure iframe src points to the embed URL's sync.html on peer origin
+      let syncBase = peerOrigin;
+      try {
+        syncBase = new URL(embedUrl).origin;
+      } catch (e) {}
+      const syncUrl = new URL('/sync.html', syncBase).toString();
       if (workerFrame.src !== syncUrl) {
         workerFrame.src = syncUrl;
       }
@@ -232,6 +236,9 @@
       iframe: workerFrame,
       storage: storageAdapter,
       onStatusChange: function ({ state, detail }) {
+        if (state === 'connected') {
+          logActivity(`🟢 Connected to Application A (${peerOrigin})!`);
+        }
         updateIndicator({ state: state });
       },
       onSyncStatus: function (status) {
@@ -306,7 +313,12 @@
         trayToggleIcon.textContent = '▲ Expand';
         updateIndicator();
         logActivity('✓ Application A background worker authenticated.');
-        if (umaiSession) umaiSession.reconcile();
+        if (umaiSession) {
+          if (umaiSession.state !== 'connected') {
+            umaiSession.start();
+          }
+          umaiSession.reconcile();
+        }
       }
     }
   });
@@ -354,7 +366,7 @@
       const res = await fetch('/api/docs', { headers: getAuthHeaders(), credentials: 'include' });
       if (!res.ok) return;
       const data = await res.json();
-      const docs = data.documents || [];
+      const docs = Array.isArray(data) ? data : (data.documents || []);
 
       inboxCount.textContent = `${docs.length} document(s)`;
 
@@ -370,8 +382,8 @@
       }
 
       inboxTbody.innerHTML = docs.map(doc => {
-        const sizeKb = (doc.size / 1024).toFixed(1);
-        const date = new Date(doc.modTime).toLocaleTimeString();
+        const sizeKb = ((doc.size || 0) / 1024).toFixed(1);
+        const date = new Date(doc.mod_time || doc.modTime || Date.now()).toLocaleTimeString();
         return `
           <tr>
             <td style="font-weight: 600; color: #fff;">📄 ${escapeHtml(doc.name)}</td>
@@ -397,7 +409,7 @@
       const res = await fetch('/api/outbox', { headers: getAuthHeaders(), credentials: 'include' });
       if (!res.ok) return;
       const data = await res.json();
-      const count = (data.messages || []).length;
+      const count = (Array.isArray(data) ? data : (data.messages || [])).length;
       outboxStat.textContent = count > 0 ? `Outbox: ${count} pending transfer` : 'Outbox: 0 pending';
     } catch (err) {}
   }

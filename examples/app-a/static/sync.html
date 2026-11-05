@@ -114,7 +114,7 @@
         try {
           const statusRes = await fetch('/api/status', { credentials: 'include' });
           const status = await statusRes.json();
-          peerOrigin = status.peerOrigin;
+          peerOrigin = status.peer_origin || status.peerOrigin || 'http://127.0.0.1:8082';
 
           const meRes = await fetch('/api/auth/me', { headers: getAuthHeaders(), credentials: 'include' });
           if (meRes.ok) {
