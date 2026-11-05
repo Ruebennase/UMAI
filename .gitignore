@@ -16,6 +16,7 @@ bin/
 examples/app-a/data/
 examples/app-b/data/
 data/
+data*/
 
 # OS and Editor files
 .DS_Store
