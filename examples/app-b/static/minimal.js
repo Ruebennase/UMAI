@@ -31,7 +31,7 @@
   const workerFrame = document.getElementById('umai-worker-frame');
 
   // State
-  let sessionToken = sessionStorage.getItem('umai_session_token_b') || '';
+  let sessionToken = sessionStorage.getItem('umai_token_b') || sessionStorage.getItem('umai_session_token_b') || '';
   let peerOrigin = '';
   let embedUrl = '';
   let umaiSession = null;
@@ -56,7 +56,7 @@
   // Check App B authentication
   async function checkAuth() {
     try {
-      const statusRes = await fetch('/api/status');
+      const statusRes = await fetch('/api/status', { credentials: 'include' });
       const status = await statusRes.json();
       peerOrigin = status.peerOrigin;
       embedUrl = status.embedUrl || peerOrigin;
@@ -67,10 +67,15 @@
         workerFrame.src = syncUrl;
       }
 
-      const meRes = await fetch('/api/auth/me', { headers: getAuthHeaders() });
+      const meRes = await fetch('/api/auth/me', { headers: getAuthHeaders(), credentials: 'include' });
       if (meRes.ok) {
         const me = await meRes.json();
         if (me.authenticated) {
+          if (me.session_id) {
+            sessionToken = me.session_id;
+            sessionStorage.setItem('umai_token_b', sessionToken);
+            sessionStorage.setItem('umai_session_token_b', sessionToken);
+          }
           showPortal();
           return;
         }
@@ -104,6 +109,7 @@
       const res = await fetch('/api/auth/login', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
         body: JSON.stringify({
           username: document.getElementById('b-username').value.trim(),
           password: document.getElementById('b-password').value
@@ -111,8 +117,9 @@
       });
 
       const data = await res.json();
-      if (res.ok && data.sessionID) {
-        sessionToken = data.sessionID;
+      if (res.ok && (data.authenticated || data.session_id)) {
+        sessionToken = data.session_id || '';
+        sessionStorage.setItem('umai_token_b', sessionToken);
         sessionStorage.setItem('umai_session_token_b', sessionToken);
         showPortal();
       } else {
@@ -120,7 +127,7 @@
         loginError.style.display = 'block';
       }
     } catch (err) {
-      loginError.textContent = err.message;
+      loginError.textContent = err.message || 'Login failed';
       loginError.style.display = 'block';
     }
   });
@@ -128,9 +135,10 @@
   // Logout handler
   btnLogout.addEventListener('click', async function () {
     try {
-      await fetch('/api/auth/logout', { method: 'POST', headers: getAuthHeaders() });
+      await fetch('/api/auth/logout', { method: 'POST', headers: getAuthHeaders(), credentials: 'include' });
     } catch (e) {}
     sessionToken = '';
+    sessionStorage.removeItem('umai_token_b');
     sessionStorage.removeItem('umai_session_token_b');
     if (umaiSession) umaiSession.stop();
     showAuth();
@@ -139,14 +147,14 @@
   // UMAI Storage Adapter for App B
   const storageAdapter = {
     async getOutboxIds() {
-      const res = await fetch('/api/outbox', { headers: getAuthHeaders() });
+      const res = await fetch('/api/outbox', { headers: getAuthHeaders(), credentials: 'include' });
       if (!res.ok) return [];
       const data = await res.json();
       return (data.messages || []).map(m => m.id);
     },
 
     async getMessage(id) {
-      const res = await fetch(`/api/outbox/${encodeURIComponent(id)}`, { headers: getAuthHeaders() });
+      const res = await fetch(`/api/outbox/${encodeURIComponent(id)}`, { headers: getAuthHeaders(), credentials: 'include' });
       if (!res.ok) return null;
       const data = await res.json();
       const meta = data.message;
@@ -156,7 +164,7 @@
       for (const att of (meta.attachments || [])) {
         const fileRes = await fetch(
           `/api/outbox/${encodeURIComponent(id)}/files/${encodeURIComponent(att.filename)}`,
-          { headers: getAuthHeaders() }
+          { headers: getAuthHeaders(), credentials: 'include' }
         );
         if (fileRes.ok) {
           const blob = await fileRes.blob();
@@ -168,7 +176,7 @@
     },
 
     async isAccepted(id) {
-      const res = await fetch(`/api/inbox/check?id=${encodeURIComponent(id)}`, { headers: getAuthHeaders() });
+      const res = await fetch(`/api/inbox/check?id=${encodeURIComponent(id)}`, { headers: getAuthHeaders(), credentials: 'include' });
       if (!res.ok) return false;
       const data = await res.json();
       return data.accepted === true;
@@ -186,6 +194,7 @@
       const res = await fetch('/api/inbox/accept', {
         method: 'POST',
         headers: getAuthHeaders(),
+        credentials: 'include',
         body: formData
       });
 
@@ -202,6 +211,7 @@
       await fetch('/api/outbox/acknowledge', {
         method: 'POST',
         headers: { ...getAuthHeaders(), 'Content-Type': 'application/json' },
+        credentials: 'include',
         body: JSON.stringify({ ids: ids })
       });
       refreshOutboxCount();
@@ -339,7 +349,7 @@
   // Refresh Inbox Table
   async function refreshInbox() {
     try {
-      const res = await fetch('/api/docs', { headers: getAuthHeaders() });
+      const res = await fetch('/api/docs', { headers: getAuthHeaders(), credentials: 'include' });
       if (!res.ok) return;
       const data = await res.json();
       const docs = data.documents || [];
@@ -382,7 +392,7 @@
   // Refresh Outbox Count
   async function refreshOutboxCount() {
     try {
-      const res = await fetch('/api/outbox', { headers: getAuthHeaders() });
+      const res = await fetch('/api/outbox', { headers: getAuthHeaders(), credentials: 'include' });
       if (!res.ok) return;
       const data = await res.json();
       const count = (data.messages || []).length;
@@ -408,6 +418,7 @@
       const uploadRes = await fetch('/api/docs', {
         method: 'POST',
         headers: getAuthHeaders(),
+        credentials: 'include',
         body: uploadData
       });
 
@@ -420,6 +431,7 @@
       const outboxRes = await fetch('/api/outbox', {
         method: 'POST',
         headers: { ...getAuthHeaders(), 'Content-Type': 'application/json' },
+        credentials: 'include',
         body: JSON.stringify({
           subject: subject,
           attachmentFilenames: [file.name]

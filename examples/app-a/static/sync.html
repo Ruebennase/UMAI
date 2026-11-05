@@ -89,7 +89,7 @@
       const loginForm = document.getElementById('sync-login-form');
       const loginError = document.getElementById('sync-login-error');
 
-      let sessionToken = sessionStorage.getItem('umai_session_token_a') || '';
+      let sessionToken = sessionStorage.getItem('umai_token_a') || sessionStorage.getItem('umai_session_token_a') || '';
       let peerOrigin = '';
       let umaiSession = null;
 
@@ -112,14 +112,19 @@
 
       async function init() {
         try {
-          const statusRes = await fetch('/api/status');
+          const statusRes = await fetch('/api/status', { credentials: 'include' });
           const status = await statusRes.json();
           peerOrigin = status.peerOrigin;
 
-          const meRes = await fetch('/api/auth/me', { headers: getAuthHeaders() });
+          const meRes = await fetch('/api/auth/me', { headers: getAuthHeaders(), credentials: 'include' });
           if (meRes.ok) {
             const me = await meRes.json();
             if (me.authenticated) {
+              if (me.session_id) {
+                sessionToken = me.session_id;
+                sessionStorage.setItem('umai_token_a', sessionToken);
+                sessionStorage.setItem('umai_session_token_a', sessionToken);
+              }
               startSyncWorker();
               return;
             }
@@ -143,14 +148,14 @@
 
         const storageAdapter = {
           async getOutboxIds() {
-            const res = await fetch('/api/outbox', { headers: getAuthHeaders() });
+            const res = await fetch('/api/outbox', { headers: getAuthHeaders(), credentials: 'include' });
             if (!res.ok) return [];
             const data = await res.json();
             return (data.messages || []).map(m => m.id);
           },
 
           async getMessage(id) {
-            const res = await fetch(`/api/outbox/${encodeURIComponent(id)}`, { headers: getAuthHeaders() });
+            const res = await fetch(`/api/outbox/${encodeURIComponent(id)}`, { headers: getAuthHeaders(), credentials: 'include' });
             if (!res.ok) return null;
             const data = await res.json();
             const meta = data.message;
@@ -160,7 +165,7 @@
             for (const att of (meta.attachments || [])) {
               const fileRes = await fetch(
                 `/api/outbox/${encodeURIComponent(id)}/files/${encodeURIComponent(att.filename)}`,
-                { headers: getAuthHeaders() }
+                { headers: getAuthHeaders(), credentials: 'include' }
               );
               if (fileRes.ok) {
                 const blob = await fileRes.blob();
@@ -172,7 +177,7 @@
           },
 
           async isAccepted(id) {
-            const res = await fetch(`/api/inbox/check?id=${encodeURIComponent(id)}`, { headers: getAuthHeaders() });
+            const res = await fetch(`/api/inbox/check?id=${encodeURIComponent(id)}`, { headers: getAuthHeaders(), credentials: 'include' });
             if (!res.ok) return false;
             const data = await res.json();
             return data.accepted === true;
@@ -188,6 +193,7 @@
             const res = await fetch('/api/inbox/accept', {
               method: 'POST',
               headers: getAuthHeaders(),
+              credentials: 'include',
               body: formData
             });
             return res.ok;
@@ -197,6 +203,7 @@
             await fetch('/api/outbox/acknowledge', {
               method: 'POST',
               headers: { ...getAuthHeaders(), 'Content-Type': 'application/json' },
+              credentials: 'include',
               body: JSON.stringify({ ids: ids })
             });
           }
@@ -236,6 +243,7 @@
           const res = await fetch('/api/auth/login', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
+            credentials: 'include',
             body: JSON.stringify({
               username: document.getElementById('sync-username').value.trim(),
               password: document.getElementById('sync-password').value
@@ -243,8 +251,9 @@
           });
 
           const data = await res.json();
-          if (res.ok && data.sessionID) {
-            sessionToken = data.sessionID;
+          if (res.ok && (data.authenticated || data.session_id)) {
+            sessionToken = data.session_id || '';
+            sessionStorage.setItem('umai_token_a', sessionToken);
             sessionStorage.setItem('umai_session_token_a', sessionToken);
             startSyncWorker();
           } else {
@@ -252,7 +261,7 @@
             loginError.style.display = 'block';
           }
         } catch (err) {
-          loginError.textContent = err.message;
+          loginError.textContent = err.message || 'Authentication failed';
           loginError.style.display = 'block';
         }
       });
