@@ -4,15 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Application B — UMAI 0.1 Host</title>
-  <link rel="stylesheet" href="/style.css?v=0.1.2">
-  <script>
-    // Clean up stale service workers or caches from other projects on this port
-    if ('serviceWorker' in navigator) {
-      navigator.serviceWorker.getRegistrations().then(function(regs) {
-        for (var r of regs) r.unregister();
-      });
-    }
-  </script>
+  <link rel="stylesheet" href="/style.css?v=0.1.6">
 </head>
 <body>
   <!-- Auth Screen for App B -->
@@ -154,7 +146,7 @@
           </div>
           <div style="display: flex; gap: 6px;">
             <button id="btn-reload-iframe" class="btn btn-secondary btn-sm" title="Reload iframe">Reload A</button>
-            <a id="btn-open-top" href="#" target="_blank" class="btn btn-secondary btn-sm" title="Open in standalone tab">Open Top-Level ↗</a>
+            <a id="btn-open-top" href="#" target="_blank" rel="noopener noreferrer" class="btn btn-secondary btn-sm" title="Open in standalone tab">Open Top-Level ↗</a>
           </div>
         </div>
         <div style="flex: 1; position: relative;">
@@ -164,7 +156,7 @@
     </div>
   </div>
 
-  <script src="/js/umai.js?v=0.1.5"></script>
-  <script src="app.js?v=0.1.5"></script>
+  <script src="/js/umai.js?v=0.1.6"></script>
+  <script src="app.js?v=0.1.6"></script>
 </body>
 </html>

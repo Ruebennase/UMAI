@@ -21,8 +21,9 @@ app-a.example.ch {
     # Content-Security-Policy frame-ancestors explicitly allows https://app-b.example.net
     # to embed Application A within an iframe.
     header {
-        Content-Security-Policy "frame-ancestors 'self' https://app-b.example.net; default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'"
+        Content-Security-Policy "frame-ancestors 'self' https://app-b.example.net; default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'"
         X-Content-Type-Options "nosniff"
+        Referrer-Policy "no-referrer"
         Strict-Transport-Security "max-age=31536000; includeSubDomains"
         -X-Frame-Options
     }
@@ -52,8 +53,9 @@ app-b.example.net {
     # Security Headers:
     # Application B is the host and embeds App A via frame-src, but does not allow itself to be framed.
     header {
-        Content-Security-Policy "frame-ancestors 'none'; frame-src 'self' https://app-a.example.ch; default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'"
+        Content-Security-Policy "frame-ancestors 'none'; frame-src 'self' https://app-a.example.ch; default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'"
         X-Content-Type-Options "nosniff"
+        Referrer-Policy "no-referrer"
         Strict-Transport-Security "max-age=31536000; includeSubDomains"
         X-Frame-Options "DENY"
     }

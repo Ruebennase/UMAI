@@ -87,7 +87,7 @@ func NewStorage(dataDir string, maxUploadSize int64) (*Storage, error) {
 	acceptedFile := filepath.Join(absDataDir, "accepted.json")
 
 	for _, dir := range []string{absDataDir, docsDir, outboxDir, inboxDir} {
-		if err := os.MkdirAll(dir, 0755); err != nil {
+		if err := os.MkdirAll(dir, 0700); err != nil {
 			return nil, fmt.Errorf("creating directory %s: %w", dir, err)
 		}
 	}
@@ -227,7 +227,7 @@ func (s *Storage) SaveDocument(filename string, r io.Reader) (*DocumentInfo, err
 	targetPath := filepath.Join(s.docsDir, cleanName)
 	tmpPath := targetPath + fmt.Sprintf(".tmp-%d", time.Now().UnixNano())
 
-	f, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	f, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
 	if err != nil {
 		return nil, err
 	}
@@ -281,7 +281,7 @@ func (s *Storage) GetDocumentPath(filename string) (string, error) {
 	defer s.mu.RUnlock()
 
 	targetPath := filepath.Join(s.docsDir, cleanName)
-	if fi, err := os.Stat(targetPath); err != nil || fi.IsDir() {
+	if fi, err := os.Lstat(targetPath); err != nil || !fi.Mode().IsRegular() {
 		return "", ErrNotFound
 	}
 	return targetPath, nil
@@ -316,6 +316,9 @@ func (s *Storage) CreateOutboxMessage(payload any, docNames []string) (*Message,
 	if len(docNames) > MaxAttachmentsPerMessage {
 		return nil, ErrTooManyAttachments
 	}
+	if payload == nil {
+		payload = map[string]any{}
+	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -324,7 +327,7 @@ func (s *Storage) CreateOutboxMessage(payload any, docNames []string) (*Message,
 	msgDir := filepath.Join(s.outboxDir, msgID)
 	attachmentsDir := filepath.Join(msgDir, "attachments")
 
-	if err := os.MkdirAll(attachmentsDir, 0755); err != nil {
+	if err := os.MkdirAll(attachmentsDir, 0700); err != nil {
 		return nil, err
 	}
 
@@ -345,6 +348,13 @@ func (s *Storage) CreateOutboxMessage(payload any, docNames []string) (*Message,
 		seenNames[cleanName] = true
 
 		srcPath := filepath.Join(s.docsDir, cleanName)
+		if fi, err := os.Lstat(srcPath); err != nil || !fi.Mode().IsRegular() {
+			_ = os.RemoveAll(msgDir)
+			if err != nil && os.IsNotExist(err) {
+				return nil, fmt.Errorf("attachment %s does not exist: %w", cleanName, ErrNotFound)
+			}
+			return nil, ErrTraversal
+		}
 		srcFile, err := os.Open(srcPath)
 		if err != nil {
 			_ = os.RemoveAll(msgDir)
@@ -355,7 +365,7 @@ func (s *Storage) CreateOutboxMessage(payload any, docNames []string) (*Message,
 		}
 
 		dstPath := filepath.Join(attachmentsDir, cleanName)
-		dstFile, err := os.OpenFile(dstPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+		dstFile, err := os.OpenFile(dstPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
 		if err != nil {
 			_ = srcFile.Close()
 			_ = os.RemoveAll(msgDir)
@@ -727,6 +737,9 @@ func (s *Storage) acceptMessageInternal(id string, payload any, attachments []At
 	if len(attachments) > MaxAttachmentsPerMessage {
 		return nil, ErrTooManyAttachments
 	}
+	if payload == nil {
+		payload = map[string]any{}
+	}
 
 	cleanID, err := sanitizeID(id)
 	if err != nil {
@@ -736,14 +749,22 @@ func (s *Storage) acceptMessageInternal(id string, payload any, attachments []At
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// If already accepted, return existing message (including its stored AckReceipt) without re-importing
+	// If already accepted, verify signature match (when required) before returning stored message & AckReceipt
 	if s.acceptedIDs[cleanID] {
 		msgFile := filepath.Join(s.inboxDir, cleanID, "message.json")
 		if data, err := os.ReadFile(msgFile); err == nil {
 			var existing Message
 			if err := json.Unmarshal(data, &existing); err == nil {
+				if (requireSignature || sigHex != "") && len(s.peerPubKey) > 0 && existing.Signature != "" {
+					if !strings.EqualFold(strings.TrimSpace(existing.Signature), strings.TrimSpace(sigHex)) {
+						return nil, ErrInvalidSignature
+					}
+				}
 				return &existing, nil
 			}
+		}
+		if requireSignature && len(s.peerPubKey) > 0 && strings.TrimSpace(sigHex) == "" {
+			return nil, ErrInvalidSignature
 		}
 		return &Message{ID: cleanID, Payload: payload}, nil
 	}
@@ -751,7 +772,7 @@ func (s *Storage) acceptMessageInternal(id string, payload any, attachments []At
 	// Atomic staging directory: all-or-nothing
 	tmpDir := filepath.Join(s.inboxDir, fmt.Sprintf(".tmp-%s-%d", cleanID, time.Now().UnixNano()))
 	tmpAttachmentsDir := filepath.Join(tmpDir, "attachments")
-	if err := os.MkdirAll(tmpAttachmentsDir, 0755); err != nil {
+	if err := os.MkdirAll(tmpAttachmentsDir, 0700); err != nil {
 		return nil, err
 	}
 
@@ -770,7 +791,7 @@ func (s *Storage) acceptMessageInternal(id string, payload any, attachments []At
 		seenNames[cleanName] = true
 
 		dstPath := filepath.Join(tmpAttachmentsDir, cleanName)
-		dstFile, err := os.OpenFile(dstPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+		dstFile, err := os.OpenFile(dstPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
 		if err != nil {
 			_ = os.RemoveAll(tmpDir)
 			return nil, err
@@ -896,7 +917,7 @@ func (s *Storage) writeAtomicJSON(targetPath string, v any) error {
 	}
 
 	tmpPath := targetPath + fmt.Sprintf(".tmp-%d", time.Now().UnixNano())
-	f, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	f, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
 	if err != nil {
 		return err
 	}

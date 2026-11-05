@@ -469,3 +469,72 @@ func TestConcurrentSessions_SoftLeaseAndNextBestSelection(t *testing.T) {
 	_ = m2
 	_ = m3
 }
+
+func TestSecurity_StrictCSP_CookieCSRF_NilPayload_And_DuplicateProbe(t *testing.T) {
+	appA := setupApp(t, "app-a", "http://127.0.0.1:8082")
+	appB := setupApp(t, "app-b", "http://127.0.0.1:8081")
+
+	// 1. Verify strict CSP: no 'unsafe-inline' in script-src and no localhost:* wildcard in connect-src
+	reqStatus, _ := http.NewRequest("GET", "/api/status", nil)
+	resStatus := appA.Do(reqStatus)
+	defer resStatus.Body.Close()
+	csp := resStatus.Header.Get("Content-Security-Policy")
+	if bytes.Contains([]byte(csp), []byte("script-src 'self' 'unsafe-inline'")) {
+		t.Errorf("CSP must not allow 'unsafe-inline' in script-src: %s", csp)
+	}
+	if bytes.Contains([]byte(csp), []byte("connect-src 'self' localhost:*")) {
+		t.Errorf("CSP must not allow localhost:* wildcard in connect-src: %s", csp)
+	}
+
+	// 2. Verify cookie-authenticated POST without Origin or X-UMAI-CSRF is blocked (stripped-Origin form CSRF defense)
+	reqCookieCSRF, _ := http.NewRequest("POST", "/api/docs", bytes.NewReader([]byte("dummy")))
+	reqCookieCSRF.AddCookie(&http.Cookie{Name: "umai_session_a", Value: appA.SessionID})
+	resCookieCSRF := appA.Do(reqCookieCSRF)
+	defer resCookieCSRF.Body.Close()
+	if resCookieCSRF.StatusCode != http.StatusForbidden {
+		t.Errorf("Expected 403 Forbidden on cookie-only POST without Origin/CSRF header, got %d", resCookieCSRF.StatusCode)
+	}
+
+	// 3. Verify nil payload signing matches '{}' JSON payload in transit, and verify attachment download sandbox CSP
+	_, _ = appA.Server.Storage().SaveDocument("note.html", bytes.NewReader([]byte("<script>alert(1)</script>")))
+	reqDl, _ := authenticatedRequest("GET", "/api/docs/note.html", appA.SessionID, nil, "")
+	resDl := appA.Do(reqDl)
+	defer resDl.Body.Close()
+	if dlCSP := resDl.Header.Get("Content-Security-Policy"); dlCSP != "default-src 'none'; sandbox" {
+		t.Errorf("Expected attachment download sandbox CSP, got %q", dlCSP)
+	}
+
+	msgNil, err := appA.Server.Storage().CreateOutboxMessage(nil, nil)
+	if err != nil {
+		t.Fatalf("CreateOutboxMessage(nil): %v", err)
+	}
+
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	_ = mw.WriteField("id", msgNil.ID)
+	_ = mw.WriteField("payload", "{}")
+	_ = mw.WriteField("signature", msgNil.Signature)
+	_ = mw.Close()
+
+	reqAccept, _ := authenticatedRequest("POST", "/api/inbox", appB.SessionID, &buf, mw.FormDataContentType())
+	resAccept := appB.Do(reqAccept)
+	defer resAccept.Body.Close()
+	if resAccept.StatusCode != http.StatusOK {
+		t.Fatalf("Expected nil-payload message to verify cleanly with '{}', got %d", resAccept.StatusCode)
+	}
+
+	// 4. Verify duplicate POST /api/inbox probe with missing/forged signature for an already-accepted ID is rejected
+	var bufProbe bytes.Buffer
+	mwProbe := multipart.NewWriter(&bufProbe)
+	_ = mwProbe.WriteField("id", msgNil.ID)
+	_ = mwProbe.WriteField("payload", "{}")
+	_ = mwProbe.WriteField("signature", "deadbeef")
+	_ = mwProbe.Close()
+
+	reqProbe, _ := authenticatedRequest("POST", "/api/inbox", appB.SessionID, &bufProbe, mwProbe.FormDataContentType())
+	resProbe := appB.Do(reqProbe)
+	defer resProbe.Body.Close()
+	if resProbe.StatusCode == http.StatusOK {
+		t.Errorf("Expected duplicate POST /api/inbox with invalid signature to be rejected, got 200 OK")
+	}
+}

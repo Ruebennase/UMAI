@@ -66,12 +66,21 @@ func ParseKeyPair(role, privHex, peerPubHex string) (ed25519.PublicKey, ed25519.
 	return ownPub, ownPriv, peerPub, nil
 }
 
-// CanonicalPutDigest computes the canonical SHA-256 digest of a UMAI PUT message:
+// CanonicalPutDigest computes the unambiguous, length-prefixed canonical SHA-256 digest of a UMAI PUT message:
 //
-//	UMAI-PUT-V1\n<sender_role>\n<id>\n<payload_canonical_sha256>\n<att1_name>:<att1_size>:<att1_sha256>\n...
+//	UMAI-PUT-V1\n
+//	role:<len>:<sender_role>\n
+//	id:<len>:<id>\n
+//	payload:<payload_canonical_sha256>\n
+//	att_count:<count>\n
+//	att:<name_len>:<att1_name>:<att1_size>:<att1_sha256>\n...
 //
-// Attachments are sorted by sanitized name so ordering differences never break verification.
+// Length-prefixing variable-length strings guarantees injectivity (zero delimiter collision ambiguity),
+// and sorting attachments by sanitized name ensures ordering differences never break verification.
 func CanonicalPutDigest(senderRole string, id string, payload any, attachments []AttachmentInfo) ([32]byte, error) {
+	if payload == nil {
+		payload = map[string]any{}
+	}
 	// Normalize payload through JSON round-trip so map types and json.Unmarshal outputs produce identical JSON
 	var normalized any
 	rawBytes, err := json.Marshal(payload)
@@ -80,6 +89,8 @@ func CanonicalPutDigest(senderRole string, id string, payload any, attachments [
 	}
 	if len(rawBytes) > 0 && string(rawBytes) != "null" {
 		_ = json.Unmarshal(rawBytes, &normalized)
+	} else {
+		normalized = map[string]any{}
 	}
 	canonicalPayload, err := json.Marshal(normalized)
 	if err != nil {
@@ -95,14 +106,12 @@ func CanonicalPutDigest(senderRole string, id string, payload any, attachments [
 
 	var sb strings.Builder
 	sb.WriteString("UMAI-PUT-V1\n")
-	sb.WriteString(senderRole)
-	sb.WriteString("\n")
-	sb.WriteString(id)
-	sb.WriteString("\n")
-	sb.WriteString(hex.EncodeToString(payloadHash[:]))
-	sb.WriteString("\n")
+	sb.WriteString(fmt.Sprintf("role:%d:%s\n", len(senderRole), senderRole))
+	sb.WriteString(fmt.Sprintf("id:%d:%s\n", len(id), id))
+	sb.WriteString(fmt.Sprintf("payload:%s\n", hex.EncodeToString(payloadHash[:])))
+	sb.WriteString(fmt.Sprintf("att_count:%d\n", len(sortedAtts)))
 	for _, a := range sortedAtts {
-		sb.WriteString(fmt.Sprintf("%s:%d:%s\n", a.Name, a.Size, a.SHA256))
+		sb.WriteString(fmt.Sprintf("att:%d:%s:%d:%s\n", len(a.Name), a.Name, a.Size, a.SHA256))
 	}
 
 	return sha256.Sum256([]byte(sb.String())), nil
@@ -143,12 +152,17 @@ func VerifyPutMessage(pub ed25519.PublicKey, expectedSenderRole string, id strin
 	return nil
 }
 
-// CanonicalAckDigest computes the canonical SHA-256 digest for an ACK receipt binding the message ID
-// to the exact message signature that was accepted and the receiver's role:
+// CanonicalAckDigest computes the unambiguous, length-prefixed canonical SHA-256 digest for an ACK receipt
+// binding the message ID to the exact message signature that was accepted and the receiver's role:
 //
-//	UMAI-ACK-V1\n<receiver_role>\n<id>\n<message_signature_hex>
+//	UMAI-ACK-V1\nrole:<len>:<receiver_role>\nid:<len>:<id>\nsig:<len>:<message_signature_hex>\n
 func CanonicalAckDigest(receiverRole string, id string, msgSignatureHex string) [32]byte {
-	data := fmt.Sprintf("UMAI-ACK-V1\n%s\n%s\n%s\n", receiverRole, id, strings.TrimSpace(msgSignatureHex))
+	sigClean := strings.TrimSpace(msgSignatureHex)
+	data := fmt.Sprintf("UMAI-ACK-V1\nrole:%d:%s\nid:%d:%s\nsig:%d:%s\n",
+		len(receiverRole), receiverRole,
+		len(id), id,
+		len(sigClean), sigClean,
+	)
 	return sha256.Sum256([]byte(data))
 }
 

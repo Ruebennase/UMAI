@@ -111,8 +111,9 @@ function createMockChannel() {
 
   console.log('✓ Test 2: Symmetric MessagePort exchange with repeated-ACK (Rule 5) passed');
 
-  // Test 3: Security — Unsolicited PUT is dropped & Unoffered ACK IDs are ignored
+  // Test 3: Security — Unsolicited PUT is dropped, Unoffered GET cannot poison _offeredIds, & Unoffered ACK IDs are ignored
   let unsolicitedAccepted = false;
+  let unofferedGetFetched = false;
   let unofferedAcked = [];
 
   const secSession = new UmaiSession({
@@ -120,7 +121,10 @@ function createMockChannel() {
     role: 'embedded',
     storage: {
       getOutboxIds: async () => ['msg-real-100'],
-      getMessage: async (id) => ({ id, payload: {}, attachments: [] }),
+      getMessage: async (id) => {
+        if (id === 'msg-never-offered') unofferedGetFetched = true;
+        return { id, payload: {}, attachments: [] };
+      },
       isAccepted: async () => false,
       acceptMessage: async () => {
         unsolicitedAccepted = true;
@@ -140,6 +144,16 @@ function createMockChannel() {
   // Offer msg-real-100 so only msg-real-100 is in _offeredIds
   await secSession.reconcile();
 
+  // Attempt GET for an unoffered ID ('msg-never-offered') to verify it cannot fetch or poison _offeredIds
+  await secSession._handleGet({
+    protocol: PROTOCOL_NAME,
+    version: PROTOCOL_VERSION,
+    type: 'GET',
+    ids: ['msg-never-offered']
+  });
+  await new Promise(r => setTimeout(r, 20));
+  assert.strictEqual(unofferedGetFetched, false, 'Unoffered GET must not invoke storage.getMessage');
+
   // Send unsolicited PUT (not in _inFlightGets)
   await secSession._handlePut({
     protocol: PROTOCOL_NAME,
@@ -151,16 +165,16 @@ function createMockChannel() {
   });
   assert.strictEqual(unsolicitedAccepted, false, 'Unsolicited PUT must be dropped without calling acceptMessage');
 
-  // Send ACK containing an unoffered ID ('msg-not-offered') alongside the offered ID ('msg-real-100')
+  // Send ACK containing unoffered IDs ('msg-not-offered', 'msg-never-offered') alongside the offered ID ('msg-real-100')
   await secSession._handleAck({
     protocol: PROTOCOL_NAME,
     version: PROTOCOL_VERSION,
     type: 'ACK',
-    ids: ['msg-not-offered', 'msg-real-100']
+    ids: ['msg-not-offered', 'msg-never-offered', 'msg-real-100']
   });
   assert.deepStrictEqual(unofferedAcked, ['msg-real-100'], 'Only offered IDs should be passed to onAcknowledged');
 
-  console.log('✓ Test 3: State-machine security (unsolicited PUT & unoffered ACK rejection) passed');
+  console.log('✓ Test 3: State-machine security (unsolicited PUT, unoffered GET, & unoffered ACK rejection) passed');
 
   secSession.stop();
   sessionA.stop();

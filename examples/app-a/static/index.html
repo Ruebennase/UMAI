@@ -4,14 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Application A — UMAI 0.1</title>
-  <link rel="stylesheet" href="/style.css?v=0.1.2">
-  <script>
-    if ('serviceWorker' in navigator) {
-      navigator.serviceWorker.getRegistrations().then(function(regs) {
-        for (var r of regs) r.unregister();
-      });
-    }
-  </script>
+  <link rel="stylesheet" href="/style.css?v=0.1.6">
 </head>
 <body>
   <div id="auth-container" class="auth-box" style="display: none;">
@@ -22,7 +15,7 @@
 
     <div id="iframe-cookie-notice" class="banner banner-warning" style="display: none;">
       <strong>Note on iframe cookies:</strong> If your browser blocks third-party cookies in embedded frames,
-      <a href="/" target="_blank" style="color: inherit; text-decoration: underline; font-weight: 600;">click here to log in in a top-level tab</a>,
+      <a href="/" target="_blank" rel="noopener noreferrer" style="color: inherit; text-decoration: underline; font-weight: 600;">click here to log in in a top-level tab</a>,
       then return and refresh.
     </div>
 
@@ -126,7 +119,7 @@
     </div>
   </div>
 
-  <script src="/js/umai.js?v=0.1.5"></script>
-  <script src="app.js?v=0.1.5"></script>
+  <script src="/js/umai.js?v=0.1.6"></script>
+  <script src="app.js?v=0.1.6"></script>
 </body>
 </html>

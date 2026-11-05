@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 func init() {
@@ -32,6 +33,13 @@ type Server struct {
 
 // NewServer creates a new UMAI server.
 func NewServer(cfg Config, staticDir string) (*Server, error) {
+	if cfg.PeerOrigin != "" {
+		u, err := url.Parse(cfg.PeerOrigin)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			return nil, fmt.Errorf("invalid peer origin %q: must be an http:// or https:// origin", cfg.PeerOrigin)
+		}
+	}
+
 	storage, err := NewStorage(cfg.DataDir, cfg.MaxUploadSize)
 	if err != nil {
 		return nil, fmt.Errorf("initializing storage: %w", err)
@@ -82,8 +90,19 @@ func (s *Server) Handler() http.Handler {
 // Start begins listening on the configured address.
 func (s *Server) Start() error {
 	server := &http.Server{
-		Addr:    s.cfg.ListenAddr,
-		Handler: s.Handler(),
+		Addr:              s.cfg.ListenAddr,
+		Handler:           s.Handler(),
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       5 * time.Minute,
+		WriteTimeout:      5 * time.Minute,
+		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    1 << 20, // 1 MB
+	}
+	if s.cfg.SigningPrivateKey == "" || s.cfg.PeerPublicKey == "" {
+		log.Printf("[%s] SECURITY NOTICE: Using deterministic role demo Ed25519 keys. Set UMAI_SIGNING_PRIVATE_KEY and UMAI_PEER_PUBLIC_KEY in production.", s.cfg.AppName)
+	}
+	if s.cfg.AuthPassword == "umai123" {
+		log.Printf("[%s] SECURITY NOTICE: Using default demo credentials (%s / umai123). Override via -user/-pass or UMAI_AUTH_USER/UMAI_AUTH_PASS.", s.cfg.AppName, s.cfg.AuthUsername)
 	}
 	log.Printf("[%s] Starting on http://%s (Peer: %s, Data: %s)", s.cfg.AppName, s.cfg.ListenAddr, s.cfg.PeerOrigin, s.cfg.DataDir)
 	return server.ListenAndServe()
@@ -112,6 +131,7 @@ func (s *Server) securityMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Strict security headers
 		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("Referrer-Policy", "no-referrer")
 
 		// Prevent browser from caching stale files from previous projects on this port
 		w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
@@ -120,14 +140,14 @@ func (s *Server) securityMiddleware(next http.Handler) http.Handler {
 
 		altPeer := loopbackAlt(s.cfg.PeerOrigin)
 
-		// Content Security Policy
+		// Content Security Policy (zero 'unsafe-inline' in script-src; strictly same-origin connect-src)
 		var csp string
 		if s.cfg.AllowEmbedding {
 			// Permitted to be embedded by peer origin
-			csp = fmt.Sprintf("frame-ancestors 'self' %s %s; default-src 'self' 'unsafe-inline' localhost:* 127.0.0.1:*; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' localhost:* 127.0.0.1:*", s.cfg.PeerOrigin, altPeer)
+			csp = fmt.Sprintf("frame-ancestors 'self' %s %s; default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'", s.cfg.PeerOrigin, altPeer)
 		} else {
 			// Host page embedding peer
-			csp = fmt.Sprintf("frame-ancestors 'none'; default-src 'self' 'unsafe-inline' localhost:* 127.0.0.1:*; frame-src 'self' %s %s; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' localhost:* 127.0.0.1:*", s.cfg.PeerOrigin, altPeer)
+			csp = fmt.Sprintf("frame-ancestors 'none'; default-src 'self'; frame-src 'self' %s %s; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'", s.cfg.PeerOrigin, altPeer)
 		}
 		w.Header().Set("Content-Security-Policy", csp)
 
@@ -139,7 +159,10 @@ func (s *Server) securityMiddleware(next http.Handler) http.Handler {
 		}
 
 		// CSRF protection on state-changing requests (POST, PUT, DELETE, PATCH):
-		// If an Origin header is present, it must match this server's own origin.
+		// 1. If an Origin header is present, it must match this server's own origin.
+		// 2. If Origin is omitted on a cookie-authenticated request (e.g. stripped Referrer/Origin),
+		//    require an explicit custom header (X-UMAI-CSRF, X-UMAI-Session, or Authorization)
+		//    which cross-site HTML <form enctype="multipart/form-data"> submissions cannot set.
 		if r.Method == http.MethodPost || r.Method == http.MethodPut || r.Method == http.MethodDelete || r.Method == http.MethodPatch {
 			if origin := r.Header.Get("Origin"); origin != "" {
 				if !s.isSameServerOrigin(origin, r) {
@@ -148,6 +171,14 @@ func (s *Server) securityMiddleware(next http.Handler) http.Handler {
 					})
 					return
 				}
+			} else if r.Header.Get("Cookie") != "" &&
+				r.Header.Get("X-UMAI-CSRF") == "" &&
+				r.Header.Get("X-UMAI-Session") == "" &&
+				r.Header.Get("Authorization") == "" {
+				writeJSON(w, http.StatusForbidden, map[string]string{
+					"error": "forbidden: missing Origin or CSRF header on cookie-authenticated request",
+				})
+				return
 			}
 		}
 
@@ -387,6 +418,7 @@ func (s *Server) handleDownloadDoc(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	w.Header().Set("Content-Security-Policy", "default-src 'none'; sandbox")
 	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", filepath.Base(path)))
 	http.ServeFile(w, r, path)
 }
@@ -481,6 +513,7 @@ func (s *Server) handleGetOutboxAttachment(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
+	w.Header().Set("Content-Security-Policy", "default-src 'none'; sandbox")
 	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", filepath.Base(path)))
 	http.ServeFile(w, r, path)
 }
@@ -554,6 +587,7 @@ func (s *Server) handleGetInboxAttachment(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	w.Header().Set("Content-Security-Policy", "default-src 'none'; sandbox")
 	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", filepath.Base(path)))
 	http.ServeFile(w, r, path)
 }

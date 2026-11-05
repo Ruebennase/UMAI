@@ -2,6 +2,12 @@
 (function () {
   'use strict';
 
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.getRegistrations().then(function (regs) {
+      for (const r of regs) r.unregister();
+    });
+  }
+
   let umaiSession = null;
   let serverConfig = null;
 
@@ -46,12 +52,12 @@
   async function api(path, options = {}) {
     options.credentials = 'include';
     options.headers = options.headers || {};
-    if (sessionToken) {
-      if (options.headers instanceof Headers) {
-        options.headers.set('X-UMAI-Session', sessionToken);
-      } else {
-        options.headers['X-UMAI-Session'] = sessionToken;
-      }
+    if (options.headers instanceof Headers) {
+      options.headers.set('X-UMAI-CSRF', '1');
+      if (sessionToken) options.headers.set('X-UMAI-Session', sessionToken);
+    } else {
+      options.headers['X-UMAI-CSRF'] = '1';
+      if (sessionToken) options.headers['X-UMAI-Session'] = sessionToken;
     }
     const res = await fetch(path, options);
     if (res.status === 401) {
@@ -122,7 +128,7 @@
     try {
       const res = await fetch('/api/auth/login', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', 'X-UMAI-CSRF': '1' },
         credentials: 'include',
         body: JSON.stringify({ username, password })
       });
@@ -517,7 +523,8 @@
       .replace(/&/g, '&amp;')
       .replace(/</g, '&lt;')
       .replace(/>/g, '&gt;')
-      .replace(/"/g, '&quot;');
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
   }
 
   // Start auth check

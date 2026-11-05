@@ -1,6 +1,12 @@
 (function () {
   'use strict';
 
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.getRegistrations().then(function (regs) {
+      for (const r of regs) r.unregister();
+    });
+  }
+
   // Elements
   const authScreen = document.getElementById('auth-screen');
   const portalContainer = document.getElementById('portal-container');
@@ -40,6 +46,7 @@
   async function api(path, options = {}) {
     options.credentials = 'include';
     options.headers = options.headers || {};
+    options.headers['X-UMAI-CSRF'] = '1';
     if (sessionToken) {
       options.headers['X-UMAI-Session'] = sessionToken;
     }
@@ -127,7 +134,7 @@
     try {
       const res = await fetch('/api/auth/login', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', 'X-UMAI-CSRF': '1' },
         credentials: 'include',
         body: JSON.stringify({
           username: document.getElementById('b-username').value.trim(),

@@ -50,12 +50,13 @@ Depending on the trust relationship between the two applications and the mediati
 
 ### 3.3 Receiver-Controlled State Machine Enforcement
 - **Unsolicited `PUT` Rejection:** Under Rule 2 (Receiver-Controlled Transfer), a receiver only requests unaccepted messages via `GET` (tracked in `_inFlightGets`). Any unsolicited `PUT` whose message ID was not requested by a preceding `GET` is immediately dropped.
-- **Offered `ACK` Validation:** Under Rule 6, a sender tracks offered message IDs in `_offeredIds` and ignores any incoming `ACK` identifiers that were never offered.
+- **Offered `GET` & `ACK` Enforcement:** A sender tracks offered message IDs in `_offeredIds`. Incoming `GET` requests for unoffered IDs are ignored (preventing a rogue peer from probing unoffered records or poisoning `_offeredIds`), and incoming `ACK` frames are filtered strictly to offered IDs with prototype-safe (`Object.create(null)`) receipt maps.
 
-### 3.4 Content Security Policy (CSP) & Embedding Control
-To prevent clickjacking and unauthorized framing:
-- **Application A (Embedded):** Enforces `Content-Security-Policy: frame-ancestors 'self' <PeerOrigin>`. Any unauthorized origin attempting to embed Application A is blocked by the browser engine.
-- **Application B (Host):** Enforces `Content-Security-Policy: frame-ancestors 'none'; frame-src 'self' <PeerOrigin>`.
+### 3.4 Strict Content Security Policy (CSP) — Zero `'unsafe-inline'` Scripts
+To prevent clickjacking, unauthorized framing, and inline XSS execution:
+- **Application A (Embedded):** Enforces `Content-Security-Policy: frame-ancestors 'self' <PeerOrigin>; default-src 'self'; script-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'`.
+- **Application B (Host):** Enforces `Content-Security-Policy: frame-ancestors 'none'; frame-src 'self' <PeerOrigin>; default-src 'self'; script-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'`.
+- **Attachment Download Sandboxing:** Every file/attachment download endpoint (`GET /api/docs/{name}`, `GET /api/outbox/{id}/attachments/{filename}`, `GET /api/inbox/{id}/attachments/{filename}`) emits `Content-Disposition: attachment` together with `Content-Security-Policy: default-src 'none'; sandbox` and `X-Content-Type-Options: nosniff`, ensuring untrusted HTML or SVG attachments can never execute script in the application's origin.
 
 ---
 
@@ -67,29 +68,30 @@ Because the user's browser mediates the transfer, a user with browser DevTools o
 ### How Server-Side Signing Works (`pkg/umaiserver/crypto.go`)
 The reference Go server implements zero-dependency `crypto/ed25519` signing and verification with strict anti-downgrade and anti-reflection guarantees:
 
-1. **Outbox Signing with Directional Domain Separation (Sender Server):**
-   - When `CreateOutboxMessage` snapshots a message and its attachments into `outbox/{id}`, the sending server computes a canonical SHA-256 digest that binds the **sender role**, **message ID**, **canonical JSON payload hash**, and **sorted attachment hashes**:
+1. **Outbox Signing with Length-Prefixed Canonical Encoding & Directional Domain Separation (Sender Server):**
+   - When `CreateOutboxMessage` snapshots a message and its attachments into `outbox/{id}`, the sending server computes an unambiguous, length-prefixed canonical SHA-256 digest (preventing any delimiter or tuple-boundary ambiguity):
      ```text
      UMAI-PUT-V1
-     <sender_role>
-     <message_id>
-     <canonical_payload_json_sha256>
-     <att1_sanitized_name>:<att1_size>:<att1_sha256>
+     role:<len>:<sender_role>
+     id:<len>:<message_id>
+     payload:<canonical_payload_json_sha256>
+     att_count:<count>
+     att:<name_len>:<att1_sanitized_name>:<att1_size>:<att1_sha256>
      ...
      ```
    - The server signs this digest with its `Ed25519` private key and stores the hex signature in `message.json` (`signature`).
    - `umai.js` passes `signature` along inside the `PUT` envelope as an opaque string.
 
 2. **Mandatory Inbox Verification & Receipt Generation (Receiver Server):**
-   - When `AcceptSignedMessage` receives `POST /api/inbox`, signature verification is **mandatory** whenever a peer public key is configured—omitting or stripping the `signature` field is immediately rejected (`ErrInvalidSignature`, preventing signature-strip downgrade attacks).
+   - When `AcceptSignedMessage` receives `POST /api/inbox`, signature verification is **mandatory** whenever a peer public key is configured—omitting or stripping the `signature` field is immediately rejected (`ErrInvalidSignature`, preventing signature-strip downgrade attacks), including on duplicate `POST /api/inbox` probes for already-accepted IDs.
    - The receiver verifies the signature against the expected `peerRole` (`"app-a"` vs `"app-b"`), preventing any cross-direction reflection attack.
    - If the payload or any attachment byte was modified in the browser (or forged by a script), signature verification fails, the temporary staging directory is purged, and no `ACK` is sent.
-   - Upon valid verification and atomic commit, the receiving server signs a cryptographic acceptance receipt binding its own `receiver_role`, the `message_id`, and the `original_message_signature_hex`:
+   - Upon valid verification and atomic commit, the receiving server signs a length-prefixed cryptographic acceptance receipt binding its own `receiver_role`, the `message_id`, and the `original_message_signature_hex`:
      ```text
      UMAI-ACK-V1
-     <receiver_role>
-     <message_id>
-     <original_message_signature_hex>
+     role:<len>:<receiver_role>
+     id:<len>:<message_id>
+     sig:<len>:<original_message_signature_hex>
      ```
    - This `ack_receipt` is persisted in `inbox/{id}/message.json` (so it is also returned on Rule 5 repeated `ACK`s via `/api/accepted/receipts`) and returned to the browser.
 
@@ -153,16 +155,20 @@ Depending on the deployment architecture, a UMAI channel operates in one of two 
 
 ## 7. Reference Server Hardening (`pkg/umaiserver`)
 
-The reference Go server (`pkg/umaiserver`) enforces the following web security controls out of the box:
+The reference Go server (`pkg/umaiserver`) enforces the following web and systems security controls out of the box:
 
-1. **CSRF Protection (`Origin` Verification & `Content-Type` Enforcement):**
-   - On every state-changing HTTP method (`POST`, `PUT`, `DELETE`, `PATCH`), `securityMiddleware` verifies that the `Origin` header (when present) matches the server's own host/listen address (`403 Forbidden` on mismatch).
+1. **CSRF Protection (`Origin` Verification, Stripped-Origin Cookie Defense & `Content-Type` Enforcement):**
+   - On every state-changing HTTP method (`POST`, `PUT`, `DELETE`, `PATCH`), `securityMiddleware` verifies that the `Origin` header matches the server's own host/listen address (`403 Forbidden` on mismatch).
+   - If the `Origin` header is omitted on a cookie-authenticated request (e.g., stripped by a referrer policy), `securityMiddleware` requires an explicit custom header (`X-UMAI-CSRF`, `X-UMAI-Session`, or `Authorization`), blocking cross-site HTML `<form enctype="multipart/form-data">` CSRF attacks.
    - JSON endpoints (`POST /api/auth/login`, `POST /api/outbox`, `POST /api/outbox/ack`) reject requests whose `Content-Type` is not `application/json` (`415 Unsupported Media Type`).
-   - State-changing requests from the reference frontends include the custom `X-UMAI-Session` header, which cannot be sent cross-origin without a CORS preflight.
 2. **Protecting Message IDs on Unauthenticated Endpoints:**
    - `GET /api/status` returns aggregate counts (`outbox_count`, `inbox_count`, `accepted_count`) and public keys, but **never exposes `outbox_ids` or `accepted_ids` to unauthenticated callers**, preventing pre-emptive message ID squatting.
-3. **Path Traversal, Duplicate Filenames & Resource Caps:**
+3. **Path Traversal, Symlink Rejection, Duplicate Filenames & Strict File Permissions:**
    - All filenames are sanitized via `filepath.Base(filepath.Clean(name))` and stripped of control characters and traversal sequences (`..`, `/`, `\`).
+   - Document reads and outbox snapshots inspect `os.Lstat` and require `fi.Mode().IsRegular()`, refusing to follow symlinks.
+   - Storage directories are created with mode `0700` and files with mode `0600`.
    - Duplicate attachment filenames within a single message are rejected with `ErrDuplicateAttachment` rather than silently overwriting a file.
-   - HTTP request bodies are bounded via `http.MaxBytesReader`, per-file streams are bounded via `io.LimitReader(r, maxUploadSize + 1)`, and messages are capped at `MaxAttachmentsPerMessage = 50`.
+4. **Slowloris & Resource Exhaustion Defenses:**
+   - `http.Server` enforces `ReadHeaderTimeout` (`10s`), `ReadTimeout` (`5m`), `WriteTimeout` (`5m`), `IdleTimeout` (`120s`), and `MaxHeaderBytes` (`1 MB`).
+   - HTTP request bodies are bounded via `http.MaxBytesReader`, per-file streams are bounded via `io.LimitReader(r, maxUploadSize + 1)`, messages are capped at `MaxAttachmentsPerMessage = 50`, and `AuthManager` uses constant-time credential hashing (`crypto/subtle.ConstantTimeCompare`) with automatic session pruning (`MaxActiveSessions = 10000`).
    - Incoming messages are staged in `.tmp-{id}-{timestamp}`, `fsync`ed, signature-verified, and atomically renamed into `inbox/{id}`.

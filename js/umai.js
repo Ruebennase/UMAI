@@ -26,6 +26,14 @@
 
   const PROTOCOL_NAME = 'UMAI';
   const PROTOCOL_VERSION = 1;
+  const MAX_BATCH_IDS = 1000;
+
+  /**
+   * Validates a message identifier is a safe, bounded string.
+   */
+  function isValidMessageId(id) {
+    return typeof id === 'string' && id.length > 0 && id.length <= 128;
+  }
 
   /**
    * Validates whether an incoming object is a valid UMAI message envelope.
@@ -41,15 +49,19 @@
   }
 
   /**
-   * Validates whether incoming origin matches expected origin,
+   * Validates whether incoming origin matches expected origin (HTTP/HTTPS only),
    * supporting local loopback synonyms (localhost <-> 127.0.0.1 on matching port).
    */
   function isAllowedOrigin(incomingOrigin, expectedOrigin) {
     if (!incomingOrigin || !expectedOrigin) return false;
-    if (incomingOrigin === expectedOrigin) return true;
     try {
       const inc = new URL(incomingOrigin);
       const exp = new URL(expectedOrigin);
+      if ((inc.protocol !== 'http:' && inc.protocol !== 'https:') ||
+          (exp.protocol !== 'http:' && exp.protocol !== 'https:')) {
+        return false;
+      }
+      if (inc.origin === exp.origin) return true;
       const isLoopback = (host) => host === 'localhost' || host === '127.0.0.1';
       if (isLoopback(inc.hostname) && isLoopback(exp.hostname) && inc.port === exp.port && inc.protocol === exp.protocol) {
         return true;
@@ -416,7 +428,9 @@
 
       try {
         const outboxIds = await this.storage.getOutboxIds();
-        const ids = Array.isArray(outboxIds) ? outboxIds : [];
+        const ids = (Array.isArray(outboxIds) ? outboxIds : [])
+          .filter(isValidMessageId)
+          .slice(0, MAX_BATCH_IDS);
 
         // If background periodic check and outbox is empty, avoid log noise
         if (!force && ids.length === 0) {
@@ -451,7 +465,9 @@
      * - Rule 2: For unaccepted IDs, sends GET.
      */
     async _handleOffer(offer) {
-      const offeredIds = Array.isArray(offer.ids) ? offer.ids : [];
+      const offeredIds = (Array.isArray(offer.ids) ? offer.ids : [])
+        .filter(isValidMessageId)
+        .slice(0, MAX_BATCH_IDS);
       this.log('info', `Received OFFER with ${offeredIds.length} message(s)`, offeredIds);
       this.onTransfer({ direction: 'incoming', type: 'OFFER', ids: offeredIds });
 
@@ -464,7 +480,7 @@
       if (offeredIds.length === 0) return;
 
       const alreadyAccepted = [];
-      const repeatedReceipts = {};
+      const repeatedReceipts = Object.create(null);
       const toFetch = [];
 
       for (const id of offeredIds) {
@@ -520,23 +536,31 @@
 
     /**
      * Handles incoming GET:
-     * Queues outgoing PUT messages for the requested IDs.
+     * Queues outgoing PUT messages strictly for IDs that were previously offered by this sender.
      */
     async _handleGet(get) {
-      const requestedIds = Array.isArray(get.ids) ? get.ids : [];
+      const rawIds = (Array.isArray(get.ids) ? get.ids : [])
+        .filter(isValidMessageId)
+        .slice(0, MAX_BATCH_IDS);
+      const requestedIds = rawIds.filter(id => this._offeredIds.has(id));
+      if (requestedIds.length !== rawIds.length) {
+        this.log('warn', `Ignored GET for unoffered ID(s)`, rawIds.filter(id => !this._offeredIds.has(id)));
+      }
       this.log('info', `Received GET request for ${requestedIds.length} message(s)`, requestedIds);
       this.onTransfer({ direction: 'incoming', type: 'GET', ids: requestedIds });
 
       for (const id of requestedIds) {
-        this._offeredIds.add(id);
         this._queuePut(id);
       }
     }
 
     /**
-     * Enqueues a message ID to be transferred as a PUT.
+     * Enqueues a message ID to be transferred as a PUT (deduplicating already queued IDs).
      */
     _queuePut(id) {
+      if (this._putQueue.includes(id)) {
+        return;
+      }
       this._putQueue.push(id);
       this._notifySyncStatus(`Transfer queued for message ${id}`);
       this._processPutQueue();
@@ -566,12 +590,13 @@
 
         // Attachments must be native File/Blob objects
         const attachments = Array.isArray(msg.attachments) ? msg.attachments : [];
+        const safePayload = (msg.payload !== undefined && msg.payload !== null) ? msg.payload : {};
         const putMsg = {
           protocol: PROTOCOL_NAME,
           version: PROTOCOL_VERSION,
           type: 'PUT',
           id: msg.id,
-          payload: msg.payload || {},
+          payload: safePayload,
           attachments: attachments,
           signature: msg.signature || ''
         };
@@ -609,8 +634,8 @@
      */
     async _handlePut(put) {
       const id = put.id;
-      if (!this._inFlightGets.has(id)) {
-        this.log('warn', `Ignored unsolicited PUT for message ${id} (not requested via GET)`);
+      if (!isValidMessageId(id) || !this._inFlightGets.has(id)) {
+        this.log('warn', `Ignored unsolicited or invalid PUT for message ${id} (not requested via GET)`);
         return;
       }
       this._inFlightGets.delete(id);
@@ -632,7 +657,7 @@
       const alreadyAccepted = await this.storage.isAccepted(id);
       if (alreadyAccepted) {
         this.log('info', `Message ${id} already accepted; sending ACK without re-importing`);
-        const receipts = {};
+        const receipts = Object.create(null);
         if (typeof alreadyAccepted === 'string' && alreadyAccepted.length > 0) {
           receipts[id] = alreadyAccepted;
         } else if (typeof alreadyAccepted === 'object' && alreadyAccepted.ackReceipt) {
@@ -655,14 +680,14 @@
       try {
         const result = await this.storage.acceptMessage({
           id: put.id,
-          payload: put.payload,
+          payload: (put.payload !== undefined && put.payload !== null) ? put.payload : {},
           attachments: attachments,
-          signature: put.signature || ''
+          signature: typeof put.signature === 'string' ? put.signature : ''
         });
 
         if (result) {
           this.log('info', `Successfully accepted message ${id}. Sending ACK.`);
-          const receipts = {};
+          const receipts = Object.create(null);
           if (typeof result === 'string' && result.length > 0) {
             receipts[id] = result;
           } else if (typeof result === 'object' && result.ackReceipt) {
@@ -696,7 +721,9 @@
      * - Removes acknowledged message from outbox.
      */
     async _handleAck(ack) {
-      const rawIds = Array.isArray(ack.ids) ? ack.ids : [];
+      const rawIds = (Array.isArray(ack.ids) ? ack.ids : [])
+        .filter(isValidMessageId)
+        .slice(0, MAX_BATCH_IDS);
       const validIds = rawIds.filter(id => this._offeredIds.has(id));
       if (validIds.length !== rawIds.length) {
         this.log('warn', `Ignored unoffered ACK ID(s)`, rawIds.filter(id => !this._offeredIds.has(id)));
@@ -706,7 +733,14 @@
 
       if (validIds.length === 0) return;
 
-      const receipts = (ack.receipts && typeof ack.receipts === 'object') ? ack.receipts : {};
+      const receipts = Object.create(null);
+      if (ack.receipts && typeof ack.receipts === 'object') {
+        for (const id of validIds) {
+          if (Object.prototype.hasOwnProperty.call(ack.receipts, id) && typeof ack.receipts[id] === 'string') {
+            receipts[id] = ack.receipts[id];
+          }
+        }
+      }
 
       try {
         await this.storage.onAcknowledged(validIds, receipts);

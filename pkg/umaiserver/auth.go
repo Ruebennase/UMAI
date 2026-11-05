@@ -2,6 +2,8 @@ package umaiserver
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
 	"net/http"
 	"strings"
@@ -12,6 +14,7 @@ import (
 const (
 	SessionCookieName = "umai_session"
 	SessionDuration   = 24 * time.Hour
+	MaxActiveSessions = 10000
 )
 
 // Session represents an active authenticated user session.
@@ -49,21 +52,48 @@ func (am *AuthManager) CookieName() string {
 	return am.cookieName
 }
 
-// Authenticate verifies credentials and returns a new session ID if valid.
+// Authenticate verifies credentials in constant time and returns a new session ID if valid.
 func (am *AuthManager) Authenticate(username, password string) (string, bool) {
-	if username != am.validUsername || password != am.validPassword {
+	uHash := sha256.Sum256([]byte(username))
+	expUHash := sha256.Sum256([]byte(am.validUsername))
+	pHash := sha256.Sum256([]byte(password))
+	expPHash := sha256.Sum256([]byte(am.validPassword))
+
+	uMatch := subtle.ConstantTimeCompare(uHash[:], expUHash[:])
+	pMatch := subtle.ConstantTimeCompare(pHash[:], expPHash[:])
+	if (uMatch & pMatch) != 1 {
 		return "", false
 	}
 
+	now := time.Now()
 	sessionID := generateSessionID()
 	sess := &Session{
 		ID:        sessionID,
 		Username:  username,
-		CreatedAt: time.Now(),
-		ExpiresAt: time.Now().Add(SessionDuration),
+		CreatedAt: now,
+		ExpiresAt: now.Add(SessionDuration),
 	}
 
 	am.mu.Lock()
+	for id, existing := range am.sessions {
+		if now.After(existing.ExpiresAt) {
+			delete(am.sessions, id)
+		}
+	}
+	if len(am.sessions) >= MaxActiveSessions {
+		// Evict oldest session if cap reached
+		var oldestID string
+		var oldestTime time.Time
+		for id, existing := range am.sessions {
+			if oldestID == "" || existing.CreatedAt.Before(oldestTime) {
+				oldestID = id
+				oldestTime = existing.CreatedAt
+			}
+		}
+		if oldestID != "" {
+			delete(am.sessions, oldestID)
+		}
+	}
 	am.sessions[sessionID] = sess
 	am.mu.Unlock()
 
