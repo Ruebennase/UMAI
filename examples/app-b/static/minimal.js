@@ -150,25 +150,27 @@
       const res = await fetch('/api/outbox', { headers: getAuthHeaders(), credentials: 'include' });
       if (!res.ok) return [];
       const data = await res.json();
-      return (data.messages || []).map(m => m.id);
+      const list = Array.isArray(data) ? data : (data.messages || []);
+      return list.map(m => m.id);
     },
 
     async getMessage(id) {
       const res = await fetch(`/api/outbox/${encodeURIComponent(id)}`, { headers: getAuthHeaders(), credentials: 'include' });
       if (!res.ok) return null;
       const data = await res.json();
-      const meta = data.message;
-      if (!meta) return null;
+      const meta = data.message || data;
+      if (!meta || !meta.id) return null;
 
       const files = [];
       for (const att of (meta.attachments || [])) {
+        const filename = att.name || att.filename;
         const fileRes = await fetch(
-          `/api/outbox/${encodeURIComponent(id)}/files/${encodeURIComponent(att.filename)}`,
+          `/api/outbox/${encodeURIComponent(id)}/attachments/${encodeURIComponent(filename)}`,
           { headers: getAuthHeaders(), credentials: 'include' }
         );
         if (fileRes.ok) {
           const blob = await fileRes.blob();
-          files.push(new File([blob], att.filename, { type: blob.type }));
+          files.push(new File([blob], filename, { type: blob.type }));
         }
       }
 
@@ -176,10 +178,10 @@
     },
 
     async isAccepted(id) {
-      const res = await fetch(`/api/inbox/check?id=${encodeURIComponent(id)}`, { headers: getAuthHeaders(), credentials: 'include' });
+      const res = await fetch('/api/accepted', { headers: getAuthHeaders(), credentials: 'include' });
       if (!res.ok) return false;
-      const data = await res.json();
-      return data.accepted === true;
+      const list = await res.json();
+      return Array.isArray(list) && list.includes(id);
     },
 
     async acceptMessage(msg) {
@@ -187,11 +189,11 @@
       const formData = new FormData();
       formData.append('id', msg.id);
       formData.append('payload', JSON.stringify(msg.payload || {}));
-      for (const f of msg.attachments) {
-        formData.append('files', f, f.name);
+      for (const f of msg.attachments || []) {
+        formData.append('attachments', f, f.name);
       }
 
-      const res = await fetch('/api/inbox/accept', {
+      const res = await fetch('/api/inbox', {
         method: 'POST',
         headers: getAuthHeaders(),
         credentials: 'include',
@@ -208,7 +210,7 @@
 
     async onAcknowledged(ids) {
       logActivity(`✓ App A acknowledged message(s): ${ids.join(', ')}. Cleaned from outbox.`);
-      await fetch('/api/outbox/acknowledge', {
+      await fetch('/api/outbox/ack', {
         method: 'POST',
         headers: { ...getAuthHeaders(), 'Content-Type': 'application/json' },
         credentials: 'include',
@@ -433,8 +435,8 @@
         headers: { ...getAuthHeaders(), 'Content-Type': 'application/json' },
         credentials: 'include',
         body: JSON.stringify({
-          subject: subject,
-          attachmentFilenames: [file.name]
+          payload: { subject: subject, timestamp: new Date().toISOString() },
+          documents: [file.name]
         })
       });
 
@@ -443,7 +445,8 @@
       }
 
       const outboxData = await outboxRes.json();
-      logActivity(`Queued message <strong>${outboxData.message.id}</strong> ('${escapeHtml(subject)}') for Application A.`);
+      const msgId = (outboxData && (outboxData.id || (outboxData.message && outboxData.message.id))) || 'msg';
+      logActivity(`Queued message <strong>${escapeHtml(msgId)}</strong> ('${escapeHtml(subject)}') for Application A.`);
 
       transferForm.reset();
       refreshOutboxCount();
