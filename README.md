@@ -62,6 +62,37 @@ Because UMAI leaves backend storage and queuing policy to the implementer, appli
      - *Server-Side Next-Best Message Selection:* As a best-practice example in `pkg/umaiserver`, fetching an outbox message (`GET /api/outbox/{id}`) places a 15-second soft in-flight lease on it and rotates the unclaimed queue per session. Concurrent browsers automatically pick the next unclaimed message instead of duplicating bandwidth—and if a browser tab closes mid-transfer, the soft lease expires after 15 seconds so another online browser seamlessly takes over.
      - *Server-Side Signing & Optional Encryption:* Combining our reference server's `Ed25519` signing with optional asymmetric encryption ensures a mediating user's browser cannot modify—or even inspect—another user's message while ferrying it.
 
+### Beyond Bilateral: Multi-Server Application Meshes ($N \ge 3$)
+
+While the code in this repository demonstrates a bilateral exchange (App A $\leftrightarrow$ App B), the UMAI principle is not limited to two systems. Because modern browsers place no logical limit on the number of isolated `<iframe>` contexts or `MessagePort` channels in a tab, a single host application can orchestrate a **multi-server application mesh** connecting 3, 4, or more completely independent backends:
+
+```mermaid
+graph TD
+    subgraph Browser Tab ["Authorized User's Browser Runtime"]
+        Host["Host Application / Portal (e.g. ERP)"]
+        FrameA["App A (e.g. CRM)<br/><code>sync.html</code>"]
+        FrameC["App C (e.g. Document Archive)<br/><code>sync.html</code>"]
+        FrameD["App D (e.g. Billing)<br/><code>sync.html</code>"]
+        
+        Host <-->|"Channel 1 (MessagePort)"| FrameA
+        Host <-->|"Channel 2 (MessagePort)"| FrameC
+        Host <-->|"Channel 3 (MessagePort)"| FrameD
+        FrameA -.-|"Direct P2P MessagePort Handoff"| FrameC
+    end
+```
+
+Two distinct multi-server patterns are possible:
+
+1. **Hub-and-Spoke Mesh (Store-and-Forward via Host):**
+   - The host application embeds several lightweight sync frames (e.g. CRM, DMS, Billing).
+   - The host backend or client orchestrator maintains separate UMAI sessions with each spoke. Messages from App A destined for App C can be accepted by the host and placed in its outbox for App C.
+   - Combining this with **Tier 2 Ed25519 signing** and **Tier 3 Asymmetric Encryption** allows the host to act as a **blind relay**: App A encrypts the payload directly to App C's public key, so the intermediate host (and the user) cannot read or tamper with the data in transit.
+2. **Direct Peer-to-Peer Port Handoff:**
+   - Because `MessagePort` instances are *transferable objects*, the host can create a `MessageChannel` and transfer `port1` to App A and `port2` to App C via `postMessage`.
+   - Once transferred, App A and App C communicate directly across that dedicated point-to-point port in browser memory, with zero host interception.
+
+In both patterns, each application continues to communicate strictly with its own same-origin backend (`connect-src 'self'`), preserving the zero-CORS, zero-backend-tunnel security boundary across the entire mesh.
+
 ---
 
 ## 3. How the Protocol Works
