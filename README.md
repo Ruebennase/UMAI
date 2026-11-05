@@ -10,7 +10,7 @@ A minimal, vendor-neutral open-source protocol for exchanging immutable messages
 
 ## 1. What UMAI Is
 
-**UMAI** stands for **User-Mediated Application Interoperability**.
+**UMAI** stands for **User-Mediated Application Interoperability** *(and is a nod to the Japanese **うまい** — meaning both "clever / skillful" and "delicious")*.
 
 It enables two completely independent web applications running on different domains to securely exchange structured data and binary files (PDFs, spreadsheets, contracts, images) without requiring direct server-to-server network integrations, API gateways, VPNs, or cloud message brokers.
 
