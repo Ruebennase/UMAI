@@ -133,7 +133,7 @@ UMAI is designed so that developers can integrate existing or legacy application
    - `isAccepted(id)`
    - `acceptMessage(msg)`
    - `onAcknowledged(ids)`
-3. **Legacy-Friendly:** Legacy applications (PHP, Java, ASP.NET, Rails) only need 4 simple internal endpoints to support this contract, or can store files purely client-side via IndexedDB.
+3. **Legacy-Friendly:** Zero backend requirements. Legacy applications (PHP, Java, ASP.NET, Rails, static HTML) can bridge data using their existing forms, DOM elements, existing internal APIs, pure client-side storage (IndexedDB), or dedicated internal endpoints. Zero server-to-server APIs required.
 
 👉 **See the complete [Developer Integration Guide](INTEGRATION_GUIDE.md) for architecture patterns, step-by-step code samples, and legacy modernization recipes.**
 

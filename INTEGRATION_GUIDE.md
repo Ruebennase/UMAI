@@ -46,7 +46,7 @@ The browser acts as a secure, sandboxed mediator:
 1. Applications communicate purely via client-side Web APIs (`postMessage`, `MessageChannel`, Structured Clone).
 2. Binary files (`File` / `Blob`) are transferred in-memory with byte-level integrity.
 3. Neither server needs public API exposure, inbound ports, or cross-network access.
-4. Legacy applications only need a lightweight UI extension and a few internal endpoints (or local browser storage).
+4. Legacy applications only need to load the in-browser script and connect their existing UI or storage through a simple adapter—without writing any server-to-server APIs.
 
 ---
 
@@ -247,24 +247,128 @@ In Application A's web page:
 
 ---
 
-## 5. Backend Options for Legacy Applications
+## 5. Storage Adapter Patterns: Complete Freedom of Implementation
 
-Legacy applications have two primary ways to support the 5-method contract:
+> [!IMPORTANT]
+> **UMAI has zero backend requirements.**
+> UMAI does not mandate any specific server endpoints, URL routes, databases, or filesystem conventions. The UMAI protocol engine (`umai.js`) lives entirely inside the browser and communicates strictly across window/iframe boundaries via `MessageChannel`.
+> 
+> How your application feeds messages into the 5-method adapter (`getOutboxIds`, `getMessage`) and how it persists accepted messages (`acceptMessage`) is **entirely up to you**.
 
-### Option A: Four Simple Internal HTTP Endpoints (Recommended)
-Add 4 lightweight endpoints to your existing web backend in any language (PHP, C#, Java, Python, Go):
+Below are four common patterns showing how different applications can implement the 5-method contract:
 
-1. `GET /api/outbox`: Returns pending messages that the user wants to transfer.
-2. `GET /api/outbox/{id}/files/{filename}`: Streams attachment files to the user's browser.
-3. `POST /api/inbox/accept`: Receives a standard multipart form with files and stores them into your database or document folder.
-4. `POST /api/outbox/acknowledge`: Marks message IDs as completed/sent.
+---
 
-*Notice that these endpoints only talk to the authenticated user's browser session. They require zero firewall rules, zero public exposure, and zero cross-network tunnels.*
+### Pattern 1: DOM & HTML Form Hooking (Zero Backend Changes!)
 
-### Option B: Pure Client-Side (Zero Backend Changes!)
-If a legacy backend cannot be modified at all, you can implement the storage adapter completely in the browser using **IndexedDB**:
-- Outgoing documents are selected from client-side files or downloaded blobs.
-- Incoming documents are saved to IndexedDB or downloaded directly to the user's filesystem via the File System Access API.
+In many legacy systems, modifying server-side code or deploying new web APIs requires months of bureaucracy. With UMAI, you don't have to touch the backend at all: you can bridge data **directly through the existing HTML DOM and forms**.
+
+#### Outbox: Reading from Existing Page Elements
+The user is viewing an invoice or record already rendered on screen. The adapter simply extracts the data from the DOM and grabs the user-selected file:
+
+```javascript
+const domStorageAdapter = {
+  async getOutboxIds() {
+    // If the page has an active document displayed, treat its ID as the outbox
+    const docId = document.getElementById('current-record-id')?.value;
+    return docId ? [docId] : [];
+  },
+
+  async getMessage(id) {
+    const title = document.getElementById('record-title')?.innerText;
+    const fileInput = document.getElementById('existing-file-upload');
+    const files = fileInput && fileInput.files.length > 0 ? Array.from(fileInput.files) : [];
+
+    return {
+      id: id,
+      payload: { title: title, extractedAt: new Date().toISOString() },
+      attachments: files // Native File objects directly from the browser input
+    };
+  },
+
+  async isAccepted(id) {
+    // Check localStorage to see if we already received this record
+    return localStorage.getItem(`accepted_${id}`) !== null;
+  },
+
+  async acceptMessage(msg) {
+    // INBOX: Populate the legacy app's existing form and submit it!
+    const form = document.getElementById('legacy-import-form');
+    if (!form) return false;
+
+    // Fill hidden or visible input fields
+    document.getElementById('import-doc-id').value = msg.id;
+    document.getElementById('import-payload-json').value = JSON.stringify(msg.payload);
+
+    // Or submit via classic FormData to the legacy system's existing handler
+    const data = new FormData(form);
+    for (const file of msg.attachments) {
+      data.append('uploaded_file', file, file.name);
+    }
+    
+    const response = await fetch(form.action, { method: form.method || 'POST', body: data });
+    if (response.ok) {
+      localStorage.setItem(`accepted_${msg.id}`, 'true');
+      return true;
+    }
+    return false;
+  },
+
+  async onAcknowledged(ids) {
+    // Show visual checkmark in the legacy UI
+    for (const id of ids) {
+      const row = document.getElementById(`record-row-${id}`);
+      if (row) row.classList.add('synced');
+    }
+  }
+};
+```
+
+---
+
+### Pattern 2: Pure Client-Side / Offline Storage (IndexedDB or File System)
+
+For offline-first applications, Progressive Web Apps (PWAs), or environments where files should be saved directly to the user's desktop without touching an intermediary application server:
+
+- **Storage via `IndexedDB`:** Incoming messages and binary files (`File` / `Blob`) are stored directly in the browser's persistent client-side database.
+- **Direct Local Disk Access (File System Access API):**
+  ```javascript
+  async function acceptMessage(msg) {
+    // Prompt or save directly to a local directory selected by the user
+    for (const file of msg.attachments) {
+      const handle = await window.showSaveFilePicker({ suggestedName: file.name });
+      const writable = await handle.createWritable();
+      await writable.write(file);
+      await writable.close();
+    }
+    return true;
+  }
+  ```
+
+---
+
+### Pattern 3: Hooking into Existing Internal APIs
+
+If your application already has an established internal communication layer—such as:
+- Existing GraphQL queries and mutations
+- Existing WebSocket or Server-Sent Events (SSE) connections
+- Existing internal REST or RPC endpoints
+
+The 5-method adapter simply calls your application's existing client services. No new protocol daemons or specialized endpoints are required.
+
+---
+
+### Pattern 4: Dedicated Internal HTTP Endpoints (Reference Example)
+
+If you *are* developing or extending an application backend and want a clean, dedicated set of internal routes, you can implement lightweight internal endpoints as done in the UMAI reference demo (`examples/app-a` and `examples/app-b`):
+
+1. `GET /api/outbox`: Returns pending message IDs.
+2. `GET /api/outbox/{id}` & `/files/{name}`: Fetches metadata and streams attachments to the browser.
+3. `POST /api/inbox/accept`: Receives a standard multipart form with files and persists them atomically to your database or document store.
+4. `POST /api/outbox/acknowledge`: Marks message IDs as acknowledged.
+
+> [!NOTE]
+> Even in this pattern, these endpoints **only talk to the user's existing, authenticated browser session** via standard internal cookies or headers. They never talk directly to the peer server over the network. Zero firewall rules, zero public exposure, and zero cross-network tunnels.
 
 ---
 
