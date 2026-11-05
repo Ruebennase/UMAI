@@ -220,10 +220,23 @@
   }
 
   // --- Document Operations ---
-  async function loadDocuments() {
+  let _lastDocsSignature = null;
+
+  async function loadDocuments(forceRender = false) {
     try {
       const res = await api('/api/docs');
       const docs = await res.json();
+      const sig = JSON.stringify(docs.map(d => `${d.name}:${d.size}:${d.mod_time}`));
+      if (!forceRender && sig === _lastDocsSignature) {
+        return;
+      }
+      _lastDocsSignature = sig;
+
+      // Preserve currently checked attachments across re-renders
+      const selectedDocs = new Set(
+        Array.from(document.querySelectorAll('input[name="attach_doc"]:checked')).map(el => el.value)
+      );
+
       docsCount.textContent = docs.length;
 
       docsList.innerHTML = '';
@@ -253,8 +266,9 @@
         const label = document.createElement('label');
         label.style.display = 'block';
         label.style.marginBottom = '2px';
+        const isChecked = selectedDocs.has(doc.name) ? 'checked' : '';
         label.innerHTML = `
-          <input type="checkbox" name="attach_doc" value="${escapeHtml(doc.name)}">
+          <input type="checkbox" name="attach_doc" value="${escapeHtml(doc.name)}" ${isChecked}>
           ${escapeHtml(doc.name)} (${formatBytes(doc.size)})
         `;
         attachDocsContainer.appendChild(label);
@@ -265,7 +279,7 @@
           const docName = e.target.dataset.name;
           if (confirm(`Delete document "${docName}"?`)) {
             await api(`/api/docs/${encodeURIComponent(docName)}`, { method: 'DELETE' });
-            loadDocuments();
+            loadDocuments(true);
           }
         });
       });
@@ -286,7 +300,7 @@
       if (res.ok) {
         fileInput.value = '';
         appendLog('info', 'Uploaded document successfully');
-        await loadDocuments();
+        await loadDocuments(true);
       }
     } catch (err) {
       appendLog('error', 'Upload failed', err.message);
