@@ -16,7 +16,10 @@ import (
 	"time"
 )
 
-const MaxAttachmentsPerMessage = 50
+const (
+	MaxAttachmentsPerMessage = 50
+	OutboxLeaseDuration      = 15 * time.Second
+)
 
 var (
 	ErrNotFound            = errors.New("not found")
@@ -63,6 +66,7 @@ type Storage struct {
 	acceptedFile  string
 	maxUploadSize int64
 	acceptedIDs   map[string]bool
+	inFlightUntil map[string]time.Time
 	role          string
 	peerRole      string
 	ownPubKey     ed25519.PublicKey
@@ -96,6 +100,7 @@ func NewStorage(dataDir string, maxUploadSize int64) (*Storage, error) {
 		acceptedFile:  acceptedFile,
 		maxUploadSize: maxUploadSize,
 		acceptedIDs:   make(map[string]bool),
+		inFlightUntil: make(map[string]time.Time),
 	}
 
 	if err := s.loadAcceptedIDs(); err != nil {
@@ -402,8 +407,16 @@ func (s *Storage) CreateOutboxMessage(payload any, docNames []string) (*Message,
 	return msg, nil
 }
 
-// ListOutbox returns all active messages in outbox.
+// ListOutbox returns all active messages in outbox, prioritizing unclaimed messages ahead of
+// messages that have an active soft in-flight lease.
 func (s *Storage) ListOutbox() ([]*Message, error) {
+	return s.ListOutboxForSession("")
+}
+
+// ListOutboxForSession returns all active messages in outbox, prioritizing unclaimed messages first
+// and deterministically rotating the unclaimed list based on sessionKey so multiple concurrent
+// browser sessions naturally pick different messages first without UI flicker.
+func (s *Storage) ListOutboxForSession(sessionKey string) ([]*Message, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -412,7 +425,10 @@ func (s *Storage) ListOutbox() ([]*Message, error) {
 		return nil, err
 	}
 
-	var messages []*Message
+	now := time.Now()
+	var unclaimed []*Message
+	var inFlight []*Message
+
 	for _, entry := range entries {
 		if !entry.IsDir() || strings.HasPrefix(entry.Name(), ".") {
 			continue
@@ -424,9 +440,28 @@ func (s *Storage) ListOutbox() ([]*Message, error) {
 		}
 		var msg Message
 		if err := json.Unmarshal(data, &msg); err == nil {
-			messages = append(messages, &msg)
+			if leaseUntil, ok := s.inFlightUntil[msg.ID]; ok && now.Before(leaseUntil) {
+				inFlight = append(inFlight, &msg)
+			} else {
+				unclaimed = append(unclaimed, &msg)
+			}
 		}
 	}
+
+	if sessionKey != "" && len(unclaimed) > 1 {
+		h := sha256.Sum256([]byte(sessionKey))
+		offset := int(h[0]) % len(unclaimed)
+		if offset > 0 {
+			rotated := make([]*Message, 0, len(unclaimed))
+			rotated = append(rotated, unclaimed[offset:]...)
+			rotated = append(rotated, unclaimed[:offset]...)
+			unclaimed = rotated
+		}
+	}
+
+	messages := make([]*Message, 0, len(unclaimed)+len(inFlight))
+	messages = append(messages, unclaimed...)
+	messages = append(messages, inFlight...)
 	return messages, nil
 }
 
@@ -443,15 +478,16 @@ func (s *Storage) ListOutboxIDs() ([]string, error) {
 	return ids, nil
 }
 
-// GetOutboxMessage retrieves a specific message from outbox.
+// GetOutboxMessage retrieves a specific message from outbox and places a soft in-flight lease
+// on it so other concurrent browser sessions prioritize unclaimed messages first.
 func (s *Storage) GetOutboxMessage(id string) (*Message, error) {
 	cleanID, err := sanitizeID(id)
 	if err != nil {
 		return nil, err
 	}
 
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
 	msgFile := filepath.Join(s.outboxDir, cleanID, "message.json")
 	data, err := os.ReadFile(msgFile)
@@ -466,6 +502,7 @@ func (s *Storage) GetOutboxMessage(id string) (*Message, error) {
 	if err := json.Unmarshal(data, &msg); err != nil {
 		return nil, err
 	}
+	s.inFlightUntil[cleanID] = time.Now().Add(OutboxLeaseDuration)
 	return &msg, nil
 }
 
@@ -502,6 +539,7 @@ func (s *Storage) AcknowledgeMessages(ids []string) error {
 			continue
 		}
 		msgDir := filepath.Join(s.outboxDir, cleanID)
+		delete(s.inFlightUntil, cleanID)
 		_ = os.RemoveAll(msgDir)
 	}
 	return nil
@@ -539,6 +577,7 @@ func (s *Storage) AcknowledgeMessagesVerified(ids []string, receipts map[string]
 				}
 			}
 		}
+		delete(s.inFlightUntil, cleanID)
 		_ = os.RemoveAll(msgDir)
 	}
 	return nil

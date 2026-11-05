@@ -432,3 +432,40 @@ func TestSecurity_CSRF_StatusLeak_And_DuplicateAttachment(t *testing.T) {
 		t.Errorf("Expected error when creating message with duplicate attachment filenames")
 	}
 }
+
+func TestConcurrentSessions_SoftLeaseAndNextBestSelection(t *testing.T) {
+	appA := setupApp(t, "app-a", "http://127.0.0.1:8082")
+
+	m1, _ := appA.Server.Storage().CreateOutboxMessage(map[string]string{"seq": "1"}, nil)
+	m2, _ := appA.Server.Storage().CreateOutboxMessage(map[string]string{"seq": "2"}, nil)
+	m3, _ := appA.Server.Storage().CreateOutboxMessage(map[string]string{"seq": "3"}, nil)
+
+	initialList, err := appA.Server.Storage().ListOutbox()
+	if err != nil || len(initialList) != 3 {
+		t.Fatalf("Expected 3 outbox messages, got %d (err=%v)", len(initialList), err)
+	}
+	firstID := initialList[0].ID
+
+	// Browser 1 begins transferring firstID by calling GetOutboxMessage(firstID),
+	// which places a 15-second soft in-flight lease on firstID.
+	_, err = appA.Server.Storage().GetOutboxMessage(firstID)
+	if err != nil {
+		t.Fatalf("GetOutboxMessage(%s) failed: %v", firstID, err)
+	}
+
+	// Browser 2 now queries ListOutbox() and should automatically pick the next unclaimed message first,
+	// with the in-flight firstID deprioritized to the end of the slice.
+	nextList, err := appA.Server.Storage().ListOutbox()
+	if err != nil || len(nextList) != 3 {
+		t.Fatalf("Expected 3 outbox messages on second query, got %d", len(nextList))
+	}
+	if nextList[0].ID == firstID {
+		t.Errorf("Expected in-flight message %s to be deprioritized, but it is still first in queue", firstID)
+	}
+	if nextList[len(nextList)-1].ID != firstID {
+		t.Errorf("Expected in-flight message %s at the end of the queue, got %s", firstID, nextList[len(nextList)-1].ID)
+	}
+	_ = m1
+	_ = m2
+	_ = m3
+}

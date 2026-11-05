@@ -37,6 +37,20 @@ Modern organizations frequently use separate, siloed web applications (e.g. an E
 
 **The UMAI approach:** The authorized human user is *already* authenticated to both applications in their browser. By turning the browser tab into a secure mediator via standard Web APIs (`postMessage`, `MessageChannel`, `File` Structured Clone), applications can exchange verified, immutable records and large documents without server-to-server coupling.
 
+### Two Operating Topologies: User-Scoped vs. System-Wide Opportunistic Pool
+
+Depending on an implementation's goals, a UMAI channel can be scoped in two ways:
+
+1. **User-Scoped Channel ("My Messages Only"):**
+   - Each user's UMAI session only offers and accepts messages belonging to that specific authenticated user (or tenant).
+2. **System-Wide Opportunistic Pool ("Crowdsourced System Bridge"):**
+   - Any authenticated user who has both applications open acts as an opportunistic courier for **all pending system-to-system messages** between Application A and Application B.
+   - If 10 employees are online simultaneously, the two systems can use all 10 open browser channels in parallel to drain the outbox queue.
+   - **Why this is both safe and efficient:**
+     - *Cryptographic Integrity & Blind Transit:* Server-side `Ed25519` signing (plus optional asymmetric encryption) ensures a mediating user's browser cannot tamper with—or even read—another user's message while ferrying it.
+     - *Withstanding Double Efforts (Idempotency):* Even if two browsers transfer the same message concurrently, Rule 4 and Rule 5 ensure the receiver commits the message once and returns the stored `ack_receipt` to both.
+     - *Picking the Next-Best Message (Soft Leases & Session Rotation):* In `pkg/umaiserver`, fetching a message (`GET /api/outbox/{id}`) places a 15-second soft in-flight lease on it and rotates the unclaimed queue per session. Concurrent browsers automatically pick the next unclaimed message rather than duplicating bandwidth, while if a browser tab closes mid-transfer, the soft lease expires and another online user's browser seamlessly takes over.
+
 ---
 
 ## 3. How the Protocol Works

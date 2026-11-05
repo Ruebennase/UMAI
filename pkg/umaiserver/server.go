@@ -415,7 +415,8 @@ func (s *Server) handleDeleteDoc(w http.ResponseWriter, r *http.Request) {
 // -----------------------------------------------------------------------------
 
 func (s *Server) handleListOutbox(w http.ResponseWriter, r *http.Request) {
-	msgs, err := s.storage.ListOutbox()
+	sessionID := s.auth.GetSessionID(r)
+	msgs, err := s.storage.ListOutboxForSession(sessionID)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
