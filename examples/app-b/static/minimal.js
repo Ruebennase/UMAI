@@ -61,6 +61,15 @@
       peerOrigin = status.peer_origin || status.peerOrigin || 'http://127.0.0.1:8081';
       embedUrl = status.peer_embed_url || status.peerEmbedURL || peerOrigin;
 
+      // Loopback synonym tolerance: match host browser url (localhost vs 127.0.0.1)
+      if (window.location.hostname === 'localhost') {
+        peerOrigin = peerOrigin.replace('127.0.0.1', 'localhost');
+        embedUrl = embedUrl.replace('127.0.0.1', 'localhost');
+      } else if (window.location.hostname === '127.0.0.1') {
+        peerOrigin = peerOrigin.replace('localhost', '127.0.0.1');
+        embedUrl = embedUrl.replace('localhost', '127.0.0.1');
+      }
+
       // Ensure iframe src points to the embed URL's sync.html on peer origin
       let syncBase = peerOrigin;
       try {
@@ -360,17 +369,17 @@
     }
   });
 
-  // Refresh Inbox Table
+  // Refresh Inbox Table (received from Application A)
   async function refreshInbox() {
     try {
-      const res = await fetch('/api/docs', { headers: getAuthHeaders(), credentials: 'include' });
+      const res = await fetch('/api/inbox', { headers: getAuthHeaders(), credentials: 'include' });
       if (!res.ok) return;
       const data = await res.json();
-      const docs = Array.isArray(data) ? data : (data.documents || []);
+      const messages = Array.isArray(data) ? data : (data.messages || []);
 
-      inboxCount.textContent = `${docs.length} document(s)`;
+      inboxCount.textContent = `${messages.length} message(s)`;
 
-      if (docs.length === 0) {
+      if (messages.length === 0) {
         inboxTbody.innerHTML = `
           <tr>
             <td colspan="5" class="empty-placeholder">
@@ -381,23 +390,44 @@
         return;
       }
 
-      inboxTbody.innerHTML = docs.map(doc => {
-        const sizeKb = ((doc.size || 0) / 1024).toFixed(1);
-        const date = new Date(doc.mod_time || doc.modTime || Date.now()).toLocaleTimeString();
-        return `
-          <tr>
-            <td style="font-weight: 600; color: #fff;">📄 ${escapeHtml(doc.name)}</td>
-            <td style="color: var(--text-muted);">${escapeHtml(doc.name)}</td>
-            <td style="color: var(--text-muted); font-family: monospace;">${sizeKb} KB</td>
-            <td style="color: var(--text-muted); font-size: 12px;">${date}</td>
-            <td style="text-align: right;">
-              <a href="/api/docs/${encodeURIComponent(doc.name)}" download="${escapeHtml(doc.name)}" class="btn btn-secondary btn-sm" style="text-decoration:none;">
-                ⬇ Download
-              </a>
-            </td>
-          </tr>
-        `;
-      }).join('');
+      const rows = [];
+      messages.forEach(msg => {
+        const subj = (msg.payload && msg.payload.subject) || 'No subject';
+        const date = new Date(msg.created_at || Date.now()).toLocaleTimeString();
+        const attachments = msg.attachments || [];
+
+        if (attachments.length === 0) {
+          rows.push(`
+            <tr>
+              <td style="font-weight: 600; color: #fff;">✉️ [Message only]</td>
+              <td style="color: var(--text-muted);">${escapeHtml(subj)}</td>
+              <td style="color: var(--text-muted); font-family: monospace;">-</td>
+              <td style="color: var(--text-muted); font-size: 12px;">${date}</td>
+              <td style="text-align: right; color: var(--success); font-size: 11px;">✓ Received</td>
+            </tr>
+          `);
+        } else {
+          attachments.forEach(att => {
+            const sizeKb = ((att.size || 0) / 1024).toFixed(1);
+            rows.push(`
+              <tr>
+                <td style="font-weight: 600; color: #fff;">📄 ${escapeHtml(att.name)}</td>
+                <td style="color: var(--text-muted);">${escapeHtml(subj)}</td>
+                <td style="color: var(--text-muted); font-family: monospace;">${sizeKb} KB</td>
+                <td style="color: var(--text-muted); font-size: 12px;">${date}</td>
+                <td style="text-align: right;">
+                  <a href="/api/inbox/${encodeURIComponent(msg.id)}/attachments/${encodeURIComponent(att.name)}"
+                     download="${escapeHtml(att.name)}" class="btn btn-secondary btn-sm" style="text-decoration:none;">
+                    ⬇ Download
+                  </a>
+                </td>
+              </tr>
+            `);
+          });
+        }
+      });
+
+      inboxTbody.innerHTML = rows.join('');
     } catch (err) {
       console.error('[Minimal B] Refresh inbox error:', err);
     }

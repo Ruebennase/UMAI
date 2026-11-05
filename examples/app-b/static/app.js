@@ -182,6 +182,17 @@
       await loadOutbox();
       await loadInbox();
 
+      // Periodically refresh lists so standalone tabs show incoming files in real-time
+      if (!window._refreshTimer) {
+        window._refreshTimer = setInterval(async () => {
+          if (sessionToken) {
+            await loadDocuments();
+            await loadOutbox();
+            await loadInbox();
+          }
+        }, 2000);
+      }
+
       // Load App A in iframe
       let embedUrl = serverConfig.peer_embed_url || serverConfig.peer_origin;
       let peerOrigin = serverConfig.peer_origin;

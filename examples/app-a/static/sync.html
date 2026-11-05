@@ -116,6 +116,12 @@
           const status = await statusRes.json();
           peerOrigin = status.peer_origin || status.peerOrigin || 'http://127.0.0.1:8082';
 
+          if (window.location.hostname === 'localhost') {
+            peerOrigin = peerOrigin.replace('127.0.0.1', 'localhost');
+          } else if (window.location.hostname === '127.0.0.1') {
+            peerOrigin = peerOrigin.replace('localhost', '127.0.0.1');
+          }
+
           const meRes = await fetch('/api/auth/me', { headers: getAuthHeaders(), credentials: 'include' });
           if (meRes.ok) {
             const me = await meRes.json();

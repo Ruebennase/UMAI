@@ -164,6 +164,17 @@
       await loadOutbox();
       await loadInbox();
 
+      // Periodically refresh lists so standalone tabs show incoming files in real-time
+      if (!window._refreshTimer) {
+        window._refreshTimer = setInterval(async () => {
+          if (sessionToken) {
+            await loadDocuments();
+            await loadOutbox();
+            await loadInbox();
+          }
+        }, 2000);
+      }
+
       initUmaiSession(serverConfig.peer_origin);
     } catch (err) {
       appendLog('error', 'Initialization error:', err.message);
