@@ -11,7 +11,6 @@
   const syncIndicator = document.getElementById('sync-indicator');
   const indicatorText = document.getElementById('indicator-text');
   const indicatorBadge = document.getElementById('indicator-badge');
-  const btnForceSync = document.getElementById('btn-force-sync');
 
   const transferForm = document.getElementById('transfer-form');
   const transferSubject = document.getElementById('transfer-subject');
@@ -22,7 +21,6 @@
 
   const inboxTbody = document.getElementById('inbox-tbody');
   const inboxCount = document.getElementById('inbox-count');
-  const activityLog = document.getElementById('activity-log');
 
   const trayHeader = document.getElementById('tray-header');
   const trayContent = document.getElementById('tray-content');
@@ -34,23 +32,26 @@
   let sessionToken = localStorage.getItem('umai_token_b') || sessionStorage.getItem('umai_token_b') || '';
   let peerOrigin = '';
   let embedUrl = '';
+  let syncUrl = '';
   let umaiSession = null;
   let isAppAAuthenticated = false;
+  let workerSyncStatus = null;
 
-  function logActivity(msg) {
-    const time = new Date().toLocaleTimeString();
-    const el = document.createElement('div');
-    el.innerHTML = `<span style="color: #64748b;">[${time}]</span> ${msg}`;
-    activityLog.insertBefore(el, activityLog.firstChild);
-    while (activityLog.children.length > 20) {
-      activityLog.removeChild(activityLog.lastChild);
+  async function api(path, options = {}) {
+    options.credentials = 'include';
+    options.headers = options.headers || {};
+    if (sessionToken) {
+      options.headers['X-UMAI-Session'] = sessionToken;
     }
-  }
-
-  function getAuthHeaders() {
-    const headers = {};
-    if (sessionToken) headers['X-UMAI-Session'] = sessionToken;
-    return headers;
+    const res = await fetch(path, options);
+    if (res.status === 401) {
+      sessionToken = '';
+      localStorage.removeItem('umai_token_b');
+      sessionStorage.removeItem('umai_token_b');
+      showAuth();
+      throw new Error('Unauthorized');
+    }
+    return res;
   }
 
   // Check App B authentication
@@ -61,7 +62,6 @@
       peerOrigin = status.peer_origin || status.peerOrigin || 'http://127.0.0.1:8081';
       embedUrl = status.peer_embed_url || status.peerEmbedURL || peerOrigin;
 
-      // Loopback synonym tolerance: match host browser url (localhost vs 127.0.0.1)
       if (window.location.hostname === 'localhost') {
         peerOrigin = peerOrigin.replace('127.0.0.1', 'localhost');
         embedUrl = embedUrl.replace('127.0.0.1', 'localhost');
@@ -70,17 +70,13 @@
         embedUrl = embedUrl.replace('localhost', '127.0.0.1');
       }
 
-      // Ensure iframe src points to the embed URL's sync.html on peer origin
       let syncBase = peerOrigin;
       try {
         syncBase = new URL(embedUrl).origin;
       } catch (e) {}
-      const syncUrl = new URL('/sync.html', syncBase).toString();
-      if (workerFrame.src !== syncUrl) {
-        workerFrame.src = syncUrl;
-      }
+      syncUrl = new URL('/sync.html', syncBase).toString();
 
-      const meRes = await fetch('/api/auth/me', { headers: getAuthHeaders(), credentials: 'include' });
+      const meRes = await api('/api/auth/me');
       if (meRes.ok) {
         const me = await meRes.json();
         if (me.authenticated) {
@@ -94,12 +90,16 @@
         }
       }
     } catch (err) {
-      console.error('[Minimal B] Auth check error:', err);
+      // 401 or error falls through to showAuth
     }
     showAuth();
   }
 
   function showAuth() {
+    if (umaiSession) {
+      umaiSession.stop();
+      umaiSession = null;
+    }
     authScreen.style.display = 'flex';
     portalContainer.style.display = 'none';
   }
@@ -107,10 +107,16 @@
   function showPortal() {
     authScreen.style.display = 'none';
     portalContainer.style.display = 'flex';
-    logActivity('Application B session established.');
     refreshInbox();
     refreshOutboxCount();
     initUmaiSession();
+
+    // Load or reload the background worker iframe after host session is ready
+    if (syncUrl && workerFrame.src !== syncUrl) {
+      workerFrame.src = syncUrl;
+    } else if (workerFrame.contentWindow) {
+      workerFrame.contentWindow.postMessage({ protocol: 'UMAI_CONTROL', type: 'PING_AUTH' }, '*');
+    }
   }
 
   // Login handler
@@ -148,20 +154,18 @@
   // Logout handler
   btnLogout.addEventListener('click', async function () {
     try {
-      await fetch('/api/auth/logout', { method: 'POST', headers: getAuthHeaders(), credentials: 'include' });
+      await api('/api/auth/logout', { method: 'POST' });
     } catch (e) {}
     sessionToken = '';
     localStorage.removeItem('umai_token_b');
     sessionStorage.removeItem('umai_token_b');
-    sessionStorage.removeItem('umai_session_token_b');
-    if (umaiSession) umaiSession.stop();
     showAuth();
   });
 
   // UMAI Storage Adapter for App B
   const storageAdapter = {
     async getOutboxIds() {
-      const res = await fetch('/api/outbox', { headers: getAuthHeaders(), credentials: 'include' });
+      const res = await api('/api/outbox');
       if (!res.ok) return [];
       const data = await res.json();
       const list = Array.isArray(data) ? data : (data.messages || []);
@@ -169,7 +173,7 @@
     },
 
     async getMessage(id) {
-      const res = await fetch(`/api/outbox/${encodeURIComponent(id)}`, { headers: getAuthHeaders(), credentials: 'include' });
+      const res = await api(`/api/outbox/${encodeURIComponent(id)}`);
       if (!res.ok) return null;
       const data = await res.json();
       const meta = data.message || data;
@@ -178,9 +182,8 @@
       const files = [];
       for (const att of (meta.attachments || [])) {
         const filename = att.name || att.filename;
-        const fileRes = await fetch(
-          `/api/outbox/${encodeURIComponent(id)}/attachments/${encodeURIComponent(filename)}`,
-          { headers: getAuthHeaders(), credentials: 'include' }
+        const fileRes = await api(
+          `/api/outbox/${encodeURIComponent(id)}/attachments/${encodeURIComponent(filename)}`
         );
         if (fileRes.ok) {
           const blob = await fileRes.blob();
@@ -192,14 +195,13 @@
     },
 
     async isAccepted(id) {
-      const res = await fetch('/api/accepted', { headers: getAuthHeaders(), credentials: 'include' });
+      const res = await api('/api/accepted');
       if (!res.ok) return false;
       const list = await res.json();
       return Array.isArray(list) && list.includes(id);
     },
 
     async acceptMessage(msg) {
-      logActivity(`📥 Ingesting message <strong>${msg.id}</strong> (${msg.attachments.length} file(s))...`);
       const formData = new FormData();
       formData.append('id', msg.id);
       formData.append('payload', JSON.stringify(msg.payload || {}));
@@ -207,15 +209,12 @@
         formData.append('attachments', f, f.name);
       }
 
-      const res = await fetch('/api/inbox', {
+      const res = await api('/api/inbox', {
         method: 'POST',
-        headers: getAuthHeaders(),
-        credentials: 'include',
         body: formData
       });
 
       if (res.ok) {
-        logActivity(`✓ Accepted message <strong>${msg.id}</strong>. Saved to local storage.`);
         refreshInbox();
         return true;
       }
@@ -223,11 +222,9 @@
     },
 
     async onAcknowledged(ids) {
-      logActivity(`✓ App A acknowledged message(s): ${ids.join(', ')}. Cleaned from outbox.`);
-      await fetch('/api/outbox/ack', {
+      await api('/api/outbox/ack', {
         method: 'POST',
-        headers: { ...getAuthHeaders(), 'Content-Type': 'application/json' },
-        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ ids: ids })
       });
       refreshOutboxCount();
@@ -245,45 +242,43 @@
       role: 'host',
       iframe: workerFrame,
       storage: storageAdapter,
-      onStatusChange: function ({ state, detail }) {
-        if (state === 'connected') {
-          logActivity(`🟢 Connected to Application A (${peerOrigin})!`);
-        }
-        updateIndicator({ state: state });
+      onStatusChange: function ({ state }) {
+        updateIndicator();
       },
-      onSyncStatus: function (status) {
-        updateIndicator(status);
-      },
-      onTransfer: function ({ direction, type, id, repeated }) {
-        if (type === 'PUT' && direction === 'outgoing') {
-          logActivity(`📤 Transferred message <strong>${id}</strong> via browser MessageChannel.`);
-        } else if (type === 'ACK' && direction === 'outgoing') {
-          logActivity(`✓ Sent ACK for message(s) to Application A${repeated ? ' (Rule 5 repeat)' : ''}.`);
-        }
+      onSyncStatus: function () {
+        updateIndicator();
       }
     });
 
-    workerFrame.addEventListener('load', function () {
-      logActivity('Application A worker frame loaded. Handshaking...');
-      umaiSession.start();
-    });
-
-    if (workerFrame.contentWindow) {
-      umaiSession.start();
+    if (!workerFrame._loadBound) {
+      workerFrame._loadBound = true;
+      workerFrame.addEventListener('load', function () {
+        if (workerFrame.src && workerFrame.src !== 'about:blank') {
+          if (workerFrame.contentWindow) {
+            workerFrame.contentWindow.postMessage({ protocol: 'UMAI_CONTROL', type: 'PING_AUTH' }, '*');
+          }
+          if (umaiSession) {
+            umaiSession.start();
+          }
+        }
+      });
     }
+
+    umaiSession.start();
   }
 
   // Update Real-Time Synchronization Indicator
-  function updateIndicator(status = {}) {
-    const state = status.state || (umaiSession ? umaiSession.state : 'disconnected');
-    const isSyncing = status.isSyncing;
+  function updateIndicator() {
+    const hostStatus = umaiSession ? umaiSession.getSyncStatus() : { state: 'disconnected', isSyncing: false };
+    const state = hostStatus.state;
+    const isSyncing = hostStatus.isSyncing || (workerSyncStatus && workerSyncStatus.isSyncing);
 
     syncIndicator.className = 'sync-indicator';
 
     if (!isAppAAuthenticated) {
       syncIndicator.classList.add('sync-auth');
       indicatorText.textContent = '🔒 App A Login Required';
-      indicatorBadge.textContent = '[Click to authenticate]';
+      indicatorBadge.textContent = '';
       return;
     }
 
@@ -297,39 +292,40 @@
     if (isSyncing) {
       syncIndicator.classList.add('sync-active');
       indicatorText.textContent = 'Syncing...';
-      const detail = status.detail || 'Transfer in progress';
-      indicatorBadge.textContent = detail;
+      indicatorBadge.textContent = '';
     } else {
       syncIndicator.classList.add('sync-idle');
-      indicatorText.textContent = '● In Sync';
-      indicatorBadge.textContent = '(All up to date)';
+      indicatorText.textContent = 'In Sync';
+      indicatorBadge.textContent = '';
     }
   }
 
   // Listen to messages from worker frame
   window.addEventListener('message', function (e) {
-    if (e.data && e.data.protocol === 'UMAI_CONTROL') {
-      if (e.data.type === 'AUTH_REQUIRED') {
-        isAppAAuthenticated = false;
-        trayContent.style.display = 'block';
-        trayLabel.textContent = '🔒 Application A Authentication Required (Log in below)';
-        trayToggleIcon.textContent = '▼ Collapse';
-        updateIndicator();
-        logActivity('⚠️ Application A requires login. Please authenticate in the bottom tray.');
-      } else if (e.data.type === 'AUTH_OK') {
-        isAppAAuthenticated = true;
-        trayContent.style.display = 'none';
-        trayLabel.textContent = '● Application A Background Node (Connected & Hidden)';
-        trayToggleIcon.textContent = '▲ Expand';
-        updateIndicator();
-        logActivity('✓ Application A background worker authenticated.');
-        if (umaiSession) {
-          if (umaiSession.state !== 'connected') {
-            umaiSession.start();
-          }
+    if (!e.data || e.data.protocol !== 'UMAI_CONTROL') return;
+
+    if (e.data.type === 'AUTH_REQUIRED') {
+      isAppAAuthenticated = false;
+      trayContent.style.display = 'block';
+      trayLabel.textContent = '🔒 Application A Login Required (Sign in below)';
+      trayToggleIcon.textContent = '▼ Collapse';
+      updateIndicator();
+    } else if (e.data.type === 'AUTH_OK') {
+      isAppAAuthenticated = true;
+      trayContent.style.display = 'none';
+      trayLabel.textContent = '● Application A Sync Worker (Connected)';
+      trayToggleIcon.textContent = '▲ Expand';
+      updateIndicator();
+      if (umaiSession) {
+        if (umaiSession.state !== 'connected') {
+          umaiSession.start();
+        } else {
           umaiSession.reconcile();
         }
       }
+    } else if (e.data.type === 'SYNC_STATUS') {
+      workerSyncStatus = e.data.status || null;
+      updateIndicator();
     }
   });
 
@@ -344,7 +340,7 @@
     }
   });
 
-  // Sync indicator click triggers immediate sync
+  // Sync indicator click triggers immediate sync or opens auth tray
   syncIndicator.addEventListener('click', function () {
     if (!isAppAAuthenticated) {
       trayContent.style.display = 'block';
@@ -352,7 +348,6 @@
       return;
     }
     if (umaiSession) {
-      logActivity('Manual reconciliation triggered.');
       umaiSession.reconcile();
       if (workerFrame && workerFrame.contentWindow) {
         workerFrame.contentWindow.postMessage({ protocol: 'UMAI_CONTROL', type: 'TRIGGER_SYNC' }, '*');
@@ -360,166 +355,145 @@
     }
   });
 
-  btnForceSync.addEventListener('click', function () {
-    if (umaiSession) {
-      logActivity('Manual reconciliation triggered.');
-      umaiSession.reconcile();
-      if (workerFrame && workerFrame.contentWindow) {
-        workerFrame.contentWindow.postMessage({ protocol: 'UMAI_CONTROL', type: 'TRIGGER_SYNC' }, '*');
-      }
-    }
-  });
-
-  // Refresh Inbox Table (received from Application A)
+  // Refresh Inbox Table (Messages received from Application A)
   async function refreshInbox() {
+    if (!sessionToken) return;
     try {
-      const res = await fetch('/api/inbox', { headers: getAuthHeaders(), credentials: 'include' });
+      const res = await api('/api/inbox');
       if (!res.ok) return;
       const data = await res.json();
       const messages = Array.isArray(data) ? data : (data.messages || []);
 
-      inboxCount.textContent = `${messages.length} message(s)`;
+      inboxCount.textContent = `${messages.length} message${messages.length === 1 ? '' : 's'}`;
 
       if (messages.length === 0) {
         inboxTbody.innerHTML = `
           <tr>
-            <td colspan="5" class="empty-placeholder">
-              No documents received from Application A yet. Upload a document in Application A to test receiving.
+            <td colspan="4" class="empty-placeholder">
+              No messages received from Application A yet.
             </td>
           </tr>
         `;
         return;
       }
 
-      const rows = [];
-      messages.forEach(msg => {
+      const rows = messages.map(msg => {
         const subj = (msg.payload && msg.payload.subject) || 'No subject';
+        const note = (msg.payload && msg.payload.text) ? ` — ${msg.payload.text}` : '';
         const date = new Date(msg.created_at || Date.now()).toLocaleTimeString();
         const attachments = msg.attachments || [];
 
-        if (attachments.length === 0) {
-          rows.push(`
-            <tr>
-              <td style="font-weight: 600; color: #fff;">✉️ [Message only]</td>
-              <td style="color: var(--text-muted);">${escapeHtml(subj)}</td>
-              <td style="color: var(--text-muted); font-family: monospace;">-</td>
-              <td style="color: var(--text-muted); font-size: 12px;">${date}</td>
-              <td style="text-align: right; color: var(--success); font-size: 11px;">✓ Received</td>
-            </tr>
-          `);
-        } else {
-          attachments.forEach(att => {
-            const sizeKb = ((att.size || 0) / 1024).toFixed(1);
-            rows.push(`
-              <tr>
-                <td style="font-weight: 600; color: #fff;">📄 ${escapeHtml(att.name)}</td>
-                <td style="color: var(--text-muted);">${escapeHtml(subj)}</td>
-                <td style="color: var(--text-muted); font-family: monospace;">${sizeKb} KB</td>
-                <td style="color: var(--text-muted); font-size: 12px;">${date}</td>
-                <td style="text-align: right;">
-                  <a href="/api/inbox/${encodeURIComponent(msg.id)}/attachments/${encodeURIComponent(att.name)}"
-                     download="${escapeHtml(att.name)}" class="btn btn-secondary btn-sm" style="text-decoration:none;">
-                    ⬇ Download
-                  </a>
-                </td>
-              </tr>
-            `);
-          });
-        }
+        const attDisplay = attachments.length === 0
+          ? '<span style="color: var(--text-muted);">—</span>'
+          : attachments.map(a => `${escapeHtml(a.name)} (${formatBytes(a.size)})`).join(', ');
+
+        return `
+          <tr>
+            <td style="font-family: monospace; font-size: 12px; color: var(--text-muted);">${escapeHtml(msg.id)}</td>
+            <td style="font-weight: 500; color: #fff;">${escapeHtml(subj)}<span style="color: var(--text-muted); font-weight: normal;">${escapeHtml(note)}</span></td>
+            <td style="color: var(--text-muted); font-size: 12px;">${attDisplay}</td>
+            <td style="text-align: right; color: var(--text-muted); font-size: 12px;">${date}</td>
+          </tr>
+        `;
       });
 
       inboxTbody.innerHTML = rows.join('');
-    } catch (err) {
-      console.error('[Minimal B] Refresh inbox error:', err);
-    }
+    } catch (err) {}
   }
 
   // Refresh Outbox Count
   async function refreshOutboxCount() {
+    if (!sessionToken) return;
     try {
-      const res = await fetch('/api/outbox', { headers: getAuthHeaders(), credentials: 'include' });
+      const res = await api('/api/outbox');
       if (!res.ok) return;
       const data = await res.json();
       const count = (Array.isArray(data) ? data : (data.messages || [])).length;
-      outboxStat.textContent = count > 0 ? `Outbox: ${count} pending transfer` : 'Outbox: 0 pending';
+      outboxStat.textContent = `Outbox: ${count} pending`;
     } catch (err) {}
   }
 
-  // Handle Form Submit: Send File to App A
+  // Handle Form Submit: Send Message to App A (with optional attachment)
   transferForm.addEventListener('submit', async function (e) {
     e.preventDefault();
 
-    const file = transferFile.files[0];
+    const file = transferFile.files[0] || null;
     const subject = transferSubject.value.trim();
-    if (!file || !subject) return;
+    if (!subject) return;
 
     btnSend.disabled = true;
-    transferStatus.innerHTML = '<span style="color: var(--warning);">Preparing document upload...</span>';
+    transferStatus.innerHTML = '<span style="color: var(--warning);">Sending...</span>';
 
     try {
-      // Step 1: Upload document to local App B store
-      const uploadData = new FormData();
-      uploadData.append('file', file);
-      const uploadRes = await fetch('/api/docs', {
-        method: 'POST',
-        headers: getAuthHeaders(),
-        credentials: 'include',
-        body: uploadData
-      });
+      const docNames = [];
 
-      if (!uploadRes.ok) {
-        throw new Error('Failed to upload file to local storage');
+      // If an attachment is selected, upload it to App B's document store first
+      if (file) {
+        const uploadData = new FormData();
+        uploadData.append('file', file);
+        const uploadRes = await api('/api/docs', {
+          method: 'POST',
+          body: uploadData
+        });
+        if (!uploadRes.ok) {
+          throw new Error('Failed to stage attachment');
+        }
+        docNames.push(file.name);
       }
 
-      // Step 2: Queue message in App B's outbox
-      transferStatus.innerHTML = '<span style="color: var(--warning);">Queueing UMAI message in outbox...</span>';
-      const outboxRes = await fetch('/api/outbox', {
+      // Create message in App B's outbox
+      const outboxRes = await api('/api/outbox', {
         method: 'POST',
-        headers: { ...getAuthHeaders(), 'Content-Type': 'application/json' },
-        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           payload: { subject: subject, timestamp: new Date().toISOString() },
-          documents: [file.name]
+          documents: docNames
         })
       });
 
       if (!outboxRes.ok) {
-        throw new Error('Failed to create outbox message');
+        throw new Error('Failed to create message');
       }
-
-      const outboxData = await outboxRes.json();
-      const msgId = (outboxData && (outboxData.id || (outboxData.message && outboxData.message.id))) || 'msg';
-      logActivity(`Queued message <strong>${escapeHtml(msgId)}</strong> ('${escapeHtml(subject)}') for Application A.`);
 
       transferForm.reset();
       refreshOutboxCount();
-      transferStatus.innerHTML = '<span style="color: var(--success);">✓ Transferred & Synchronizing via UMAI!</span>';
+      transferStatus.innerHTML = '<span style="color: var(--success);">✓ Queued for synchronization</span>';
 
-      // Step 3: Trigger instant UMAI reconciliation
       if (umaiSession) {
         umaiSession.reconcile();
       }
 
       setTimeout(() => {
-        transferStatus.textContent = 'Ready to send.';
-      }, 4000);
+        transferStatus.textContent = '';
+      }, 3000);
     } catch (err) {
-      logActivity(`❌ Error transferring document: ${err.message}`);
       transferStatus.innerHTML = `<span style="color: var(--danger);">${escapeHtml(err.message)}</span>`;
     } finally {
       btnSend.disabled = false;
     }
   });
 
+  function formatBytes(bytes) {
+    if (!bytes || bytes === 0) return '0 B';
+    const k = 1024;
+    const sizes = ['B', 'KB', 'MB', 'GB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
+  }
+
   function escapeHtml(str) {
-    return (str || '').replace(/[&<>"']/g, function (m) {
+    return String(str || '').replace(/[&<>"']/g, function (m) {
       return ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[m];
     });
   }
 
-  // Periodic polling for inbox changes
-  setInterval(refreshInbox, 3000);
-  setInterval(refreshOutboxCount, 3000);
+  // Periodic polling for inbox and outbox changes
+  setInterval(() => {
+    if (sessionToken) {
+      refreshInbox();
+      refreshOutboxCount();
+    }
+  }, 2000);
 
   // Start initialization
   checkAuth();

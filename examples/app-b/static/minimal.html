@@ -3,8 +3,8 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Application B — Minimal Production View</title>
-  <link rel="stylesheet" href="/minimal.css?v=0.1.2">
+  <title>Application B — Minimal View</title>
+  <link rel="stylesheet" href="/minimal.css?v=0.1.3">
   <script>
     if ('serviceWorker' in navigator) {
       navigator.serviceWorker.getRegistrations().then(function(regs) {
@@ -16,20 +16,20 @@
 <body>
 
   <!-- Auth Screen for App B -->
-  <div id="auth-screen" style="display: none; min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 20px;">
-    <div style="background: var(--card-bg); border: 1px solid var(--card-border); border-radius: 12px; padding: 32px; max-width: 400px; width: 100%;">
-      <h2 style="margin-bottom: 8px; color: #fff;">Application B — Login</h2>
-      <p style="color: var(--text-muted); font-size: 13px; margin-bottom: 20px;">
-        Demo login (Default: <code>admin</code> / <code>umai123</code>)
+  <div id="auth-screen" style="display: none; min-height: 100vh; align-items: center; justify-content: center; padding: 20px;">
+    <div style="background: var(--card-bg); border: 1px solid var(--card-border); border-radius: 10px; padding: 28px; max-width: 360px; width: 100%;">
+      <h2 style="margin-bottom: 6px; color: #fff; font-size: 18px;">Application B — Sign In</h2>
+      <p style="color: var(--text-muted); font-size: 12px; margin-bottom: 18px;">
+        Default: <code>admin</code> / <code>umai123</code>
       </p>
       <form id="b-login-form">
-        <div style="margin-bottom: 14px;">
-          <label style="display: block; font-size: 12px; font-weight: 600; margin-bottom: 6px; color: var(--text-muted);">Username</label>
-          <input type="text" id="b-username" value="admin" style="width: 100%; padding: 8px 12px; background: #0f172a; border: 1px solid #334155; border-radius: 6px; color: #fff;" required>
+        <div style="margin-bottom: 12px;">
+          <label style="display: block; font-size: 12px; font-weight: 600; margin-bottom: 4px; color: var(--text-muted);">Username</label>
+          <input type="text" id="b-username" value="admin" style="width: 100%; padding: 8px 10px; background: #0f172a; border: 1px solid #334155; border-radius: 6px; color: #fff;" required>
         </div>
-        <div style="margin-bottom: 18px;">
-          <label style="display: block; font-size: 12px; font-weight: 600; margin-bottom: 6px; color: var(--text-muted);">Password</label>
-          <input type="password" id="b-password" value="umai123" style="width: 100%; padding: 8px 12px; background: #0f172a; border: 1px solid #334155; border-radius: 6px; color: #fff;" required>
+        <div style="margin-bottom: 16px;">
+          <label style="display: block; font-size: 12px; font-weight: 600; margin-bottom: 4px; color: var(--text-muted);">Password</label>
+          <input type="password" id="b-password" value="umai123" style="width: 100%; padding: 8px 10px; background: #0f172a; border: 1px solid #334155; border-radius: 6px; color: #fff;" required>
         </div>
         <div id="b-login-error" style="color: var(--danger); font-size: 12px; margin-bottom: 12px; display: none;"></div>
         <button type="submit" class="btn btn-primary" style="width: 100%;">Sign In</button>
@@ -43,116 +43,89 @@
     <header class="portal-header">
       <div class="portal-brand">
         <h1 class="portal-title">Application B</h1>
-        <span class="portal-badge">Minimal Production View</span>
+        <span class="portal-badge">Minimal View</span>
       </div>
 
       <div class="portal-controls">
         <!-- Live Real-Time Synchronization Status Indicator -->
-        <div id="sync-indicator" class="sync-indicator sync-connecting" title="Real-time UMAI Sync State">
+        <div id="sync-indicator" class="sync-indicator sync-connecting" title="Click to synchronize or authenticate Application A">
           <span class="indicator-dot"></span>
-          <span id="indicator-text">Connecting to App A...</span>
+          <span id="indicator-text">Connecting...</span>
           <span id="indicator-badge" style="font-size: 11px; opacity: 0.85;"></span>
         </div>
 
-        <button id="btn-force-sync" class="btn btn-secondary btn-sm" title="Trigger instant sync">↻ Sync Now</button>
-        <a href="/" class="btn btn-secondary btn-sm" title="View dual side-by-side inspector">🔍 Full Inspector View</a>
+        <a href="/" class="btn btn-secondary btn-sm" title="Switch to dual side-by-side protocol inspector">Inspector View</a>
         <button id="btn-logout" class="btn btn-secondary btn-sm">Logout</button>
       </div>
     </header>
 
     <!-- Main Workspace -->
     <main class="portal-main">
-      <!-- Architectural Explainer Banner -->
-      <div class="portal-banner">
-        <div class="portal-banner-text">
-          <strong>User-Mediated Interoperability in Action:</strong> Application A is embedded invisibly below as a background worker. 
-          When you upload a file, it is securely transferred to Application A directly through your browser session with zero server-to-server APIs.
-        </div>
-      </div>
-
-      <!-- Quick Transfer Card (Send to App A) -->
+      <!-- Send Message to Application A -->
       <div class="portal-card">
         <div class="card-heading">
-          <span>📤 Send Document to Application A</span>
+          <span>Send Message to Application A</span>
           <span id="outbox-stat" style="font-size: 12px; color: var(--text-muted); font-weight: normal;">Outbox: 0 pending</span>
         </div>
 
         <form id="transfer-form">
-          <div style="display: grid; grid-template-columns: 2fr 1fr; gap: 12px; margin-bottom: 14px;">
+          <div style="display: grid; grid-template-columns: 1fr 1fr auto; gap: 10px; align-items: end;">
             <div>
-              <label style="display: block; font-size: 12px; color: var(--text-muted); margin-bottom: 4px;">Subject / Metadata</label>
-              <input type="text" id="transfer-subject" placeholder="e.g. Q4 Audit Report" style="width: 100%; padding: 8px 12px; background: #0f172a; border: 1px solid #334155; border-radius: 6px; color: #fff;" required>
+              <label style="display: block; font-size: 12px; color: var(--text-muted); margin-bottom: 4px;">Message / Subject</label>
+              <input type="text" id="transfer-subject" placeholder="Enter message for Application A..." style="width: 100%; padding: 8px 10px; background: #0f172a; border: 1px solid #334155; border-radius: 6px; color: #fff;" required>
             </div>
             <div>
-              <label style="display: block; font-size: 12px; color: var(--text-muted); margin-bottom: 4px;">Select File</label>
-              <input type="file" id="transfer-file" style="width: 100%; padding: 6px; background: #0f172a; border: 1px solid #334155; border-radius: 6px; color: #fff; font-size: 12px;" required>
+              <label style="display: block; font-size: 12px; color: var(--text-muted); margin-bottom: 4px;">Attachment (Optional)</label>
+              <input type="file" id="transfer-file" style="width: 100%; padding: 5px 8px; background: #0f172a; border: 1px solid #334155; border-radius: 6px; color: #fff; font-size: 12px;">
             </div>
-          </div>
-
-          <div style="display: flex; justify-content: space-between; align-items: center;">
-            <div id="transfer-status" style="font-size: 12px; color: var(--text-muted);">
-              Ready to send.
-            </div>
-            <button type="submit" id="btn-send" class="btn btn-primary">
-              <span>Send & Synchronize</span>
+            <button type="submit" id="btn-send" class="btn btn-primary" style="height: 35px;">
+              Send
             </button>
           </div>
+          <div id="transfer-status" style="font-size: 12px; color: var(--text-muted); margin-top: 8px; min-height: 18px;"></div>
         </form>
       </div>
 
-      <!-- Received Documents Card (Inbox from App A) -->
+      <!-- Received Messages from Application A -->
       <div class="portal-card">
         <div class="card-heading">
-          <span>📥 Received from Application A (Inbox)</span>
-          <span id="inbox-count" style="font-size: 12px; color: var(--text-muted); font-weight: normal;">0 document(s)</span>
+          <span>Messages Received from Application A</span>
+          <span id="inbox-count" style="font-size: 12px; color: var(--text-muted); font-weight: normal;">0 messages</span>
         </div>
 
         <table class="portal-table">
           <thead>
             <tr>
-              <th>Document Name</th>
-              <th>Subject</th>
-              <th>File Size</th>
-              <th>Received</th>
-              <th style="text-align: right;">Action</th>
+              <th style="width: 22%;">Message ID</th>
+              <th style="width: 38%;">Message</th>
+              <th style="width: 25%;">Attachments</th>
+              <th style="width: 15%; text-align: right;">Received</th>
             </tr>
           </thead>
           <tbody id="inbox-tbody">
             <tr>
-              <td colspan="5" class="empty-placeholder">
-                No documents received from Application A yet. Upload a document in Application A to test receiving.
+              <td colspan="4" class="empty-placeholder">
+                No messages received from Application A yet.
               </td>
             </tr>
           </tbody>
         </table>
-      </div>
-
-      <!-- Recent Activity Log (Collapsible) -->
-      <div class="portal-card" style="padding: 16px 24px;">
-        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
-          <strong style="font-size: 13px; color: #fff;">Activity Stream</strong>
-          <span style="font-size: 11px; color: var(--text-muted);">Real-time events</span>
-        </div>
-        <div id="activity-log" style="font-family: monospace; font-size: 11px; color: var(--text-muted); max-height: 120px; overflow-y: auto; display: flex; flex-direction: column; gap: 4px;">
-          <div>Waiting for UMAI connection...</div>
-        </div>
       </div>
     </main>
 
     <!-- Bottom Tray: Collapsible Background Iframe for Application A -->
     <div id="sync-tray" class="sync-tray">
       <div id="tray-header" class="sync-tray-header">
-        <span id="tray-label">🔒 Application A Background Node: Click to expand / log in</span>
+        <span id="tray-label">Application A Background Sync Worker</span>
         <span id="tray-toggle-icon">▲ Expand</span>
       </div>
       <div id="tray-content" class="sync-tray-content" style="display: none;">
-        <!-- Embedded Application A Sync Endpoint -->
-        <iframe id="umai-worker-frame" src="http://127.0.0.1:8081/sync.html"></iframe>
+        <iframe id="umai-worker-frame" src="about:blank"></iframe>
       </div>
     </div>
   </div>
 
-  <script src="/js/umai.js"></script>
-  <script src="/minimal.js?v=0.1.2"></script>
+  <script src="/js/umai.js?v=0.1.3"></script>
+  <script src="/minimal.js?v=0.1.3"></script>
 </body>
 </html>

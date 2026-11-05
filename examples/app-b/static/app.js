@@ -504,10 +504,15 @@
     });
 
     // When iframe fires load event, host initiates handshake
-    peerIframe.addEventListener('load', () => {
-      appendLog('info', 'Iframe load event detected; starting UMAI session');
-      umaiSession.start();
-    });
+    if (!peerIframe._loadBound) {
+      peerIframe._loadBound = true;
+      peerIframe.addEventListener('load', () => {
+        if (peerIframe.src && peerIframe.src !== 'about:blank') {
+          appendLog('info', 'Iframe load event detected; starting UMAI session');
+          if (umaiSession) umaiSession.start();
+        }
+      });
+    }
 
     umaiSession.start();
   }

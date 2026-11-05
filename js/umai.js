@@ -168,8 +168,9 @@
       if (this.state === 'connected') return;
 
       this._setState('handshaking', `Starting as ${this.role}`);
-      if (typeof window !== 'undefined' && window.addEventListener) {
+      if (typeof window !== 'undefined' && window.addEventListener && !this._windowListenerRegistered) {
         window.addEventListener('message', this._windowListener);
+        this._windowListenerRegistered = true;
       }
 
       // Start periodic reconciliation heartbeat once connected
@@ -185,13 +186,16 @@
         // Embedded app informs parent window that it is ready
         this._sendReadySignal();
         // Periodically announce ready until parent responds with INIT
-        this._readyInterval = setInterval(() => {
-          if (this.state === 'connected') {
-            clearInterval(this._readyInterval);
-            return;
-          }
-          this._sendReadySignal();
-        }, 1000);
+        if (!this._readyInterval) {
+          this._readyInterval = setInterval(() => {
+            if (this.state === 'connected') {
+              clearInterval(this._readyInterval);
+              this._readyInterval = null;
+              return;
+            }
+            this._sendReadySignal();
+          }, 1000);
+        }
       } else {
         // Host role: if iframe is already loaded, we can initiate
         if (this.iframe && this.iframe.contentWindow) {
@@ -212,8 +216,9 @@
         clearInterval(this._readyInterval);
         this._readyInterval = null;
       }
-      if (typeof window !== 'undefined' && window.removeEventListener) {
+      if (typeof window !== 'undefined' && window.removeEventListener && this._windowListenerRegistered) {
         window.removeEventListener('message', this._windowListener);
+        this._windowListenerRegistered = false;
       }
       if (this.port) {
         try {
@@ -223,6 +228,7 @@
         }
         this.port = null;
       }
+      this._peerOfferedOnce = false;
       this._putQueue = [];
       this._isSendingPut = false;
       this._inFlightGets.clear();
@@ -291,6 +297,15 @@
       if (this.role === 'host') {
         if (data.type === 'READY') {
           this.log('info', 'Received READY from embedded peer');
+          // If embedded peer reloaded or restarted, reset port and re-initiate handshake
+          if (this.port) {
+            try {
+              this.port.close();
+            } catch (e) {}
+            this.port = null;
+          }
+          this._peerOfferedOnce = false;
+          this._setState('handshaking', 'Peer sent READY; re-establishing channel');
           this._initiateHostHandshake(event.origin);
         }
       } else if (this.role === 'embedded') {

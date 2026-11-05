@@ -499,5 +499,11 @@
   }
 
   // Start auth check
+  window.addEventListener('storage', (e) => {
+    if (e.key === 'umai_token_a') {
+      sessionToken = e.newValue || '';
+      checkAuth();
+    }
+  });
   checkAuth();
 })();
