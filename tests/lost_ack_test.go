@@ -54,6 +54,7 @@ func TestMandatory_LostACKVerification(t *testing.T) {
 	_ = mw.WriteField("id", msgA.ID)
 	pJSON, _ := json.Marshal(msgA.Payload)
 	_ = mw.WriteField("payload", string(pJSON))
+	_ = mw.WriteField("signature", msgA.Signature)
 	part, _ := mw.CreateFormFile("attachments", "contract.pdf")
 	_, _ = part.Write(fileData)
 	_ = mw.Close()
@@ -113,9 +114,13 @@ func TestMandatory_LostACKVerification(t *testing.T) {
 	}
 	t.Logf("Step 7: B sends repeated ACK for: %v without sending GET or receiving PUT", repeatedAcks)
 
-	// --- Step 8: A processes the ACK and removes the message from its outbox ---
+	// --- Step 8: A processes the ACK (with B's stored receipt) and removes the message from its outbox ---
+	storedReceipts := appB.Server.Storage().ListAcceptedReceipts()
 	var ackBuf bytes.Buffer
-	_ = json.NewEncoder(&ackBuf).Encode(map[string]any{"ids": repeatedAcks})
+	_ = json.NewEncoder(&ackBuf).Encode(map[string]any{
+		"ids":      repeatedAcks,
+		"receipts": storedReceipts,
+	})
 
 	ackReq, err := authenticatedRequest("POST", "/api/outbox/ack", appA.SessionID, &ackBuf, "application/json")
 	if err != nil {

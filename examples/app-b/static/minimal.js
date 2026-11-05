@@ -114,8 +114,8 @@
     // Load or reload the background worker iframe after host session is ready
     if (syncUrl && workerFrame.src !== syncUrl) {
       workerFrame.src = syncUrl;
-    } else if (workerFrame.contentWindow) {
-      workerFrame.contentWindow.postMessage({ protocol: 'UMAI_CONTROL', type: 'PING_AUTH' }, '*');
+    } else if (workerFrame.contentWindow && peerOrigin) {
+      workerFrame.contentWindow.postMessage({ protocol: 'UMAI_CONTROL', type: 'PING_AUTH' }, peerOrigin);
     }
   }
 
@@ -266,8 +266,8 @@
       workerFrame._loadBound = true;
       workerFrame.addEventListener('load', function () {
         if (workerFrame.src && workerFrame.src !== 'about:blank') {
-          if (workerFrame.contentWindow) {
-            workerFrame.contentWindow.postMessage({ protocol: 'UMAI_CONTROL', type: 'PING_AUTH' }, '*');
+          if (workerFrame.contentWindow && peerOrigin) {
+            workerFrame.contentWindow.postMessage({ protocol: 'UMAI_CONTROL', type: 'PING_AUTH' }, peerOrigin);
           }
           if (umaiSession) {
             umaiSession.start();
@@ -314,6 +314,8 @@
 
   // Listen to messages from worker frame
   window.addEventListener('message', function (e) {
+    if (peerOrigin && e.origin !== peerOrigin) return;
+    if (workerFrame && workerFrame.contentWindow && e.source !== workerFrame.contentWindow) return;
     if (!e.data || e.data.protocol !== 'UMAI_CONTROL') return;
 
     if (e.data.type === 'AUTH_REQUIRED') {
@@ -361,8 +363,8 @@
     }
     if (umaiSession) {
       umaiSession.reconcile();
-      if (workerFrame && workerFrame.contentWindow) {
-        workerFrame.contentWindow.postMessage({ protocol: 'UMAI_CONTROL', type: 'TRIGGER_SYNC' }, '*');
+      if (workerFrame && workerFrame.contentWindow && peerOrigin) {
+        workerFrame.contentWindow.postMessage({ protocol: 'UMAI_CONTROL', type: 'TRIGGER_SYNC' }, peerOrigin);
       }
     }
   });

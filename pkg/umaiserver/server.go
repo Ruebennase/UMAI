@@ -41,7 +41,7 @@ func NewServer(cfg Config, staticDir string) (*Server, error) {
 	if err != nil {
 		return nil, fmt.Errorf("initializing signing keys: %w", err)
 	}
-	storage.SetKeys(ownPub, ownPriv, peerPub)
+	storage.SetKeys(cfg.Role, ownPub, ownPriv, peerPub)
 
 	auth := NewAuthManager(cfg.CookieName, cfg.AuthUsername, cfg.AuthPassword)
 

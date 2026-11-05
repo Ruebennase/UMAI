@@ -212,6 +212,7 @@ func TestProtocol_ZeroAttachmentsExchange(t *testing.T) {
 	mw := multipart.NewWriter(&buf)
 	_ = mw.WriteField("id", msg.ID)
 	_ = mw.WriteField("payload", `{"type":"ping"}`)
+	_ = mw.WriteField("signature", msg.Signature)
 	_ = mw.Close()
 
 	req, _ := authenticatedRequest("POST", "/api/inbox", appB.SessionID, &buf, mw.FormDataContentType())
@@ -228,16 +229,24 @@ func TestProtocol_ZeroAttachmentsExchange(t *testing.T) {
 }
 
 func TestProtocol_DuplicatePrevention(t *testing.T) {
+	appA := setupApp(t, "app-a", "http://127.0.0.1:8082")
 	appB := setupApp(t, "app-b", "http://127.0.0.1:8081")
 
-	msgID := "msg-dup-001"
-	payload := `{"text":"First send"}`
+	_, _ = appA.Server.Storage().SaveDocument("file.txt", bytes.NewReader([]byte("content")))
+	msgA, err := appA.Server.Storage().CreateOutboxMessage(map[string]string{"text": "First send"}, []string{"file.txt"})
+	if err != nil {
+		t.Fatalf("CreateOutboxMessage: %v", err)
+	}
+	msgID := msgA.ID
+	pBytes, _ := json.Marshal(msgA.Payload)
+	payload := string(pBytes)
 
 	// 1. Send first PUT
 	var buf1 bytes.Buffer
 	mw1 := multipart.NewWriter(&buf1)
 	_ = mw1.WriteField("id", msgID)
 	_ = mw1.WriteField("payload", payload)
+	_ = mw1.WriteField("signature", msgA.Signature)
 	p1, _ := mw1.CreateFormFile("attachments", "file.txt")
 	_, _ = p1.Write([]byte("content"))
 	_ = mw1.Close()
@@ -260,6 +269,7 @@ func TestProtocol_DuplicatePrevention(t *testing.T) {
 	mw2 := multipart.NewWriter(&buf2)
 	_ = mw2.WriteField("id", msgID)
 	_ = mw2.WriteField("payload", payload)
+	_ = mw2.WriteField("signature", msgA.Signature)
 	p2, _ := mw2.CreateFormFile("attachments", "file.txt")
 	_, _ = p2.Write([]byte("content"))
 	_ = mw2.Close()
@@ -348,7 +358,27 @@ func TestSecurity_SignedMessages_TamperAndForgeryRejection(t *testing.T) {
 		t.Fatalf("Tampered message must not be marked accepted on B")
 	}
 
-	// 2. Attempt to forge an ACK receipt on A without B having accepted it
+	// 2. Attempt signature-strip downgrade (omitting signature field entirely)
+	var bufStrip bytes.Buffer
+	mwStrip := multipart.NewWriter(&bufStrip)
+	_ = mwStrip.WriteField("id", msgA.ID)
+	_ = mwStrip.WriteField("payload", string(pJSON))
+	partStrip, _ := mwStrip.CreateFormFile("attachments", "invoice.pdf")
+	_, _ = partStrip.Write([]byte("Original Amount: CHF 100"))
+	_ = mwStrip.Close()
+
+	reqStrip, _ := authenticatedRequest("POST", "/api/inbox", appB.SessionID, &bufStrip, mwStrip.FormDataContentType())
+	resStrip := appB.Do(reqStrip)
+	defer resStrip.Body.Close()
+	if resStrip.StatusCode == http.StatusOK {
+		t.Fatalf("Expected B to reject unsigned message (signature-strip downgrade), but got 200 OK")
+	}
+
+	// 3. Attempt to forge an ACK receipt on A without B having accepted it, or with an empty receipts map
+	err = appA.Server.Storage().AcknowledgeMessagesVerified([]string{msgA.ID}, map[string]string{})
+	if err == nil {
+		t.Fatalf("Expected A to reject empty receipts map downgrade")
+	}
 	err = appA.Server.Storage().AcknowledgeMessagesVerified([]string{msgA.ID}, map[string]string{
 		msgA.ID: "0000000000000000000000000000000000000000000000000000000000000000",
 	})

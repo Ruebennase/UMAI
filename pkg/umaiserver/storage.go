@@ -63,6 +63,8 @@ type Storage struct {
 	acceptedFile  string
 	maxUploadSize int64
 	acceptedIDs   map[string]bool
+	role          string
+	peerRole      string
 	ownPubKey     ed25519.PublicKey
 	ownPrivKey    ed25519.PrivateKey
 	peerPubKey    ed25519.PublicKey
@@ -103,10 +105,16 @@ func NewStorage(dataDir string, maxUploadSize int64) (*Storage, error) {
 	return s, nil
 }
 
-// SetKeys configures the Ed25519 signing key pair and the expected peer public key.
-func (s *Storage) SetKeys(ownPub ed25519.PublicKey, ownPriv ed25519.PrivateKey, peerPub ed25519.PublicKey) {
+// SetKeys configures the server role, Ed25519 signing key pair, and the expected peer public key.
+func (s *Storage) SetKeys(role string, ownPub ed25519.PublicKey, ownPriv ed25519.PrivateKey, peerPub ed25519.PublicKey) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.role = role
+	if role == "app-b" {
+		s.peerRole = "app-a"
+	} else {
+		s.peerRole = "app-b"
+	}
 	s.ownPubKey = ownPub
 	s.ownPrivKey = ownPriv
 	s.peerPubKey = peerPub
@@ -372,7 +380,7 @@ func (s *Storage) CreateOutboxMessage(payload any, docNames []string) (*Message,
 		})
 	}
 
-	sigHex, err := SignPutMessage(s.ownPrivKey, msgID, payload, attachments)
+	sigHex, err := SignPutMessage(s.ownPrivKey, s.role, msgID, payload, attachments)
 	if err != nil {
 		_ = os.RemoveAll(msgDir)
 		return nil, err
@@ -482,13 +490,26 @@ func (s *Storage) GetOutboxAttachmentPath(id, filename string) (string, error) {
 	return filePath, nil
 }
 
-// AcknowledgeMessages removes acknowledged messages from outbox (Rule 6).
+// AcknowledgeMessages removes acknowledged messages from outbox (Rule 6) without cryptographic receipt verification
+// (used only by internal unit tests that test storage cleanup directly).
 func (s *Storage) AcknowledgeMessages(ids []string) error {
-	return s.AcknowledgeMessagesVerified(ids, nil)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for _, rawID := range ids {
+		cleanID, err := sanitizeID(rawID)
+		if err != nil {
+			continue
+		}
+		msgDir := filepath.Join(s.outboxDir, cleanID)
+		_ = os.RemoveAll(msgDir)
+	}
+	return nil
 }
 
 // AcknowledgeMessagesVerified removes acknowledged messages from outbox (Rule 6),
-// verifying any provided cryptographic ACK receipts against the peer's public key.
+// strictly verifying cryptographic ACK receipts against the peer's public key whenever
+// a peer public key is configured and the outbox message was signed.
 func (s *Storage) AcknowledgeMessagesVerified(ids []string, receipts map[string]string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -500,16 +521,19 @@ func (s *Storage) AcknowledgeMessagesVerified(ids []string, receipts map[string]
 		}
 		msgDir := filepath.Join(s.outboxDir, cleanID)
 		msgFile := filepath.Join(msgDir, "message.json")
-		if len(receipts) > 0 && len(s.peerPubKey) > 0 {
-			receiptHex, hasReceipt := receipts[cleanID]
-			if !hasReceipt || receiptHex == "" {
-				return fmt.Errorf("missing ACK receipt for %s: %w", cleanID, ErrInvalidReceipt)
-			}
+		if len(s.peerPubKey) > 0 {
 			data, err := os.ReadFile(msgFile)
 			if err == nil {
 				var outMsg Message
 				if err := json.Unmarshal(data, &outMsg); err == nil && outMsg.Signature != "" {
-					if err := VerifyAckReceipt(s.peerPubKey, cleanID, outMsg.Signature, receiptHex); err != nil {
+					receiptHex := ""
+					if receipts != nil {
+						receiptHex = receipts[cleanID]
+					}
+					if receiptHex == "" {
+						return fmt.Errorf("missing ACK receipt for %s: %w", cleanID, ErrInvalidReceipt)
+					}
+					if err := VerifyAckReceipt(s.peerPubKey, s.peerRole, cleanID, outMsg.Signature, receiptHex); err != nil {
 						return fmt.Errorf("ACK receipt verification failed for %s: %w", cleanID, err)
 					}
 				}
@@ -648,14 +672,19 @@ type AttachmentReader struct {
 	Reader io.Reader
 }
 
-// AcceptMessage performs all-or-nothing acceptance of a PUT message (Rule 3 & 4).
+// AcceptMessage performs all-or-nothing acceptance of a PUT message (Rule 3 & 4) without signature enforcement
+// (used only by internal storage tests that test raw disk staging directly).
 func (s *Storage) AcceptMessage(id string, payload any, attachments []AttachmentReader) (*Message, error) {
-	return s.AcceptSignedMessage(id, payload, attachments, "")
+	return s.acceptMessageInternal(id, payload, attachments, "", false)
 }
 
 // AcceptSignedMessage performs all-or-nothing acceptance of a PUT message (Rule 3 & 4),
-// verifying the sender's Ed25519 signature when provided (or when required by server config).
+// strictly verifying the sender's Ed25519 signature against the configured peer public key.
 func (s *Storage) AcceptSignedMessage(id string, payload any, attachments []AttachmentReader, sigHex string) (*Message, error) {
+	return s.acceptMessageInternal(id, payload, attachments, sigHex, true)
+}
+
+func (s *Storage) acceptMessageInternal(id string, payload any, attachments []AttachmentReader, sigHex string, requireSignature bool) (*Message, error) {
 	if len(attachments) > MaxAttachmentsPerMessage {
 		return nil, ErrTooManyAttachments
 	}
@@ -739,9 +768,9 @@ func (s *Storage) AcceptSignedMessage(id string, payload any, attachments []Atta
 		})
 	}
 
-	// Verify Ed25519 signature if provided
-	if sigHex != "" && len(s.peerPubKey) > 0 {
-		if err := VerifyPutMessage(s.peerPubKey, cleanID, payload, attInfos, sigHex); err != nil {
+	// Enforce Ed25519 signature verification when required and peer public key is configured
+	if (requireSignature || sigHex != "") && len(s.peerPubKey) > 0 {
+		if err := VerifyPutMessage(s.peerPubKey, s.peerRole, cleanID, payload, attInfos, sigHex); err != nil {
 			_ = os.RemoveAll(tmpDir)
 			return nil, err
 		}
@@ -749,7 +778,7 @@ func (s *Storage) AcceptSignedMessage(id string, payload any, attachments []Atta
 
 	ackReceipt := ""
 	if len(s.ownPrivKey) > 0 {
-		ackReceipt = SignAckReceipt(s.ownPrivKey, cleanID, sigHex)
+		ackReceipt = SignAckReceipt(s.ownPrivKey, s.role, cleanID, sigHex)
 	}
 
 	msg := &Message{

@@ -68,10 +68,10 @@ func ParseKeyPair(role, privHex, peerPubHex string) (ed25519.PublicKey, ed25519.
 
 // CanonicalPutDigest computes the canonical SHA-256 digest of a UMAI PUT message:
 //
-//	UMAI-PUT-V1\n<id>\n<payload_canonical_sha256>\n<att1_name>:<att1_size>:<att1_sha256>\n...
+//	UMAI-PUT-V1\n<sender_role>\n<id>\n<payload_canonical_sha256>\n<att1_name>:<att1_size>:<att1_sha256>\n...
 //
 // Attachments are sorted by sanitized name so ordering differences never break verification.
-func CanonicalPutDigest(id string, payload any, attachments []AttachmentInfo) ([32]byte, error) {
+func CanonicalPutDigest(senderRole string, id string, payload any, attachments []AttachmentInfo) ([32]byte, error) {
 	// Normalize payload through JSON round-trip so map types and json.Unmarshal outputs produce identical JSON
 	var normalized any
 	rawBytes, err := json.Marshal(payload)
@@ -95,6 +95,8 @@ func CanonicalPutDigest(id string, payload any, attachments []AttachmentInfo) ([
 
 	var sb strings.Builder
 	sb.WriteString("UMAI-PUT-V1\n")
+	sb.WriteString(senderRole)
+	sb.WriteString("\n")
 	sb.WriteString(id)
 	sb.WriteString("\n")
 	sb.WriteString(hex.EncodeToString(payloadHash[:]))
@@ -107,11 +109,11 @@ func CanonicalPutDigest(id string, payload any, attachments []AttachmentInfo) ([
 }
 
 // SignPutMessage signs a message's canonical PUT digest with the sender's Ed25519 private key.
-func SignPutMessage(priv ed25519.PrivateKey, id string, payload any, attachments []AttachmentInfo) (string, error) {
+func SignPutMessage(priv ed25519.PrivateKey, senderRole string, id string, payload any, attachments []AttachmentInfo) (string, error) {
 	if len(priv) == 0 {
 		return "", nil
 	}
-	digest, err := CanonicalPutDigest(id, payload, attachments)
+	digest, err := CanonicalPutDigest(senderRole, id, payload, attachments)
 	if err != nil {
 		return "", err
 	}
@@ -120,7 +122,7 @@ func SignPutMessage(priv ed25519.PrivateKey, id string, payload any, attachments
 }
 
 // VerifyPutMessage verifies a message's canonical PUT digest against the sender's Ed25519 public key.
-func VerifyPutMessage(pub ed25519.PublicKey, id string, payload any, attachments []AttachmentInfo, sigHex string) error {
+func VerifyPutMessage(pub ed25519.PublicKey, expectedSenderRole string, id string, payload any, attachments []AttachmentInfo, sigHex string) error {
 	if len(pub) == 0 {
 		return nil
 	}
@@ -131,7 +133,7 @@ func VerifyPutMessage(pub ed25519.PublicKey, id string, payload any, attachments
 	if err != nil || len(sig) != ed25519.SignatureSize {
 		return ErrInvalidSignature
 	}
-	digest, err := CanonicalPutDigest(id, payload, attachments)
+	digest, err := CanonicalPutDigest(expectedSenderRole, id, payload, attachments)
 	if err != nil {
 		return err
 	}
@@ -142,26 +144,26 @@ func VerifyPutMessage(pub ed25519.PublicKey, id string, payload any, attachments
 }
 
 // CanonicalAckDigest computes the canonical SHA-256 digest for an ACK receipt binding the message ID
-// to the exact message signature that was accepted:
+// to the exact message signature that was accepted and the receiver's role:
 //
-//	UMAI-ACK-V1\n<id>\n<message_signature_hex>
-func CanonicalAckDigest(id string, msgSignatureHex string) [32]byte {
-	data := fmt.Sprintf("UMAI-ACK-V1\n%s\n%s\n", id, strings.TrimSpace(msgSignatureHex))
+//	UMAI-ACK-V1\n<receiver_role>\n<id>\n<message_signature_hex>
+func CanonicalAckDigest(receiverRole string, id string, msgSignatureHex string) [32]byte {
+	data := fmt.Sprintf("UMAI-ACK-V1\n%s\n%s\n%s\n", receiverRole, id, strings.TrimSpace(msgSignatureHex))
 	return sha256.Sum256([]byte(data))
 }
 
 // SignAckReceipt signs an acceptance receipt with the receiver's Ed25519 private key.
-func SignAckReceipt(priv ed25519.PrivateKey, id string, msgSignatureHex string) string {
+func SignAckReceipt(priv ed25519.PrivateKey, receiverRole string, id string, msgSignatureHex string) string {
 	if len(priv) == 0 {
 		return ""
 	}
-	digest := CanonicalAckDigest(id, msgSignatureHex)
+	digest := CanonicalAckDigest(receiverRole, id, msgSignatureHex)
 	sig := ed25519.Sign(priv, digest[:])
 	return hex.EncodeToString(sig)
 }
 
 // VerifyAckReceipt verifies that the receiver genuinely accepted the exact signed message.
-func VerifyAckReceipt(pub ed25519.PublicKey, id string, msgSignatureHex string, receiptHex string) error {
+func VerifyAckReceipt(pub ed25519.PublicKey, expectedReceiverRole string, id string, msgSignatureHex string, receiptHex string) error {
 	if len(pub) == 0 {
 		return nil
 	}
@@ -172,7 +174,7 @@ func VerifyAckReceipt(pub ed25519.PublicKey, id string, msgSignatureHex string, 
 	if err != nil || len(sig) != ed25519.SignatureSize {
 		return ErrInvalidReceipt
 	}
-	digest := CanonicalAckDigest(id, msgSignatureHex)
+	digest := CanonicalAckDigest(expectedReceiverRole, id, msgSignatureHex)
 	if !ed25519.Verify(pub, digest[:], sig) {
 		return ErrInvalidReceipt
 	}

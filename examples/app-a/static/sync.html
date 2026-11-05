@@ -95,13 +95,13 @@
       let isAuthenticated = false;
 
       function notifyParent(type, payload = {}) {
-        if (window.parent && window.parent !== window) {
+        if (window.parent && window.parent !== window && peerOrigin) {
           window.parent.postMessage({
             protocol: 'UMAI_CONTROL',
             source: 'app-a',
             type: type,
             ...payload
-          }, '*');
+          }, peerOrigin);
         }
       }
 
@@ -303,6 +303,8 @@
 
       // Listen for parent control messages and cross-tab storage events
       window.addEventListener('message', function (e) {
+        if (peerOrigin && e.origin !== peerOrigin) return;
+        if (window.parent && e.source !== window.parent) return;
         if (!e.data || e.data.protocol !== 'UMAI_CONTROL') return;
         if (e.data.type === 'TRIGGER_SYNC') {
           if (umaiSession && isAuthenticated) {
