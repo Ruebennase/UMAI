@@ -372,7 +372,43 @@ If you *are* developing or extending an application backend and want a clean, de
 
 ---
 
-## 6. Key Invariants to Remember
+## 6. Real-Time Sync State Indicators (Transfer Ongoing vs. Complete Sync)
+
+In production user interfaces, users need clear visual feedback on whether synchronization is actively transferring data or whether both applications are completely in sync.
+
+The `UmaiSession` provides an `onSyncStatus` callback specifically for this purpose:
+
+```javascript
+const umai = new UMAI.UmaiSession({
+  peerOrigin: 'https://app-a.company.com',
+  storage: myStorageAdapter,
+  onSyncStatus({ isSyncing, state, pendingOutgoing, pendingIncoming, detail }) {
+    const badge = document.getElementById('sync-indicator');
+
+    if (state !== 'connected') {
+      badge.textContent = '⏳ Connecting...';
+      badge.className = 'status-connecting';
+    } else if (isSyncing) {
+      // Transfers are actively ongoing!
+      badge.textContent = `🔄 Syncing (${pendingOutgoing} out, ${pendingIncoming} in)...`;
+      badge.className = 'status-syncing';
+    } else {
+      // Complete sync has been reached for now!
+      badge.textContent = '🟢 In Sync';
+      badge.className = 'status-idle';
+    }
+  }
+});
+```
+
+### Event Lifecycle:
+1. **Idle State (`isSyncing: false`):** Both sides have empty outboxes or have acknowledged all transfers. The UI displays **`🟢 In Sync`**.
+2. **Transfer In-Flight (`isSyncing: true`):** An `OFFER` resulted in a `GET`, and a `PUT` is currently streaming over the `MessageChannel`. The UI displays **`🔄 Syncing...`** with an animated spinner.
+3. **Completion:** Upon successful `acceptMessage` and `ACK` receipt, `isSyncing` automatically transitions back to `false`, informing the user that synchronization is complete.
+
+---
+
+## 7. Key Invariants to Remember
 
 1. **Rule 1 — Immutability:** Never modify a message once offered. If data changes, generate a new message ID.
 2. **Rule 3 — All-or-Nothing Acceptance:** If saving any file fails in `acceptMessage`, return `false`. Never acknowledge or store a partial message.
@@ -381,7 +417,7 @@ If you *are* developing or extending an application backend and want a clean, de
 
 ---
 
-## 7. Summary
+## 8. Summary
 
 | Integration Type | Server-to-Server REST/gRPC | UMAI Browser Mediation |
 |---|---|---|

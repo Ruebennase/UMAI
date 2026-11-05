@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Application A — UMAI Background Sync</title>
+  <link rel="stylesheet" href="/style.css?v=0.1.2">
+  <style>
+    body {
+      background: #f8fafc;
+      padding: 10px;
+      font-size: 12px;
+      height: auto;
+      min-height: 100%;
+      overflow: auto;
+    }
+    .sync-card {
+      background: #ffffff;
+      border: 1px solid var(--border-color);
+      border-radius: 6px;
+      padding: 10px;
+      max-width: 380px;
+      margin: 0 auto;
+    }
+    .sync-status-bar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+    }
+    .pulse-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background-color: var(--success);
+      display: inline-block;
+      box-shadow: 0 0 6px rgba(22, 163, 74, 0.6);
+    }
+    .pulse-dot.syncing {
+      background-color: var(--warning);
+      animation: pulse 1s infinite alternate;
+    }
+    @keyframes pulse {
+      from { transform: scale(0.9); opacity: 0.7; }
+      to { transform: scale(1.3); opacity: 1; }
+    }
+  </style>
+</head>
+<body>
+  <!-- State 1: Authenticated & Running -->
+  <div id="sync-active-container" class="sync-card" style="display: none;">
+    <div class="sync-status-bar">
+      <div style="display: flex; align-items: center; gap: 8px;">
+        <span id="sync-dot" class="pulse-dot"></span>
+        <strong id="sync-title">App A Sync Worker</strong>
+      </div>
+      <span id="sync-detail" style="color: var(--text-muted); font-size: 11px;">In Sync</span>
+    </div>
+  </div>
+
+  <!-- State 2: Unauthenticated -->
+  <div id="sync-auth-container" class="sync-card" style="display: none;">
+    <div style="margin-bottom: 8px; font-weight: 600; color: var(--danger);">
+      🔒 Application A Login Required
+    </div>
+    <p style="color: var(--text-muted); font-size: 11px; margin-bottom: 8px;">
+      Log in below to enable background synchronization with Application B.
+    </p>
+    <form id="sync-login-form">
+      <div style="display: flex; gap: 6px; margin-bottom: 6px;">
+        <input type="text" id="sync-username" value="admin" placeholder="User" style="flex: 1; padding: 4px 6px; font-size: 11px;" required>
+        <input type="password" id="sync-password" value="umai123" placeholder="Pass" style="flex: 1; padding: 4px 6px; font-size: 11px;" required>
+      </div>
+      <div style="display: flex; gap: 6px;">
+        <button type="submit" class="btn btn-sm" style="flex: 1;">Authenticate App A</button>
+        <a href="/" target="_blank" class="btn btn-secondary btn-sm" style="text-decoration: none;" title="Open in top-level tab">New Tab</a>
+      </div>
+      <div id="sync-login-error" style="color: var(--danger); font-size: 11px; margin-top: 4px; display: none;"></div>
+    </form>
+  </div>
+
+  <script src="/js/umai.js"></script>
+  <script>
+    (function () {
+      const activeContainer = document.getElementById('sync-active-container');
+      const authContainer = document.getElementById('sync-auth-container');
+      const syncDot = document.getElementById('sync-dot');
+      const syncDetail = document.getElementById('sync-detail');
+      const loginForm = document.getElementById('sync-login-form');
+      const loginError = document.getElementById('sync-login-error');
+
+      let sessionToken = sessionStorage.getItem('umai_session_token_a') || '';
+      let peerOrigin = '';
+      let umaiSession = null;
+
+      function getAuthHeaders() {
+        const headers = {};
+        if (sessionToken) headers['X-UMAI-Session'] = sessionToken;
+        return headers;
+      }
+
+      function notifyParent(type, payload = {}) {
+        if (window.parent && window.parent !== window) {
+          window.parent.postMessage({
+            protocol: 'UMAI_CONTROL',
+            source: 'app-a',
+            type: type,
+            ...payload
+          }, '*');
+        }
+      }
+
+      async function init() {
+        try {
+          const statusRes = await fetch('/api/status');
+          const status = await statusRes.json();
+          peerOrigin = status.peerOrigin;
+
+          const meRes = await fetch('/api/auth/me', { headers: getAuthHeaders() });
+          if (meRes.ok) {
+            const me = await meRes.json();
+            if (me.authenticated) {
+              startSyncWorker();
+              return;
+            }
+          }
+        } catch (e) {
+          console.error('[Sync Worker] Init error:', e);
+        }
+        showAuthRequired();
+      }
+
+      function showAuthRequired() {
+        activeContainer.style.display = 'none';
+        authContainer.style.display = 'block';
+        notifyParent('AUTH_REQUIRED');
+      }
+
+      function startSyncWorker() {
+        authContainer.style.display = 'none';
+        activeContainer.style.display = 'block';
+        notifyParent('AUTH_OK');
+
+        const storageAdapter = {
+          async getOutboxIds() {
+            const res = await fetch('/api/outbox', { headers: getAuthHeaders() });
+            if (!res.ok) return [];
+            const data = await res.json();
+            return (data.messages || []).map(m => m.id);
+          },
+
+          async getMessage(id) {
+            const res = await fetch(`/api/outbox/${encodeURIComponent(id)}`, { headers: getAuthHeaders() });
+            if (!res.ok) return null;
+            const data = await res.json();
+            const meta = data.message;
+            if (!meta) return null;
+
+            const files = [];
+            for (const att of (meta.attachments || [])) {
+              const fileRes = await fetch(
+                `/api/outbox/${encodeURIComponent(id)}/files/${encodeURIComponent(att.filename)}`,
+                { headers: getAuthHeaders() }
+              );
+              if (fileRes.ok) {
+                const blob = await fileRes.blob();
+                files.push(new File([blob], att.filename, { type: blob.type }));
+              }
+            }
+
+            return { id: meta.id, payload: meta.payload || {}, attachments: files };
+          },
+
+          async isAccepted(id) {
+            const res = await fetch(`/api/inbox/check?id=${encodeURIComponent(id)}`, { headers: getAuthHeaders() });
+            if (!res.ok) return false;
+            const data = await res.json();
+            return data.accepted === true;
+          },
+
+          async acceptMessage(msg) {
+            const formData = new FormData();
+            formData.append('id', msg.id);
+            formData.append('payload', JSON.stringify(msg.payload || {}));
+            for (const f of msg.attachments) {
+              formData.append('files', f, f.name);
+            }
+            const res = await fetch('/api/inbox/accept', {
+              method: 'POST',
+              headers: getAuthHeaders(),
+              body: formData
+            });
+            return res.ok;
+          },
+
+          async onAcknowledged(ids) {
+            await fetch('/api/outbox/acknowledge', {
+              method: 'POST',
+              headers: { ...getAuthHeaders(), 'Content-Type': 'application/json' },
+              body: JSON.stringify({ ids: ids })
+            });
+          }
+        };
+
+        if (umaiSession) {
+          umaiSession.stop();
+        }
+
+        umaiSession = new UMAI.UmaiSession({
+          peerOrigin: peerOrigin,
+          role: 'embedded',
+          storage: storageAdapter,
+          onSyncStatus: function (status) {
+            if (status.isSyncing) {
+              syncDot.className = 'pulse-dot syncing';
+              syncDetail.textContent = status.detail || 'Transferring...';
+            } else {
+              syncDot.className = 'pulse-dot';
+              syncDetail.textContent = 'In sync';
+            }
+            notifyParent('SYNC_STATUS', { status: status });
+          },
+          onStatusChange: function ({ state }) {
+            notifyParent('STATUS_CHANGE', { state: state });
+          }
+        });
+
+        umaiSession.start();
+      }
+
+      loginForm.addEventListener('submit', async function (e) {
+        e.preventDefault();
+        loginError.style.display = 'none';
+
+        try {
+          const res = await fetch('/api/auth/login', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              username: document.getElementById('sync-username').value.trim(),
+              password: document.getElementById('sync-password').value
+            })
+          });
+
+          const data = await res.json();
+          if (res.ok && data.sessionID) {
+            sessionToken = data.sessionID;
+            sessionStorage.setItem('umai_session_token_a', sessionToken);
+            startSyncWorker();
+          } else {
+            loginError.textContent = data.error || 'Authentication failed';
+            loginError.style.display = 'block';
+          }
+        } catch (err) {
+          loginError.textContent = err.message;
+          loginError.style.display = 'block';
+        }
+      });
+
+      // Expose manual reconcile for parent trigger
+      window.addEventListener('message', function (e) {
+        if (e.data && e.data.protocol === 'UMAI_CONTROL' && e.data.type === 'TRIGGER_SYNC') {
+          if (umaiSession) umaiSession.reconcile();
+        }
+      });
+
+      init();
+    })();
+  </script>
+</body>
+</html>

@@ -59,4 +59,38 @@ func TestStaticAssets_ServingAndMimeTypes(t *testing.T) {
 	if recUmaiJS.Code != http.StatusOK {
 		t.Errorf("Expected 200 for /js/umai.js, got %d", recUmaiJS.Code)
 	}
+
+	// 5. Request /minimal.html
+	reqMinHTML, _ := http.NewRequest("GET", "/minimal.html", nil)
+	recMinHTML := httptest.NewRecorder()
+	handler.ServeHTTP(recMinHTML, reqMinHTML)
+	if recMinHTML.Code != http.StatusOK {
+		t.Errorf("Expected 200 for /minimal.html, got %d", recMinHTML.Code)
+	}
+
+	// 6. Request /minimal.css
+	reqMinCSS, _ := http.NewRequest("GET", "/minimal.css", nil)
+	recMinCSS := httptest.NewRecorder()
+	handler.ServeHTTP(recMinCSS, reqMinCSS)
+	if recMinCSS.Code != http.StatusOK {
+		t.Errorf("Expected 200 for /minimal.css, got %d", recMinCSS.Code)
+	}
+
+	// 7. Test App A serving /sync.html
+	cfgA := umaiserver.DefaultConfig("app-a")
+	cfgA.DataDir = t.TempDir()
+	staticDirA, err := filepath.Abs("../examples/app-a/static")
+	if err != nil {
+		t.Fatalf("Failed to resolve App A static dir: %v", err)
+	}
+	serverA, err := umaiserver.NewServer(cfgA, staticDirA)
+	if err != nil {
+		t.Fatalf("Failed to create App A server: %v", err)
+	}
+	reqSyncHTML, _ := http.NewRequest("GET", "/sync.html", nil)
+	recSyncHTML := httptest.NewRecorder()
+	serverA.Handler().ServeHTTP(recSyncHTML, reqSyncHTML)
+	if recSyncHTML.Code != http.StatusOK {
+		t.Errorf("Expected 200 for App A /sync.html, got %d", recSyncHTML.Code)
+	}
 }

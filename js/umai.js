@@ -91,6 +91,7 @@
       this.peerOrigin = options.peerOrigin;
       this.storage = options.storage;
       this.onStatusChange = options.onStatusChange || (() => {});
+      this.onSyncStatus = options.onSyncStatus || (() => {});
       this.onLog = options.onLog || (() => {});
       this.onError = options.onError || (() => {});
       this.onTransfer = options.onTransfer || (() => {});
@@ -125,6 +126,39 @@
       this.state = newState;
       this.onStatusChange({ state: newState, detail });
       this.log('info', `State changed: ${newState} ${detail ? `(${detail})` : ''}`);
+      this._notifySyncStatus(detail);
+    }
+
+    /**
+     * Broadcast real-time synchronization status (transfers ongoing vs complete sync).
+     */
+    _notifySyncStatus(detail = '') {
+      const isSyncing = this._isSendingPut || this._putQueue.length > 0 || this._inFlightGets.size > 0;
+      const info = {
+        isSyncing: isSyncing,
+        state: this.state,
+        pendingOutgoing: this._putQueue.length + (this._isSendingPut ? 1 : 0),
+        pendingIncoming: this._inFlightGets.size,
+        detail: detail || (isSyncing ? 'Synchronizing...' : (this.state === 'connected' ? 'In sync' : ''))
+      };
+      try {
+        this.onSyncStatus(info);
+      } catch (err) {
+        // ignore callback error
+      }
+    }
+
+    /**
+     * Get snapshot of current synchronization status.
+     */
+    getSyncStatus() {
+      const isSyncing = this._isSendingPut || this._putQueue.length > 0 || this._inFlightGets.size > 0;
+      return {
+        isSyncing: isSyncing,
+        state: this.state,
+        pendingOutgoing: this._putQueue.length + (this._isSendingPut ? 1 : 0),
+        pendingIncoming: this._inFlightGets.size
+      };
     }
 
     /**
@@ -435,6 +469,7 @@
         for (const id of toFetch) {
           this._inFlightGets.add(id);
         }
+        this._notifySyncStatus(`Requesting ${toFetch.length} unaccepted message(s)...`);
         this.log('info', `Requesting unaccepted message(s) via GET`, toFetch);
         const getMsg = {
           protocol: PROTOCOL_NAME,
@@ -466,6 +501,7 @@
      */
     _queuePut(id) {
       this._putQueue.push(id);
+      this._notifySyncStatus(`Transfer queued for message ${id}`);
       this._processPutQueue();
     }
 
@@ -479,6 +515,7 @@
 
       this._isSendingPut = true;
       const id = this._putQueue.shift();
+      this._notifySyncStatus(`Sending message ${id}...`);
 
       try {
         this.log('info', `Preparing PUT for message ${id}`);
@@ -518,6 +555,7 @@
         this.onError(err);
       } finally {
         this._isSendingPut = false;
+        this._notifySyncStatus();
         // Process next item in queue
         this._processPutQueue();
       }
@@ -535,6 +573,7 @@
       this._inFlightGets.delete(id);
 
       const attachments = Array.isArray(put.attachments) ? put.attachments : [];
+      this._notifySyncStatus(`Receiving message ${id} (${attachments.length} attachment(s))...`);
       this.log(
         'info',
         `Received PUT for message ${id} with ${attachments.length} attachment(s)`
@@ -558,6 +597,7 @@
         };
         this._sendToPort(ackMsg);
         this.onTransfer({ direction: 'outgoing', type: 'ACK', ids: [id], repeated: true });
+        this._notifySyncStatus();
         return;
       }
 
@@ -586,6 +626,8 @@
         // Transfer failure or storage error: do not send ACK
         this.log('error', `Failed to accept message ${id}: ${err.message}; NO ACK sent`);
         this.onError(err);
+      } finally {
+        this._notifySyncStatus();
       }
     }
 
@@ -607,6 +649,8 @@
       } catch (err) {
         this.log('error', 'Error processing ACK in local storage', err.message);
         this.onError(err);
+      } finally {
+        this._notifySyncStatus();
       }
     }
   }

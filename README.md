@@ -187,6 +187,17 @@ You will see the side-by-side dashboard:
    - The document is immediately downloadable under Application B's Inbox!
 6. Repeat the reverse flow (B to A) to observe full bidirectional symmetry.
 
+### Minimal Production View (Zero-Distraction UI)
+In addition to the dual-inspector view, Application B includes a **minimal single-application view** that demonstrates how UMAI looks in a real enterprise production deployment:
+
+👉 Open **`http://127.0.0.1:8082/minimal.html`**
+- **Single-App Workspace:** Application A runs quietly in a background sync frame (`/sync.html`). The user interacts only with Application B.
+- **Real-Time Sync Status Indicator:** A live status pill in the header continuously informs the user:
+  - 🟢 **`● In Sync`**: Complete sync reached; 0 pending transfers in either direction.
+  - 🔄 **`Syncing...`**: Animated real-time spinner showing active in-flight transfers (e.g. `Sending Q4_Audit.pdf...`).
+  - 🔒 **`App A Login Required`**: Alerts the user if Application A requires authentication, opening a compact 1-click login drawer without navigating away.
+- **One-Click File Transfer:** Select a file, click **"Send & Synchronize"**, and watch it transfer directly to Application A through the browser session!
+
 ---
 
 ## 8. Running the Test Suite
