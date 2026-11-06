@@ -556,8 +556,8 @@ func (s *Storage) AcknowledgeMessages(ids []string) error {
 }
 
 // AcknowledgeMessagesVerified removes acknowledged messages from outbox (Rule 6),
-// strictly verifying cryptographic ACK receipts against the peer's public key whenever
-// a peer public key is configured and the outbox message was signed.
+// strictly verifying cryptographic ACK receipts against the peer's public key (fail-closed)
+// whenever a peer public key is configured.
 func (s *Storage) AcknowledgeMessagesVerified(ids []string, receipts map[string]string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -570,21 +570,30 @@ func (s *Storage) AcknowledgeMessagesVerified(ids []string, receipts map[string]
 		msgDir := filepath.Join(s.outboxDir, cleanID)
 		msgFile := filepath.Join(msgDir, "message.json")
 		if len(s.peerPubKey) > 0 {
-			data, err := os.ReadFile(msgFile)
-			if err == nil {
-				var outMsg Message
-				if err := json.Unmarshal(data, &outMsg); err == nil && outMsg.Signature != "" {
-					receiptHex := ""
-					if receipts != nil {
-						receiptHex = receipts[cleanID]
-					}
-					if receiptHex == "" {
-						return fmt.Errorf("missing ACK receipt for %s: %w", cleanID, ErrInvalidReceipt)
-					}
-					if err := VerifyAckReceipt(s.peerPubKey, s.peerRole, cleanID, outMsg.Signature, receiptHex); err != nil {
-						return fmt.Errorf("ACK receipt verification failed for %s: %w", cleanID, err)
-					}
+			if _, statErr := os.Stat(msgDir); statErr == nil {
+				data, err := os.ReadFile(msgFile)
+				if err != nil {
+					return fmt.Errorf("reading outbox message %s for receipt verification: %w", cleanID, err)
 				}
+				var outMsg Message
+				if err := json.Unmarshal(data, &outMsg); err != nil {
+					return fmt.Errorf("corrupt outbox message %s during receipt verification: %w", cleanID, err)
+				}
+				if strings.TrimSpace(outMsg.Signature) == "" {
+					return fmt.Errorf("unsigned outbox message %s cannot be verified: %w", cleanID, ErrInvalidSignature)
+				}
+				receiptHex := ""
+				if receipts != nil {
+					receiptHex = receipts[cleanID]
+				}
+				if receiptHex == "" {
+					return fmt.Errorf("missing ACK receipt for %s: %w", cleanID, ErrInvalidReceipt)
+				}
+				if err := VerifyAckReceipt(s.peerPubKey, s.peerRole, cleanID, outMsg.Signature, receiptHex); err != nil {
+					return fmt.Errorf("ACK receipt verification failed for %s: %w", cleanID, err)
+				}
+			} else if !os.IsNotExist(statErr) {
+				return fmt.Errorf("stat outbox message %s: %w", cleanID, statErr)
 			}
 		}
 		delete(s.inFlightUntil, cleanID)
@@ -881,23 +890,65 @@ func (s *Storage) acceptMessageInternal(id string, payload any, attachments []At
 // -----------------------------------------------------------------------------
 
 func (s *Storage) loadAcceptedIDs() error {
+	// 1. Purge any orphaned temporary staging files/directories from prior interrupted runs
+	for _, dir := range []string{s.docsDir, s.outboxDir, s.inboxDir, s.dataDir} {
+		if entries, err := os.ReadDir(dir); err == nil {
+			for _, entry := range entries {
+				name := entry.Name()
+				if strings.HasPrefix(name, ".tmp-") || strings.Contains(name, ".tmp-") {
+					_ = os.RemoveAll(filepath.Join(dir, name))
+				}
+			}
+		}
+	}
+
+	// 2. Load persisted accepted.json if present
 	data, err := os.ReadFile(s.acceptedFile)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
+	if err != nil && !os.IsNotExist(err) {
 		return err
 	}
-
-	var list []string
-	if err := json.Unmarshal(data, &list); err != nil {
-		return err
+	if err == nil {
+		var list []string
+		if err := json.Unmarshal(data, &list); err != nil {
+			return err
+		}
+		for _, id := range list {
+			if clean, err := sanitizeID(id); err == nil {
+				s.acceptedIDs[clean] = true
+			}
+		}
 	}
 
-	for _, id := range list {
-		if clean, err := sanitizeID(id); err == nil {
-			s.acceptedIDs[clean] = true
+	// 3. Reconcile committed inbox/{id}/message.json directories into acceptedIDs
+	// so a crash between os.Rename(tmpDir, inbox/{id}) and persistAcceptedIDsLocked()
+	// self-heals atomically on startup.
+	reconciled := false
+	if entries, err := os.ReadDir(s.inboxDir); err == nil {
+		for _, entry := range entries {
+			if !entry.IsDir() || strings.HasPrefix(entry.Name(), ".") {
+				continue
+			}
+			cleanID, err := sanitizeID(entry.Name())
+			if err != nil {
+				continue
+			}
+			msgFile := filepath.Join(s.inboxDir, cleanID, "message.json")
+			msgBytes, err := os.ReadFile(msgFile)
+			if err != nil {
+				continue
+			}
+			var msg Message
+			if err := json.Unmarshal(msgBytes, &msg); err == nil && msg.ID == cleanID {
+				if !s.acceptedIDs[cleanID] {
+					s.acceptedIDs[cleanID] = true
+					reconciled = true
+				}
+			}
 		}
+	}
+
+	if reconciled {
+		return s.persistAcceptedIDsLocked()
 	}
 	return nil
 }

@@ -150,7 +150,8 @@ In Application A's web page:
 ```html
 <script src="/js/umai.js"></script>
 <script>
-  // 1. Implement the 5 storage methods connecting to your existing backend
+  // 1. Implement the 5 storage methods connecting to your existing backend.
+  //    (Supports both signed/receipt-verified servers like pkg/umaiserver and minimal unsigned endpoints.)
   const storage = {
     async getOutboxIds() {
       const res = await fetch('/api/outbox/ids');
@@ -168,32 +169,43 @@ In Application A's web page:
         files.push(new File([blob], att.filename, { type: blob.type }));
       }
 
-      return { id: meta.id, payload: meta.payload, attachments: files };
+      return {
+        id: meta.id,
+        payload: meta.payload,
+        attachments: files,
+        signature: meta.signature || '' // Passed opaquely if server-side signing is enabled
+      };
     },
 
     async isAccepted(id) {
       const res = await fetch(`/api/accepted/check?id=${encodeURIComponent(id)}`);
       const data = await res.json();
-      return data.accepted === true;
+      // Return the stored cryptographic ack_receipt string (if signed) or boolean true/false
+      return data.accepted ? (data.ack_receipt || true) : false;
     },
 
     async acceptMessage(msg) {
       const formData = new FormData();
       formData.append('id', msg.id);
       formData.append('payload', JSON.stringify(msg.payload));
+      if (msg.signature) {
+        formData.append('signature', msg.signature);
+      }
       for (const file of msg.attachments) {
         formData.append('files', file, file.name);
       }
 
       const res = await fetch('/api/inbox/accept', { method: 'POST', body: formData });
-      return res.ok;
+      if (!res.ok) return false;
+      const data = await res.json().catch(() => ({}));
+      return data.ack_receipt || true;
     },
 
-    async onAcknowledged(ids) {
+    async onAcknowledged(ids, receipts) {
       await fetch('/api/outbox/acknowledge', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ids })
+        body: JSON.stringify({ ids, receipts })
       });
     }
   };

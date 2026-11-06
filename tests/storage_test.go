@@ -179,3 +179,59 @@ func TestStorage_ServerRestartPersistence(t *testing.T) {
 		t.Fatalf("Inbox attachments lost after restart")
 	}
 }
+
+func TestStorage_CrashRecoveryAndFailClosedAck(t *testing.T) {
+	tmpDir := t.TempDir()
+	store1, err := umaiserver.NewStorage(tmpDir, 10*1024*1024)
+	if err != nil {
+		t.Fatalf("Init storage 1: %v", err)
+	}
+
+	// Accept a message normally
+	_, err = store1.AcceptMessage("msg-crash-99", map[string]string{"k": "v"}, nil)
+	if err != nil {
+		t.Fatalf("AcceptMessage: %v", err)
+	}
+
+	// Simulate a crash right after inbox/{id} was renamed into place before accepted.json was written,
+	// plus an orphaned .tmp- directory left behind in inbox/
+	_ = os.Remove(filepath.Join(tmpDir, "accepted.json"))
+	orphanTmp := filepath.Join(tmpDir, "inbox", ".tmp-msg-orphan-12345")
+	_ = os.MkdirAll(orphanTmp, 0700)
+
+	// Restart storage: NewStorage must purge .tmp-* and reconcile inbox/msg-crash-99 into acceptedIDs
+	store2, err := umaiserver.NewStorage(tmpDir, 10*1024*1024)
+	if err != nil {
+		t.Fatalf("Init storage 2: %v", err)
+	}
+	if _, err := os.Stat(orphanTmp); !os.IsNotExist(err) {
+		t.Errorf("Expected orphaned .tmp directory to be purged on startup")
+	}
+	if !store2.IsAccepted("msg-crash-99") {
+		t.Errorf("Expected msg-crash-99 to be reconciled from inbox/ into acceptedIDs on startup")
+	}
+	if _, err := os.Stat(filepath.Join(tmpDir, "accepted.json")); err != nil {
+		t.Errorf("Expected accepted.json to be persisted after startup reconciliation: %v", err)
+	}
+
+	// Verify fail-closed AcknowledgeMessagesVerified when outbox message.json is corrupt or unsigned
+	pubA, privA := umaiserver.DeriveDemoKeyPair("app-a")
+	pubB, _ := umaiserver.DeriveDemoKeyPair("app-b")
+	store2.SetKeys("app-a", pubA, privA, pubB)
+
+	outMsg, err := store2.CreateOutboxMessage(map[string]string{"hello": "world"}, nil)
+	if err != nil {
+		t.Fatalf("CreateOutboxMessage: %v", err)
+	}
+
+	// Corrupt outbox/{id}/message.json by stripping its signature on disk
+	msgFile := filepath.Join(tmpDir, "outbox", outMsg.ID, "message.json")
+	_ = os.WriteFile(msgFile, []byte(`{"id":"`+outMsg.ID+`","signature":""}`), 0600)
+
+	if err := store2.AcknowledgeMessagesVerified([]string{outMsg.ID}, map[string]string{outMsg.ID: "deadbeef"}); err == nil {
+		t.Errorf("Expected fail-closed error when outbox message on disk has empty signature")
+	}
+	if _, err := os.Stat(filepath.Join(tmpDir, "outbox", outMsg.ID)); err != nil {
+		t.Errorf("Outbox directory must NOT be deleted when AcknowledgeMessagesVerified fails closed")
+	}
+}

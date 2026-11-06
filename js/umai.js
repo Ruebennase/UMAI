@@ -27,6 +27,7 @@
   const PROTOCOL_NAME = 'UMAI';
   const PROTOCOL_VERSION = 1;
   const MAX_BATCH_IDS = 1000;
+  const MAX_AUTO_RETRIES = 3;
 
   /**
    * Validates a message identifier is a safe, bounded string.
@@ -125,6 +126,9 @@
 
       // Track message IDs offered to the peer so only offered IDs can be acknowledged
       this._offeredIds = new Set();
+
+      // Track per-ID acceptance failures in this session to prevent poison-pill retry loops
+      this._failedAttempts = new Map();
     }
 
     /**
@@ -248,6 +252,7 @@
       this._isSendingPut = false;
       this._inFlightGets.clear();
       this._offeredIds.clear();
+      this._failedAttempts.clear();
       this._setState('disconnected');
     }
 
@@ -426,6 +431,10 @@
         return;
       }
 
+      if (force) {
+        this._failedAttempts.clear();
+      }
+
       try {
         const outboxIds = await this.storage.getOutboxIds();
         const ids = (Array.isArray(outboxIds) ? outboxIds : [])
@@ -486,6 +495,7 @@
       for (const id of offeredIds) {
         const accResult = await this.storage.isAccepted(id);
         if (accResult) {
+          this._failedAttempts.delete(id);
           alreadyAccepted.push(id);
           if (typeof accResult === 'string' && accResult.length > 0) {
             repeatedReceipts[id] = accResult;
@@ -493,6 +503,11 @@
             repeatedReceipts[id] = accResult.ackReceipt;
           }
         } else {
+          const failCount = this._failedAttempts.get(id) || 0;
+          if (failCount >= MAX_AUTO_RETRIES) {
+            this.log('warn', `Skipping automatic GET for message ${id} after ${failCount} failed acceptance attempts in this session`);
+            continue;
+          }
           // If not currently in-flight
           if (!this._inFlightGets.has(id)) {
             toFetch.push(id);
@@ -686,6 +701,7 @@
         });
 
         if (result) {
+          this._failedAttempts.delete(id);
           this.log('info', `Successfully accepted message ${id}. Sending ACK.`);
           const receipts = Object.create(null);
           if (typeof result === 'string' && result.length > 0) {
@@ -703,11 +719,15 @@
           this._sendToPort(ackMsg);
           this.onTransfer({ direction: 'outgoing', type: 'ACK', ids: [id] });
         } else {
-          this.log('error', `Acceptance rejected by local storage for message ${id}; NO ACK sent`);
+          const fails = (this._failedAttempts.get(id) || 0) + 1;
+          this._failedAttempts.set(id, fails);
+          this.log('error', `Acceptance rejected by local storage for message ${id} (attempt ${fails}/${MAX_AUTO_RETRIES}); NO ACK sent`);
         }
       } catch (err) {
         // Transfer failure or storage error: do not send ACK
-        this.log('error', `Failed to accept message ${id}: ${err.message}; NO ACK sent`);
+        const fails = (this._failedAttempts.get(id) || 0) + 1;
+        this._failedAttempts.set(id, fails);
+        this.log('error', `Failed to accept message ${id} (attempt ${fails}/${MAX_AUTO_RETRIES}): ${err.message}; NO ACK sent`);
         this.onError(err);
       } finally {
         this._notifySyncStatus();

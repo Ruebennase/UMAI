@@ -176,6 +176,57 @@ function createMockChannel() {
 
   console.log('✓ Test 3: State-machine security (unsolicited PUT, unoffered GET, & unoffered ACK rejection) passed');
 
+  // Test 4: Poison-pill retry backoff (stops auto-GET after MAX_AUTO_RETRIES=3 failed acceptMessage attempts, resets on reconcile(true))
+  let poisonAttempts = 0;
+  const poisonChannel = createMockChannel();
+  const senderPoison = new UmaiSession({
+    peerOrigin: 'http://peer.example',
+    role: 'host',
+    storage: {
+      getOutboxIds: async () => ['msg-poison-1'],
+      getMessage: async (id) => ({ id, payload: { bad: true }, attachments: [] }),
+      isAccepted: async () => false,
+      acceptMessage: async () => true,
+      onAcknowledged: async () => {}
+    }
+  });
+  const receiverPoison = new UmaiSession({
+    peerOrigin: 'http://host.example',
+    role: 'embedded',
+    storage: {
+      getOutboxIds: async () => [],
+      getMessage: async () => null,
+      isAccepted: async () => false,
+      acceptMessage: async () => {
+        poisonAttempts++;
+        return false; // Reject acceptance
+      },
+      onAcknowledged: async () => {}
+    }
+  });
+  senderPoison.port = poisonChannel.port1;
+  poisonChannel.port1.onmessage = senderPoison._portListener;
+  senderPoison.state = 'connected';
+  receiverPoison.port = poisonChannel.port2;
+  poisonChannel.port2.onmessage = receiverPoison._portListener;
+  receiverPoison.state = 'connected';
+
+  for (let i = 0; i < 5; i++) {
+    await senderPoison.reconcile(false);
+    await new Promise(r => setTimeout(r, 30));
+  }
+  assert.strictEqual(poisonAttempts, 3, 'Poison-pill message should back off after 3 failed automatic acceptance attempts');
+
+  // Manual reconcile(true) on receiver resets failure counter
+  await receiverPoison.reconcile(true);
+  await senderPoison.reconcile(false);
+  await new Promise(r => setTimeout(r, 30));
+  assert.strictEqual(poisonAttempts, 4, 'Manual reconcile(true) should reset failure counter and allow retry');
+
+  console.log('✓ Test 4: Poison-pill retry backoff and manual reconcile reset passed');
+
+  senderPoison.stop();
+  receiverPoison.stop();
   secSession.stop();
   sessionA.stop();
   sessionB.stop();

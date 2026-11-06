@@ -92,7 +92,7 @@ Every adopter who includes `js/umai.js` verbatim receives the following browser-
 3. **Strict Offer-Before-GET, Offer-Before-ACK & Pull-Before-PUT State Machine:**
    - **Unsolicited `PUT` Rejection (`_inFlightGets`):** A receiver tracks requested IDs in `_inFlightGets`. Any incoming `PUT` not preceded by an outgoing `GET` for that ID is immediately dropped.
    - **Unoffered `GET` & `ACK` Rejection (`_offeredIds`):** A sender records offered IDs in `_offeredIds` exclusively during `reconcile()` (`OFFER`). Incoming `GET` requests for unoffered IDs are ignored (preventing peers from probing unoffered records or poisoning `_offeredIds`), and incoming `ACK`s are filtered strictly to offered IDs.
-   - **Serialized Queue & `GET` Deduplication (`_queuePut`):** Duplicate `GET` requests for an already-queued ID are ignored, and outgoing `PUT` frames are transmitted one at a time per direction to bound browser memory usage.
+   - **Serialized Queue, `GET` Deduplication & Poison-Pill Backoff (`_queuePut`, `_failedAttempts`):** Duplicate `GET` requests for an already-queued ID are ignored, outgoing `PUT` frames are transmitted one at a time per direction to bound browser memory usage, and any incoming message that fails `acceptMessage` `MAX_AUTO_RETRIES = 3` times in a row backs off from automatic background `GET` retries during that session (resetting on manual `reconcile(true)`).
 4. **Envelope Bounds, Payload Normalization & Prototype-Safe Receipt Maps:**
    - Message IDs are validated (`isValidMessageId`: non-empty string `<= 128` chars) and batch arrays in `OFFER`, `GET`, and `ACK` are capped at `MAX_BATCH_IDS = 1000`.
    - `null`/`undefined` payloads are normalized to `{}` while preserving valid falsy JSON primitives (`false`, `0`, `""`).
@@ -175,8 +175,10 @@ In our reference codebase (`pkg/umaiserver` and `examples/*`), we pulled a numbe
   - Public health or status endpoints (`GET /api/status`) must **never** expose pending `outbox_ids` or `accepted_ids` to unauthenticated callers; otherwise an unauthenticated observer could learn pending IDs and attempt pre-emptive ID squatting.
 
 ### 6.3 Server-Side Signing & Canonicalization Watchlist (When Implementing Tier 2)
-- **No Empty-Signature or Empty-Receipt Downgrades:**
-  - When a peer public key is configured, `POST /api/inbox` MUST reject empty/missing `signature` strings (`ErrInvalidSignature`), and `POST /api/outbox/ack` MUST reject missing `receipts[id]` entries or empty `receipts: {}` maps (`ErrInvalidReceipt`). Otherwise, a rogue browser mediator could strip `signature` or `receipts` to bypass verification.
+- **Fail-Closed Signature & Receipt Verification (No Downgrades):**
+  - When a peer public key is configured, `POST /api/inbox` MUST reject empty/missing `signature` strings (`ErrInvalidSignature`), and `POST /api/outbox/ack` (`AcknowledgeMessagesVerified`) MUST fail closed—rejecting missing `receipts[id]` entries, empty `receipts: {}` maps, or unreadable/corrupt/unsigned outbox metadata (`ErrInvalidReceipt` / `ErrInvalidSignature`) without deleting the outbox directory.
+- **Crash-Safe Staging & Startup Reconciliation (`inbox/` $\leftrightarrow$ `accepted.json`):**
+  - Stream incoming multipart attachments into a unique temporary staging directory (e.g., `.tmp-{id}-{nanoseconds}`), bound per-file bytes (`io.LimitReader(r, maxUploadSize + 1)`), bound attachment count (`MaxAttachmentsPerMessage`), `fsync`, verify the cryptographic signature, atomically rename into `inbox/{id}`, and commit the ID to durable `acceptedIDs`. On server startup (`NewStorage`), purge any leftover `.tmp-*` staging directories and automatically reconcile committed `inbox/{id}/message.json` directories into `acceptedIDs` so a crash or power loss between directory rename and `accepted.json` persistence self-heals without split-brain state.
 - **Verify Signature Match on Duplicate `POST /api/inbox` Probes:**
   - When `POST /api/inbox` receives an ID that is already in `acceptedIDs` (e.g., due to a lost `ACK` or concurrent pooled upload), verify that the incoming `signature` matches the stored message's `signature` before returning the cached `ack_receipt`.
 - **Injective Length-Prefixed Canonical Digests & Attachment Counts:**
@@ -187,14 +189,12 @@ In our reference codebase (`pkg/umaiserver` and `examples/*`), we pulled a numbe
   - Normalize `nil` / `null` payloads to `{}` on both outbox signing and inbox verification so JSON serialization across Go/backend maps and browser Structured Clone produces identical digests.
 
 ### 6.4 Atomic Storage, File Hygiene & Pooled-Channel Concurrency Watchlist
-- **Crash-Safe Staging Before Marking Accepted:**
-  - Stream incoming multipart attachments into a unique temporary staging directory (e.g., `.tmp-{id}-{nanoseconds}`), bound per-file bytes (`io.LimitReader(r, maxUploadSize + 1)`), bound attachment count (`MaxAttachmentsPerMessage`), `fsync`, verify the cryptographic signature, atomically rename into `inbox/{id}`, and only *then* commit the ID to durable `acceptedIDs`.
 - **Reject Duplicate Sanitized Attachment Filenames:**
   - Sanitize every filename (`filepath.Base`, strip `..`, `/`, `\`, null bytes, and control chars `< 32`), and **reject duplicate sanitized filenames within a single message** (`ErrDuplicateAttachment`) rather than letting a second attachment silently overwrite the first on disk while both appear in metadata.
 - **Symlink Rejection & Restrictive File Modes:**
   - When snapshotting local files or serving attachments from disk, check `os.Lstat` and require `fi.Mode().IsRegular()` so symbolic links are never followed; create storage directories with `0700` and files with `0600`.
-- **Soft In-Flight Leases for Multi-User Pooled Channels:**
-  - If multiple concurrent users share a system-wide outbox pool (`ListOutboxForSession`), place a short soft lease (e.g., `15s` `inFlightUntil` when `GET /api/outbox/{id}` is called) and deterministically rotate unclaimed IDs by session hash so concurrent browsers pick *different* pending messages first instead of duplicating transfers, while abandoned transfers automatically recover when the lease expires.
+- **Soft In-Flight Leases for Multi-User Pooled Channels (Bandwidth Optimization):**
+  - If multiple concurrent users share a system-wide outbox pool (`ListOutboxForSession`), place a short soft priority lease (e.g., `15s` `inFlightUntil` when `GET /api/outbox/{id}` is called) and deterministically rotate unclaimed IDs by session hash. Rather than acting as a hard exclusion lock, this bandwidth-optimization hint steers concurrent browsers toward different unclaimed messages first while relying on receiver deduplication (Rules 4 & 5) for correctness.
 - **HTTP Server Timeouts:**
   - Configure explicit `ReadHeaderTimeout`, `ReadTimeout`, `WriteTimeout`, `IdleTimeout`, and `MaxHeaderBytes` on the HTTP server or reverse proxy to prevent Slowloris socket exhaustion.
 
