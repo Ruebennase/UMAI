@@ -35,7 +35,7 @@
   const workerFrame = document.getElementById('umai-worker-frame');
 
   // State
-  let sessionToken = localStorage.getItem('umai_token_b') || sessionStorage.getItem('umai_token_b') || '';
+  let isAuthenticated = false;
   let peerOrigin = '';
   let embedUrl = '';
   let syncUrl = '';
@@ -47,14 +47,9 @@
     options.credentials = 'include';
     options.headers = options.headers || {};
     options.headers['X-UMAI-CSRF'] = '1';
-    if (sessionToken) {
-      options.headers['X-UMAI-Session'] = sessionToken;
-    }
     const res = await fetch(path, options);
     if (res.status === 401) {
-      sessionToken = '';
-      localStorage.removeItem('umai_token_b');
-      sessionStorage.removeItem('umai_token_b');
+      isAuthenticated = false;
       showAuth();
       throw new Error('Unauthorized');
     }
@@ -87,11 +82,7 @@
       if (meRes.ok) {
         const me = await meRes.json();
         if (me.authenticated) {
-          if (me.session_id) {
-            sessionToken = me.session_id;
-            localStorage.setItem('umai_token_b', sessionToken);
-            sessionStorage.setItem('umai_token_b', sessionToken);
-          }
+          isAuthenticated = true;
           showPortal();
           return;
         }
@@ -99,6 +90,7 @@
     } catch (err) {
       // 401 or error falls through to showAuth
     }
+    isAuthenticated = false;
     showAuth();
   }
 
@@ -143,10 +135,8 @@
       });
 
       const data = await res.json();
-      if (res.ok && (data.authenticated || data.session_id)) {
-        sessionToken = data.session_id || '';
-        localStorage.setItem('umai_token_b', sessionToken);
-        sessionStorage.setItem('umai_token_b', sessionToken);
+      if (res.ok && data.authenticated) {
+        isAuthenticated = true;
         showPortal();
       } else {
         loginError.textContent = data.error || 'Login failed';
@@ -163,9 +153,7 @@
     try {
       await api('/api/auth/logout', { method: 'POST' });
     } catch (e) {}
-    sessionToken = '';
-    localStorage.removeItem('umai_token_b');
-    sessionStorage.removeItem('umai_token_b');
+    isAuthenticated = false;
     showAuth();
   });
 
@@ -378,7 +366,7 @@
 
   // Refresh Inbox Table (Messages received from Application A)
   async function refreshInbox() {
-    if (!sessionToken) return;
+    if (!isAuthenticated) return;
     try {
       const res = await api('/api/inbox');
       if (!res.ok) return;
@@ -424,7 +412,7 @@
 
   // Refresh Outbox Count
   async function refreshOutboxCount() {
-    if (!sessionToken) return;
+    if (!isAuthenticated) return;
     try {
       const res = await api('/api/outbox');
       if (!res.ok) return;
@@ -510,7 +498,7 @@
 
   // Periodic polling for inbox and outbox changes
   setInterval(() => {
-    if (sessionToken) {
+    if (isAuthenticated) {
       refreshInbox();
       refreshOutboxCount();
     }

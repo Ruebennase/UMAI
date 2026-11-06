@@ -108,10 +108,11 @@ Because the user's browser sits in the middle of the `MessagePort`, UMAI's `PUT`
 In the reference implementation (`pkg/umaiserver/crypto.go`), zero-dependency `crypto/ed25519` signing enforces three end-to-end steps:
 
 1. **Outbox Signing (`UMAI-PUT-V1`):**
-   - On `CreateOutboxMessage`, the sender server snapshots the payload and attachments and signs an unambiguous, length-prefixed canonical SHA-256 digest binding its `sender_role`, `message_id`, canonical JSON payload hash, attachment count, and each sorted attachment's `(name_len, sanitized_name, byte_size, sha256)`:
+   - On `CreateOutboxMessage`, the sender server snapshots the payload and attachments and signs an unambiguous, length-prefixed canonical SHA-256 digest binding its `sender_role`, the intended `receiver_role`, `message_id`, canonical JSON payload hash, attachment count, and each sorted attachment's `(name_len, sanitized_name, byte_size, sha256)`:
      ```text
      UMAI-PUT-V1
-     role:<len>:<sender_role>
+     sender:<len>:<sender_role>
+     receiver:<len>:<receiver_role>
      id:<len>:<message_id>
      payload:<canonical_payload_json_sha256>
      att_count:<count>
@@ -119,7 +120,7 @@ In the reference implementation (`pkg/umaiserver/crypto.go`), zero-dependency `c
      ...
      ```
 2. **Mandatory Inbox Verification & Receipt Signing (`UMAI-ACK-V1`):**
-   - On `POST /api/inbox`, `AcceptSignedMessage` verifies the signature against the peer's public key and expected `sender_role`. Any tampered byte, wrong sender role, or stripped signature is rejected (`ErrInvalidSignature`) and purged from staging before commit.
+   - On `POST /api/inbox`, `AcceptSignedMessage` verifies the signature against the peer's public key and expected `sender_role` and `receiver_role`. Any tampered byte, wrong sender or receiver role, or stripped signature is rejected (`ErrInvalidSignature`) and purged from staging before commit.
    - Upon atomic commit, the receiver server signs a length-prefixed acceptance receipt binding its own `receiver_role`, the `message_id`, and the original `message_signature_hex`:
      ```text
      UMAI-ACK-V1
@@ -134,8 +135,11 @@ In the reference implementation (`pkg/umaiserver/crypto.go`), zero-dependency `c
 ### 5.2 Optional Extension: Asymmetric Encryption ("Blind Courier" Mode)
 When mediating browsers or extensions must not read sensitive payloads or attachments in transit, **asymmetric encryption** layers cleanly on top of server signing **without modifying `js/umai.js`**:
 1. **Key Exchange:** Server A holds Server B's public encryption key (`X25519`), and vice versa.
-2. **Encrypt-then-Sign on Outbox Snapshot:** Server A generates an ephemeral `X25519` key pair, derives a symmetric key via `HKDF-SHA256`, encrypts the JSON payload and attachment files with `AES-256-GCM` (or `ChaCha20-Poly1305`), and signs the resulting ciphertext envelope with `Ed25519`.
-3. **Blind Transit & Verify-then-Decrypt on Ingest:** `js/umai.js` transports the opaque ciphertext blobs via `PUT`; Server B verifies Server A's `Ed25519` signature first and decrypts inside its temporary staging directory prior to atomic commit.
+2. **Sign-First (with Named Receiver), Then Encrypt on Outbox Snapshot:**
+   - Server A first signs the plaintext canonical digest (`UMAI-PUT-V1`, which explicitly binds both `sender` A and intended `receiver` B) with Server A's `Ed25519` private key.
+   - Server A then generates an ephemeral `X25519` key pair, derives a symmetric key with Server B's public key via `HKDF-SHA256`, and encrypts the signed message and attachment files using `AES-256-GCM` (or `ChaCha20-Poly1305`).
+   - *Why Sign-First with Named Receiver Matters:* If a message were encrypted without naming the receiver inside the signed part (or signed only on the outer ciphertext), a recipient B in a multi-server mesh could decrypt A's message and re-encrypt it to a third party C with A's signature still intact (*surreptitious forwarding*). Signing first with `receiver` bound inside `UMAI-PUT-V1` and then encrypting to that receiver closes this completely.
+3. **Blind Transit & Decrypt-then-Verify on Ingest:** `js/umai.js` transports the opaque ciphertext blobs via `PUT`; Server B decrypts inside its temporary staging directory using its `X25519` private key and verifies Server A's `Ed25519` signature (confirming both `sender: A` and `receiver: B`) prior to atomic commit.
 
 ---
 
@@ -151,9 +155,11 @@ In our reference codebase (`pkg/umaiserver` and `examples/*`), we pulled a numbe
   - *Host App B:* Emit `Content-Security-Policy: frame-ancestors 'none'; frame-src 'self' https://app-a.example.com;` so only the expected peer origin can be framed.
 - **Strict `script-src 'self'` Without `'unsafe-inline'`:**
   - Keep all initialization and adapter glue in external `.js` files and serve `script-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'` together with `Referrer-Policy: no-referrer`.
-- **Cross-Origin Iframe Session Cookies (CHIPS / `Partitioned`):**
+- **Cross-Origin Iframe Session Cookies (CHIPS / `Partitioned`) & No `localStorage` Tokens:**
+  - Store session identifiers strictly in `HttpOnly` cookies (never in `localStorage` or `sessionStorage`, where XSS could exfiltrate a long-lived bearer token).
   - Because Embedded App A runs inside Host App B's cross-origin `<iframe>`, modern browsers treat App A's session cookie as third-party. Over HTTPS, issue the embedded session cookie with:
     `Set-Cookie: session=...; Path=/; Secure; HttpOnly; SameSite=None; Partitioned`
+  - Only trust `X-Forwarded-Proto: https` when the HTTP connection arrives from a trusted local reverse proxy (loopback).
 - **Sandboxing All Attachment & Document Download Endpoints:**
   - Peers may exchange `.html`, `.svg`, or `.xml` files as message attachments. Every attachment/document download response MUST emit:
     - `Content-Disposition: attachment; filename="..."`
@@ -183,8 +189,8 @@ In our reference codebase (`pkg/umaiserver` and `examples/*`), we pulled a numbe
   - When `POST /api/inbox` receives an ID that is already in `acceptedIDs` (e.g., due to a lost `ACK` or concurrent pooled upload), verify that the incoming `signature` matches the stored message's `signature` before returning the cached `ack_receipt`.
 - **Injective Length-Prefixed Canonical Digests & Attachment Counts:**
   - Never concatenate variable-length strings with bare delimiters alone (e.g., `name:size:hash`), as filenames containing `:` could cause canonicalization collisions. Length-prefix every variable-length string (`role:<len>:...`, `id:<len>:...`, `att:<name_len>:<name>:<size>:<sha256>`), include `att_count:<n>`, and sort attachments deterministically by sanitized name.
-- **Directional Role Binding (`sender_role` & `receiver_role`):**
-  - Bind the sender's logical role/origin into `UMAI-PUT-V1` and the receiver's role/origin into `UMAI-ACK-V1` so a peer or mediator cannot reflect a signed message or receipt back in the opposite direction (especially if keys were ever misconfigured).
+- **Directional Sender & Receiver Role Binding (`sender_role` & `receiver_role`):**
+  - Bind both the sender's and the intended receiver's logical role/origin (`sender:<len>:...` and `receiver:<len>:...`) into `UMAI-PUT-V1` and the receiver's role into `UMAI-ACK-V1` so a peer or courier cannot reflect a signed message backwards or misdirect a message signed for Peer B to Peer C.
 - **Empty/Null Payload Canonicalization Equivalence (`nil` -> `{}`):**
   - Normalize `nil` / `null` payloads to `{}` on both outbox signing and inbox verification so JSON serialization across Go/backend maps and browser Structured Clone produces identical digests.
 
@@ -200,5 +206,5 @@ In our reference codebase (`pkg/umaiserver` and `examples/*`), we pulled a numbe
 
 ### 6.5 Demo-Only Safeguards in `pkg/umaiserver` (Replace in Production)
 To keep this repository self-contained and runnable with zero external infrastructure, `pkg/umaiserver` includes several hardened local fixtures that **are specific to the demo server and should be replaced by enterprise infrastructure in production**:
-- **Static Demo Login (`AuthManager`):** Uses constant-time SHA-256 credential comparison (`crypto/subtle.ConstantTimeCompare`), `MaxActiveSessions = 10000` pruning, and emits a startup `[SECURITY NOTICE]` warning when the default `umai123` password is active. *Production apps replace this completely with their own OIDC/SAML/WebAuthn/MFA session middleware.*
-- **Deterministic Role Demo Keys (`DeriveDemoKeyPair`):** Allows `go test` and local demos to exercise full `Ed25519` signing out of the box without manual key generation, while logging a startup `[SECURITY NOTICE]` warning until overridden via `UMAI_SIGNING_PRIVATE_KEY` and `UMAI_PEER_PUBLIC_KEY` (or KMS/HSM in production).
+- **Loopback-Only Demo Defaults (`AllowDemoDefaults` / `-demo`):** Deterministic role demo keys (`DeriveDemoKeyPair`) and the default `admin` / `umai123` password are automatically permitted **only when listening on a loopback address (`127.0.0.1`, `localhost`, `[::1]`)**. Binding to a non-loopback network interface refuses to start unless `UMAI_SIGNING_PRIVATE_KEY`, `UMAI_PEER_PUBLIC_KEY`, and a non-default password are set (or `-demo` is explicitly passed).
+- **Static Demo Login (`AuthManager`):** Issues scoped `HttpOnly` cookies (`umai_session_a` / `umai_session_b`, with zero bearer tokens in `localStorage`), uses constant-time SHA-256 credential comparison (`crypto/subtle.ConstantTimeCompare`), and caps active sessions (`MaxActiveSessions = 10000`). *Production apps replace this completely with their own OIDC/SAML/WebAuthn/MFA session middleware.*

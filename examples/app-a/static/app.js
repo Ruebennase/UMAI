@@ -46,7 +46,7 @@
     iframeCookieNotice.style.display = 'block';
   }
 
-  let sessionToken = localStorage.getItem('umai_token_a') || sessionStorage.getItem('umai_token_a') || '';
+  let isAuthenticated = false;
 
   // --- API Utilities ---
   async function api(path, options = {}) {
@@ -54,16 +54,12 @@
     options.headers = options.headers || {};
     if (options.headers instanceof Headers) {
       options.headers.set('X-UMAI-CSRF', '1');
-      if (sessionToken) options.headers.set('X-UMAI-Session', sessionToken);
     } else {
       options.headers['X-UMAI-CSRF'] = '1';
-      if (sessionToken) options.headers['X-UMAI-Session'] = sessionToken;
     }
     const res = await fetch(path, options);
     if (res.status === 401) {
-      sessionToken = '';
-      localStorage.removeItem('umai_token_a');
-      sessionStorage.removeItem('umai_token_a');
+      isAuthenticated = false;
       showAuth();
       throw new Error('Unauthorized');
     }
@@ -90,16 +86,14 @@
       const res = await api('/api/auth/me');
       const data = await res.json();
       if (data.authenticated) {
-        if (data.session_id) {
-          sessionToken = data.session_id;
-          localStorage.setItem('umai_token_a', sessionToken);
-          sessionStorage.setItem('umai_token_a', sessionToken);
-        }
+        isAuthenticated = true;
         showApp();
       } else {
+        isAuthenticated = false;
         showAuth();
       }
     } catch (e) {
+      isAuthenticated = false;
       showAuth();
     }
   }
@@ -134,9 +128,10 @@
       });
       const data = await res.json();
       if (res.ok && data.authenticated) {
-        sessionToken = data.session_id || '';
-        localStorage.setItem('umai_token_a', sessionToken);
-        sessionStorage.setItem('umai_token_a', sessionToken);
+        isAuthenticated = true;
+        try {
+          localStorage.setItem('umai_auth_event_a', 'login:' + Date.now());
+        } catch (e) {}
         showApp();
       } else {
         loginError.textContent = data.error || 'Login failed';
@@ -152,9 +147,10 @@
     try {
       await api('/api/auth/logout', { method: 'POST' });
     } finally {
-      sessionToken = '';
-      localStorage.removeItem('umai_token_a');
-      sessionStorage.removeItem('umai_token_a');
+      isAuthenticated = false;
+      try {
+        localStorage.setItem('umai_auth_event_a', 'logout:' + Date.now());
+      } catch (e) {}
       showAuth();
     }
   });
@@ -177,7 +173,7 @@
       // Periodically refresh lists so standalone tabs show incoming files in real-time
       if (!window._refreshTimer) {
         window._refreshTimer = setInterval(async () => {
-          if (sessionToken) {
+          if (isAuthenticated) {
             await loadDocuments();
             await loadOutbox();
             await loadInbox();
@@ -529,8 +525,7 @@
 
   // Start auth check
   window.addEventListener('storage', (e) => {
-    if (e.key === 'umai_token_a') {
-      sessionToken = e.newValue || '';
+    if (e.key === 'umai_auth_event_a') {
       checkAuth();
     }
   });

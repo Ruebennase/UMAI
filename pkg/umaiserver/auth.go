@@ -5,8 +5,8 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/hex"
+	"net"
 	"net/http"
-	"strings"
 	"sync"
 	"time"
 )
@@ -131,9 +131,35 @@ func (am *AuthManager) RevokeSession(sessionID string) {
 	am.mu.Unlock()
 }
 
+func isHTTPSRequest(r *http.Request) bool {
+	if r.TLS != nil {
+		return true
+	}
+	// Only trust X-Forwarded-Proto when request arrives from a local reverse proxy (loopback)
+	if r.Header.Get("X-Forwarded-Proto") == "https" && isLoopbackHostPort(r.RemoteAddr) {
+		return true
+	}
+	return false
+}
+
+func isLoopbackHostPort(addr string) bool {
+	if addr == "" {
+		return true
+	}
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		host = addr
+	}
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
 // SetSessionCookie writes the session cookie onto the HTTP response.
 func (am *AuthManager) SetSessionCookie(w http.ResponseWriter, r *http.Request, sessionID string) {
-	isSecure := r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https"
+	isSecure := isHTTPSRequest(r)
 	sameSite := http.SameSiteLaxMode
 	if isSecure {
 		sameSite = http.SameSiteNoneMode
@@ -154,7 +180,7 @@ func (am *AuthManager) SetSessionCookie(w http.ResponseWriter, r *http.Request, 
 
 // ClearSessionCookie clears the session cookie.
 func (am *AuthManager) ClearSessionCookie(w http.ResponseWriter, r *http.Request) {
-	isSecure := r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https"
+	isSecure := isHTTPSRequest(r)
 	sameSite := http.SameSiteLaxMode
 	if isSecure {
 		sameSite = http.SameSiteNoneMode
@@ -173,23 +199,14 @@ func (am *AuthManager) ClearSessionCookie(w http.ResponseWriter, r *http.Request
 	http.SetCookie(w, cookie)
 }
 
-// GetSessionID extracts the session ID from cookie or Authorization header.
+// GetSessionID extracts the session ID strictly from the HttpOnly session cookie.
 func (am *AuthManager) GetSessionID(r *http.Request) string {
-	// First check explicit headers (takes precedence, preventing cross-port cookie collisions)
-	if h := r.Header.Get("X-UMAI-Session"); h != "" {
-		return h
-	}
-	authHeader := r.Header.Get("Authorization")
-	if strings.HasPrefix(authHeader, "Bearer ") {
-		return strings.TrimPrefix(authHeader, "Bearer ")
-	}
-
-	// Fallback to scoped cookie
+	// Scoped HttpOnly cookie (e.g. umai_session_a or umai_session_b)
 	if c, err := r.Cookie(am.cookieName); err == nil && c.Value != "" {
 		return c.Value
 	}
 
-	// Legacy fallback to default cookie name
+	// Fallback to default cookie name
 	if c, err := r.Cookie(SessionCookieName); err == nil && c.Value != "" {
 		return c.Value
 	}

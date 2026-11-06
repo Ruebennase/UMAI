@@ -61,7 +61,7 @@ func authenticatedRequest(method, url string, sessionID string, body io.Reader, 
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("X-UMAI-Session", sessionID)
+	req.Header.Set("X-UMAI-CSRF", "1")
 	req.AddCookie(&http.Cookie{
 		Name:  umaiserver.SessionCookieName,
 		Value: sessionID,
@@ -388,6 +388,36 @@ func TestSecurity_SignedMessages_TamperAndForgeryRejection(t *testing.T) {
 	outboxAfterForgedAck, _ := appA.Server.Storage().ListOutbox()
 	if len(outboxAfterForgedAck) != 1 {
 		t.Fatalf("Outbox message on A must not be deleted on forged ACK receipt")
+	}
+
+	// 4. Verify receiver role binding in UMAI-PUT-V1: a message signed by app-a for "app-c" must be rejected by app-b
+	_, privA := umaiserver.DeriveDemoKeyPair("app-a")
+	sigForAppC, err := umaiserver.SignPutMessage(privA, "app-a", "app-c", msgA.ID, msgA.Payload, msgA.Attachments)
+	if err != nil {
+		t.Fatalf("SignPutMessage for app-c: %v", err)
+	}
+	var bufWrongReceiver bytes.Buffer
+	mwWrong := multipart.NewWriter(&bufWrongReceiver)
+	_ = mwWrong.WriteField("id", msgA.ID)
+	_ = mwWrong.WriteField("payload", string(pJSON))
+	_ = mwWrong.WriteField("signature", sigForAppC)
+	partWrong, _ := mwWrong.CreateFormFile("attachments", "invoice.pdf")
+	_, _ = partWrong.Write([]byte("Original Amount: CHF 100"))
+	_ = mwWrong.Close()
+
+	reqWrong, _ := authenticatedRequest("POST", "/api/inbox", appB.SessionID, &bufWrongReceiver, mwWrong.FormDataContentType())
+	resWrong := appB.Do(reqWrong)
+	defer resWrong.Body.Close()
+	if resWrong.StatusCode == http.StatusOK {
+		t.Fatalf("Expected B to reject message signed for different receiver role (app-c), got 200 OK")
+	}
+
+	// 5. Verify non-loopback address refuses deterministic demo keys unless AllowDemoDefaults (-demo) is enabled
+	nonLoopbackCfg := umaiserver.DefaultConfig("app-a")
+	nonLoopbackCfg.ListenAddr = "0.0.0.0:8081"
+	nonLoopbackCfg.DataDir = t.TempDir()
+	if _, err := umaiserver.NewServer(nonLoopbackCfg, t.TempDir()); err == nil {
+		t.Fatalf("Expected NewServer on non-loopback 0.0.0.0:8081 without explicit keys or -demo to fail")
 	}
 }
 

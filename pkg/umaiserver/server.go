@@ -40,6 +40,15 @@ func NewServer(cfg Config, staticDir string) (*Server, error) {
 		}
 	}
 
+	if !cfg.AllowDemoDefaults && !isLoopbackHostPort(cfg.ListenAddr) {
+		if strings.TrimSpace(cfg.SigningPrivateKey) == "" || strings.TrimSpace(cfg.PeerPublicKey) == "" {
+			return nil, fmt.Errorf("refusing to use deterministic demo Ed25519 keys on non-loopback address %q: set UMAI_SIGNING_PRIVATE_KEY and UMAI_PEER_PUBLIC_KEY (or pass -demo)", cfg.ListenAddr)
+		}
+		if cfg.AuthPassword == "" || cfg.AuthPassword == "umai123" {
+			return nil, fmt.Errorf("refusing to use default demo password on non-loopback address %q: set -pass / UMAI_AUTH_PASS (or pass -demo)", cfg.ListenAddr)
+		}
+	}
+
 	storage, err := NewStorage(cfg.DataDir, cfg.MaxUploadSize)
 	if err != nil {
 		return nil, fmt.Errorf("initializing storage: %w", err)
@@ -172,11 +181,9 @@ func (s *Server) securityMiddleware(next http.Handler) http.Handler {
 					return
 				}
 			} else if r.Header.Get("Cookie") != "" &&
-				r.Header.Get("X-UMAI-CSRF") == "" &&
-				r.Header.Get("X-UMAI-Session") == "" &&
-				r.Header.Get("Authorization") == "" {
+				r.Header.Get("X-UMAI-CSRF") == "" {
 				writeJSON(w, http.StatusForbidden, map[string]string{
-					"error": "forbidden: missing Origin or CSRF header on cookie-authenticated request",
+					"error": "forbidden: missing Origin or X-UMAI-CSRF header on cookie-authenticated request",
 				})
 				return
 			}
@@ -323,7 +330,6 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"authenticated": true,
 		"username":      req.Username,
-		"session_id":    sessionID,
 	})
 }
 
@@ -349,7 +355,6 @@ func (s *Server) handleAuthMe(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"authenticated": true,
 		"username":      sess.Username,
-		"session_id":    sess.ID,
 	})
 }
 
@@ -612,7 +617,7 @@ func (s *Server) handleListAcceptedReceipts(w http.ResponseWriter, r *http.Reque
 // - "signature": optional/expected Ed25519 signature hex of canonical PUT digest
 // - "attachments": one or more binary files
 func (s *Server) handleAcceptMessage(w http.ResponseWriter, r *http.Request) {
-	r.Body = http.MaxBytesReader(w, r.Body, s.cfg.MaxUploadSize*int64(MaxAttachmentsPerMessage)+10*1024*1024)
+	r.Body = http.MaxBytesReader(w, r.Body, s.cfg.MaxUploadSize+10*1024*1024)
 	if err := r.ParseMultipartForm(s.cfg.MaxUploadSize); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "failed parsing multipart form"})
 		return

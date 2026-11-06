@@ -69,15 +69,17 @@ func ParseKeyPair(role, privHex, peerPubHex string) (ed25519.PublicKey, ed25519.
 // CanonicalPutDigest computes the unambiguous, length-prefixed canonical SHA-256 digest of a UMAI PUT message:
 //
 //	UMAI-PUT-V1\n
-//	role:<len>:<sender_role>\n
+//	sender:<len>:<sender_role>\n
+//	receiver:<len>:<receiver_role>\n
 //	id:<len>:<id>\n
 //	payload:<payload_canonical_sha256>\n
 //	att_count:<count>\n
 //	att:<name_len>:<att1_name>:<att1_size>:<att1_sha256>\n...
 //
-// Length-prefixing variable-length strings guarantees injectivity (zero delimiter collision ambiguity),
+// Binding both sender and intended receiver prevents cross-channel or multi-peer misdirection,
+// length-prefixing variable-length strings guarantees injectivity (zero delimiter collision ambiguity),
 // and sorting attachments by sanitized name ensures ordering differences never break verification.
-func CanonicalPutDigest(senderRole string, id string, payload any, attachments []AttachmentInfo) ([32]byte, error) {
+func CanonicalPutDigest(senderRole string, receiverRole string, id string, payload any, attachments []AttachmentInfo) ([32]byte, error) {
 	if payload == nil {
 		payload = map[string]any{}
 	}
@@ -106,7 +108,8 @@ func CanonicalPutDigest(senderRole string, id string, payload any, attachments [
 
 	var sb strings.Builder
 	sb.WriteString("UMAI-PUT-V1\n")
-	sb.WriteString(fmt.Sprintf("role:%d:%s\n", len(senderRole), senderRole))
+	sb.WriteString(fmt.Sprintf("sender:%d:%s\n", len(senderRole), senderRole))
+	sb.WriteString(fmt.Sprintf("receiver:%d:%s\n", len(receiverRole), receiverRole))
 	sb.WriteString(fmt.Sprintf("id:%d:%s\n", len(id), id))
 	sb.WriteString(fmt.Sprintf("payload:%s\n", hex.EncodeToString(payloadHash[:])))
 	sb.WriteString(fmt.Sprintf("att_count:%d\n", len(sortedAtts)))
@@ -117,12 +120,12 @@ func CanonicalPutDigest(senderRole string, id string, payload any, attachments [
 	return sha256.Sum256([]byte(sb.String())), nil
 }
 
-// SignPutMessage signs a message's canonical PUT digest with the sender's Ed25519 private key.
-func SignPutMessage(priv ed25519.PrivateKey, senderRole string, id string, payload any, attachments []AttachmentInfo) (string, error) {
+// SignPutMessage signs a message's canonical PUT digest (binding sender and intended receiver) with the sender's Ed25519 private key.
+func SignPutMessage(priv ed25519.PrivateKey, senderRole string, receiverRole string, id string, payload any, attachments []AttachmentInfo) (string, error) {
 	if len(priv) == 0 {
 		return "", nil
 	}
-	digest, err := CanonicalPutDigest(senderRole, id, payload, attachments)
+	digest, err := CanonicalPutDigest(senderRole, receiverRole, id, payload, attachments)
 	if err != nil {
 		return "", err
 	}
@@ -130,8 +133,8 @@ func SignPutMessage(priv ed25519.PrivateKey, senderRole string, id string, paylo
 	return hex.EncodeToString(sig), nil
 }
 
-// VerifyPutMessage verifies a message's canonical PUT digest against the sender's Ed25519 public key.
-func VerifyPutMessage(pub ed25519.PublicKey, expectedSenderRole string, id string, payload any, attachments []AttachmentInfo, sigHex string) error {
+// VerifyPutMessage verifies a message's canonical PUT digest against the sender's Ed25519 public key and expected sender/receiver roles.
+func VerifyPutMessage(pub ed25519.PublicKey, expectedSenderRole string, expectedReceiverRole string, id string, payload any, attachments []AttachmentInfo, sigHex string) error {
 	if len(pub) == 0 {
 		return nil
 	}
@@ -142,7 +145,7 @@ func VerifyPutMessage(pub ed25519.PublicKey, expectedSenderRole string, id strin
 	if err != nil || len(sig) != ed25519.SignatureSize {
 		return ErrInvalidSignature
 	}
-	digest, err := CanonicalPutDigest(expectedSenderRole, id, payload, attachments)
+	digest, err := CanonicalPutDigest(expectedSenderRole, expectedReceiverRole, id, payload, attachments)
 	if err != nil {
 		return err
 	}

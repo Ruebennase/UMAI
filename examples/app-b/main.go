@@ -19,6 +19,7 @@ func main() {
 	flag.StringVar(&cfg.AuthUsername, "user", cfg.AuthUsername, "Demo authentication username")
 	flag.StringVar(&cfg.AuthPassword, "pass", cfg.AuthPassword, "Demo authentication password")
 	flag.Int64Var(&cfg.MaxUploadSize, "max-upload", cfg.MaxUploadSize, "Max upload size in bytes")
+	flag.BoolVar(&cfg.AllowDemoDefaults, "demo", cfg.AllowDemoDefaults, "Allow demo keys and default password on non-loopback addresses")
 	staticDirFlag := flag.String("static", "", "Path to static directory (defaults to ./static next to binary/source)")
 
 	flag.Parse()

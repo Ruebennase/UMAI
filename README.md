@@ -48,6 +48,16 @@ Modern organizations frequently use separate, siloed web applications (e.g. an E
 
 **The UMAI approach:** The authorized human user is *already* authenticated to both applications in their browser. By turning the browser tab into a secure mediator via standard Web APIs (`postMessage`, `MessageChannel`, `File` Structured Clone), applications can exchange verified, immutable records and large documents without server-to-server coupling.
 
+### Conceptual Lineage: Browsers as Zero-Install Store-Carry-Forward Couriers
+
+In networking theory, moving data via mobile or intermittent intermediaries is known as **store-carry-forward** or **Delay-Tolerant Networking (DTN, RFC 9171)**—historically seen in offline mesh apps (like Briar or Secure Scuttlebutt) or physical "sneakernets" that require installing specialized native software.
+
+UMAI brings store-carry-forward to **ordinary, logged-in web browser sessions** with zero client installation:
+- **Why End-to-End Signing Changes Everything:** Once every message is signed by the server that created it (binding both the sender and the intended receiver in `UMAI-PUT-V1`) and verified by the server that receives it (`UMAI-ACK-V1`), **the transport route stops mattering for integrity**. Whether a record travels over a direct fiber link or is carried across an air-gapped boundary by a user's browser tab, neither the browser nor the route needs to be trusted.
+- **Practical Store-Carry-Forward Dynamics:**
+  - *Asynchronous Delivery:* Messages move when an authorized user session connects the systems—making UMAI ideal for asynchronous document, invoice, and record synchronization rather than real-time interactive RPC.
+  - *Correlated Availability in Multi-User Pools:* While multiple online users provide redundant parallel paths (and UMAI's idempotent `ACK` naturally deduplicates multi-path arrivals), human sessions correlate with working hours, weekends, and holidays.
+
 ### Implementer's Choice: User-Scoped vs. System-Wide Opportunistic Pool
 
 Because UMAI leaves backend storage and queuing policy to the implementer, applications can choose how to scope an open UMAI channel depending on their business goal:

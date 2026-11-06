@@ -395,7 +395,7 @@ func (s *Storage) CreateOutboxMessage(payload any, docNames []string) (*Message,
 		})
 	}
 
-	sigHex, err := SignPutMessage(s.ownPrivKey, s.role, msgID, payload, attachments)
+	sigHex, err := SignPutMessage(s.ownPrivKey, s.role, s.peerRole, msgID, payload, attachments)
 	if err != nil {
 		_ = os.RemoveAll(msgDir)
 		return nil, err
@@ -839,7 +839,7 @@ func (s *Storage) acceptMessageInternal(id string, payload any, attachments []At
 
 	// Enforce Ed25519 signature verification when required and peer public key is configured
 	if (requireSignature || sigHex != "") && len(s.peerPubKey) > 0 {
-		if err := VerifyPutMessage(s.peerPubKey, s.peerRole, cleanID, payload, attInfos, sigHex); err != nil {
+		if err := VerifyPutMessage(s.peerPubKey, s.peerRole, s.role, cleanID, payload, attInfos, sigHex); err != nil {
 			_ = os.RemoveAll(tmpDir)
 			return nil, err
 		}

@@ -9,7 +9,6 @@
   const loginForm = document.getElementById('sync-login-form');
   const loginError = document.getElementById('sync-login-error');
 
-  let sessionToken = localStorage.getItem('umai_token_a') || sessionStorage.getItem('umai_token_a') || '';
   let peerOrigin = '';
   let umaiSession = null;
   let isAuthenticated = false;
@@ -29,14 +28,8 @@
     options.credentials = 'include';
     options.headers = options.headers || {};
     options.headers['X-UMAI-CSRF'] = '1';
-    if (sessionToken) {
-      options.headers['X-UMAI-Session'] = sessionToken;
-    }
     const res = await fetch(path, options);
     if (res.status === 401) {
-      sessionToken = '';
-      localStorage.removeItem('umai_token_a');
-      sessionStorage.removeItem('umai_token_a');
       showAuthRequired();
       throw new Error('Unauthorized');
     }
@@ -59,11 +52,6 @@
       if (meRes.ok) {
         const me = await meRes.json();
         if (me.authenticated) {
-          if (me.session_id) {
-            sessionToken = me.session_id;
-            localStorage.setItem('umai_token_a', sessionToken);
-            sessionStorage.setItem('umai_token_a', sessionToken);
-          }
           startSyncWorker();
           return;
         }
@@ -207,10 +195,10 @@
       });
 
       const data = await res.json();
-      if (res.ok && (data.authenticated || data.session_id)) {
-        sessionToken = data.session_id || '';
-        localStorage.setItem('umai_token_a', sessionToken);
-        sessionStorage.setItem('umai_token_a', sessionToken);
+      if (res.ok && data.authenticated) {
+        try {
+          localStorage.setItem('umai_auth_event_a', 'login:' + Date.now());
+        } catch (e) {}
         startSyncWorker();
       } else {
         loginError.textContent = data.error || 'Authentication failed';
@@ -238,15 +226,10 @@
     }
   });
 
-  // If user logs into App A in a separate tab, localStorage fires 'storage' event here
+  // If user logs into or out of App A in a separate tab, re-check HttpOnly cookie session
   window.addEventListener('storage', function (e) {
-    if (e.key === 'umai_token_a') {
-      sessionToken = e.newValue || '';
-      if (sessionToken && !isAuthenticated) {
-        init();
-      } else if (!sessionToken && isAuthenticated) {
-        showAuthRequired();
-      }
+    if (e.key === 'umai_auth_event_a') {
+      init();
     }
   });
 

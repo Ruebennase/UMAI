@@ -21,8 +21,9 @@ type Config struct {
 	MaxUploadSize     int64  // Maximum upload size in bytes (e.g. 100MB)
 	SessionSecret     string // Secret for signing/validating sessions
 	AllowEmbedding    bool   // Whether CSP should allow embedding by PeerOrigin
-	SigningPrivateKey string // Hex-encoded Ed25519 private key or seed (auto-derived per role if empty)
-	PeerPublicKey     string // Hex-encoded Ed25519 public key of peer (auto-derived per role if empty)
+	SigningPrivateKey string // Hex-encoded Ed25519 private key or seed (auto-derived per role on loopback/demo if empty)
+	PeerPublicKey     string // Hex-encoded Ed25519 public key of peer (auto-derived per role on loopback/demo if empty)
+	AllowDemoDefaults bool   // Allow deterministic demo keys and default password even on non-loopback addresses
 }
 
 // DefaultConfig returns a configuration populated with sensible defaults.
@@ -43,6 +44,7 @@ func DefaultConfig(role string) Config {
 			AllowEmbedding:    false,
 			SigningPrivateKey: getEnv("UMAI_SIGNING_PRIVATE_KEY", ""),
 			PeerPublicKey:     getEnv("UMAI_PEER_PUBLIC_KEY", ""),
+			AllowDemoDefaults: getEnv("UMAI_DEMO", "") == "1" || getEnv("UMAI_DEMO", "") == "true",
 		}
 	}
 
@@ -62,6 +64,7 @@ func DefaultConfig(role string) Config {
 		AllowEmbedding:    true,
 		SigningPrivateKey: getEnv("UMAI_SIGNING_PRIVATE_KEY", ""),
 		PeerPublicKey:     getEnv("UMAI_PEER_PUBLIC_KEY", ""),
+		AllowDemoDefaults: getEnv("UMAI_DEMO", "") == "1" || getEnv("UMAI_DEMO", "") == "true",
 	}
 }
 
