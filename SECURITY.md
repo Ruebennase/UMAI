@@ -174,9 +174,11 @@ In our reference codebase (`pkg/umaiserver` and `examples/*`), we pulled a numbe
 - **The W3C `Sec-Fetch-Site: cross-site` Cross-Origin Iframe Gotcha:**
   - *Trap to watch out for:* Per the W3C Fetch Metadata specification, when Embedded App A (`https://app-a.example`) runs inside Host App B's cross-origin `<iframe>` (`https://app-b.example`) and calls its **own** backend (`fetch('https://app-a.example/api/inbox')`), the browser sends `Origin: https://app-a.example` **but sets `Sec-Fetch-Site: cross-site`** because the top-level ancestor frame is cross-site!
   - *Correct CSRF Pattern (implemented in `pkg/umaiserver/server.go`):* Do **not** blindly block `Sec-Fetch-Site: cross-site` on the embedded app's API (which would break embedded `SameSite=None; Partitioned` cookie requests). Instead:
-    1. On every state-changing method (`POST`, `PUT`, `DELETE`, `PATCH`), verify that the `Origin` header—when present—strictly matches your server's own origin (`403 Forbidden` otherwise).
+    1. On every state-changing method (`POST`, `PUT`, `DELETE`, `PATCH`), verify that the `Origin` header—when present—strictly matches your server's own **scheme and host** (`403 Forbidden` otherwise).
     2. If `Origin` is omitted/stripped on a cookie-authenticated request, require an explicit custom header (e.g., `X-UMAI-CSRF: 1` or `Authorization`), which cross-site HTML `<form enctype="multipart/form-data">` CSRF attacks cannot set without triggering a blocked CORS preflight.
     3. Enforce `Content-Type: application/json` (`415 Unsupported Media Type` otherwise) on all JSON endpoints (`/api/outbox`, `/api/outbox/ack`, etc.).
+- **Strict Separation Between Static Asset Root and `DataDir`:**
+  - Never allow the static file handler root (`staticDir`) to overlap with `DataDir` or fall back to `"."`, and restrict static serving to explicit web asset extensions (excluding hidden paths and data files).
 - **Unauthenticated Endpoint Hygiene (Preventing ID Squatting):**
   - Public health or status endpoints (`GET /api/status`) must **never** expose pending `outbox_ids` or `accepted_ids` to unauthenticated callers; otherwise an unauthenticated observer could learn pending IDs and attempt pre-emptive ID squatting.
 
@@ -191,8 +193,8 @@ In our reference codebase (`pkg/umaiserver` and `examples/*`), we pulled a numbe
   - Never concatenate variable-length strings with bare delimiters alone (e.g., `name:size:hash`), as filenames containing `:` could cause canonicalization collisions. Length-prefix every variable-length string (`role:<len>:...`, `id:<len>:...`, `att:<name_len>:<name>:<size>:<sha256>`), include `att_count:<n>`, and sort attachments deterministically by sanitized name.
 - **Directional Sender & Receiver Role Binding (`sender_role` & `receiver_role`):**
   - Bind both the sender's and the intended receiver's logical role/origin (`sender:<len>:...` and `receiver:<len>:...`) into `UMAI-PUT-V1` and the receiver's role into `UMAI-ACK-V1` so a peer or courier cannot reflect a signed message backwards or misdirect a message signed for Peer B to Peer C.
-- **Empty/Null Payload Canonicalization Equivalence (`nil` -> `{}`):**
-  - Normalize `nil` / `null` payloads to `{}` on both outbox signing and inbox verification so JSON serialization across Go/backend maps and browser Structured Clone produces identical digests.
+- **Empty/Null Payload Canonicalization Equivalence (`nil` -> `{}`) & Exact JSON Numbers (RFC 7493):**
+  - Normalize `nil` / `null` payloads to `{}` on both outbox signing and inbox verification, use `(payload !== undefined && payload !== null) ? payload : {}` in JS adapters so valid falsy scalars (`false`, `0`, `""`) are never coerced to `{}`, and decode JSON payloads with exact number tokens (`json.Decoder.UseNumber()` in Go) so 64-bit integers are never silently rounded to `float64`. Because browser `JSON.parse()` uses IEEE-754 double precision, applications passing integers beyond $\pm(2^{53}-1)$ across the browser should encode them as strings per RFC 7493 (I-JSON).
 
 ### 6.4 Atomic Storage, File Hygiene & Pooled-Channel Concurrency Watchlist
 - **Reject Duplicate Sanitized Attachment Filenames:**

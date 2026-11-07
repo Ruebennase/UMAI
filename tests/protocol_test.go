@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/umai-protocol/umai/pkg/umaiserver"
@@ -566,5 +567,48 @@ func TestSecurity_StrictCSP_CookieCSRF_NilPayload_And_DuplicateProbe(t *testing.
 	defer resProbe.Body.Close()
 	if resProbe.StatusCode == http.StatusOK {
 		t.Errorf("Expected duplicate POST /api/inbox with invalid signature to be rejected, got 200 OK")
+	}
+
+	// 5. Verify static directory and DataDir overlap is rejected at startup (F1)
+	overlapCfg := umaiserver.DefaultConfig("app-a")
+	overlapCfg.DataDir = filepath.Join(appA.Server.Config().DataDir, "sub")
+	if _, err := umaiserver.NewServer(overlapCfg, appA.Server.Config().DataDir); err == nil {
+		t.Errorf("Expected NewServer to reject overlapping staticDir and DataDir")
+	}
+
+	// 6. Verify scheme-aware Origin check rejects http:// Origin on an https request (F7)
+	reqMismatchScheme, _ := authenticatedRequest("POST", "/api/outbox/ack", appA.SessionID, bytes.NewReader([]byte(`{"ids":[]}`)), "application/json")
+	reqMismatchScheme.RemoteAddr = "127.0.0.1:54321"
+	reqMismatchScheme.Header.Set("X-Forwarded-Proto", "https")
+	reqMismatchScheme.Header.Set("Origin", "http://127.0.0.1:8081")
+	resMismatch := appA.Do(reqMismatchScheme)
+	defer resMismatch.Body.Close()
+	if resMismatch.StatusCode != http.StatusForbidden {
+		t.Errorf("Expected 403 Forbidden for scheme-mismatched Origin header, got %d", resMismatch.StatusCode)
+	}
+
+	// 7. Verify exact 64-bit integer precision in CanonicalPutDigest (F5): 9007199254740992 vs 9007199254740993
+	d1, err1 := umaiserver.CanonicalPutDigest("app-a", "app-b", "msg-int", json.RawMessage(`{"n":9007199254740992}`), nil)
+	d2, err2 := umaiserver.CanonicalPutDigest("app-a", "app-b", "msg-int", json.RawMessage(`{"n":9007199254740993}`), nil)
+	if err1 != nil || err2 != nil || d1 == d2 {
+		t.Errorf("Expected distinct canonical digests for 9007199254740992 and 9007199254740993, got equal (%x)", d1)
+	}
+
+	// 8. Verify scalar false payload round-trips with valid signature verification (F6)
+	msgFalse, err := appA.Server.Storage().CreateOutboxMessage(false, nil)
+	if err != nil {
+		t.Fatalf("CreateOutboxMessage(false): %v", err)
+	}
+	var bufFalse bytes.Buffer
+	mwFalse := multipart.NewWriter(&bufFalse)
+	_ = mwFalse.WriteField("id", msgFalse.ID)
+	_ = mwFalse.WriteField("payload", "false")
+	_ = mwFalse.WriteField("signature", msgFalse.Signature)
+	_ = mwFalse.Close()
+	reqFalse, _ := authenticatedRequest("POST", "/api/inbox", appB.SessionID, &bufFalse, mwFalse.FormDataContentType())
+	resFalse := appB.Do(reqFalse)
+	defer resFalse.Body.Close()
+	if resFalse.StatusCode != http.StatusOK {
+		t.Errorf("Expected scalar false payload message to verify cleanly, got %d", resFalse.StatusCode)
 	}
 }

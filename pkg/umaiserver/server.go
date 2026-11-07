@@ -49,6 +49,21 @@ func NewServer(cfg Config, staticDir string) (*Server, error) {
 		}
 	}
 
+	if staticDir != "" && cfg.DataDir != "" {
+		absStatic, err1 := filepath.Abs(staticDir)
+		absData, err2 := filepath.Abs(cfg.DataDir)
+		if err1 == nil && err2 == nil {
+			cleanStatic := filepath.Clean(absStatic)
+			cleanData := filepath.Clean(absData)
+			sep := string(filepath.Separator)
+			if cleanStatic == cleanData ||
+				strings.HasPrefix(cleanData, cleanStatic+sep) ||
+				strings.HasPrefix(cleanStatic, cleanData+sep) {
+				return nil, fmt.Errorf("security violation: static directory (%s) and data directory (%s) must not overlap", cleanStatic, cleanData)
+			}
+		}
+	}
+
 	storage, err := NewStorage(cfg.DataDir, cfg.MaxUploadSize)
 	if err != nil {
 		return nil, fmt.Errorf("initializing storage: %w", err)
@@ -78,7 +93,20 @@ func newStaticFileHandler(staticDir string) http.Handler {
 	fileServer := http.FileServer(http.Dir(staticDir))
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		path := r.URL.Path
-		ext := filepath.Ext(path)
+		for _, seg := range strings.Split(path, "/") {
+			if strings.HasPrefix(seg, ".") && seg != "" {
+				http.NotFound(w, r)
+				return
+			}
+		}
+		ext := strings.ToLower(filepath.Ext(path))
+		switch ext {
+		case "", ".html", ".css", ".js", ".svg", ".png", ".ico", ".woff2", ".txt", ".map":
+			// Allowed static web asset extensions
+		default:
+			http.NotFound(w, r)
+			return
+		}
 		if ext == ".css" {
 			w.Header().Set("Content-Type", "text/css; charset=utf-8")
 		} else if ext == ".js" {
@@ -193,11 +221,18 @@ func (s *Server) securityMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-// isSameServerOrigin checks whether the HTTP Origin header matches this server's own host/listen address
+// isSameServerOrigin checks whether the HTTP Origin header matches this server's own scheme and host/listen address
 // (allowing localhost <-> 127.0.0.1 loopback equivalence on the same port).
 func (s *Server) isSameServerOrigin(origin string, r *http.Request) bool {
 	u, err := url.Parse(origin)
 	if err != nil || u.Host == "" {
+		return false
+	}
+	expectedScheme := "http"
+	if isHTTPSRequest(r) {
+		expectedScheme = "https"
+	}
+	if !strings.EqualFold(u.Scheme, expectedScheme) {
 		return false
 	}
 	reqHost := r.Host
@@ -476,7 +511,9 @@ func (s *Server) handleCreateOutbox(w http.ResponseWriter, r *http.Request) {
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, 4*1024*1024)
 	var req createOutboxRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	dec := json.NewDecoder(r.Body)
+	dec.UseNumber()
+	if err := dec.Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json body"})
 		return
 	}
@@ -635,7 +672,9 @@ func (s *Server) handleAcceptMessage(w http.ResponseWriter, r *http.Request) {
 	payloadStr := r.FormValue("payload")
 	var payload any
 	if payloadStr != "" {
-		if err := json.Unmarshal([]byte(payloadStr), &payload); err != nil {
+		dec := json.NewDecoder(strings.NewReader(payloadStr))
+		dec.UseNumber()
+		if err := dec.Decode(&payload); err != nil {
 			payload = payloadStr
 		}
 	}

@@ -1,6 +1,7 @@
 package umaiserver
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/hex"
@@ -90,7 +91,9 @@ func CanonicalPutDigest(senderRole string, receiverRole string, id string, paylo
 		return [32]byte{}, err
 	}
 	if len(rawBytes) > 0 && string(rawBytes) != "null" {
-		_ = json.Unmarshal(rawBytes, &normalized)
+		dec := json.NewDecoder(bytes.NewReader(rawBytes))
+		dec.UseNumber()
+		_ = dec.Decode(&normalized)
 	} else {
 		normalized = map[string]any{}
 	}

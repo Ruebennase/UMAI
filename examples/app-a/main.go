@@ -23,15 +23,15 @@ func main() {
 
 	flag.Parse()
 
-	// Locate static files
+	// Locate static files (never fall back to "." to prevent exposing DataDir or source tree)
 	staticDir := *staticDirFlag
 	if staticDir == "" {
-		if _, err := os.Stat("static"); err == nil {
+		if info, err := os.Stat("static"); err == nil && info.IsDir() {
 			staticDir = "static"
-		} else if _, err := os.Stat("examples/app-a/static"); err == nil {
+		} else if info, err := os.Stat("examples/app-a/static"); err == nil && info.IsDir() {
 			staticDir = "examples/app-a/static"
 		} else {
-			staticDir = "."
+			log.Fatalf("Static assets directory not found (checked ./static and ./examples/app-a/static); specify -static <dir>")
 		}
 	}
 	absStatic, _ := filepath.Abs(staticDir)

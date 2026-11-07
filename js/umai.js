@@ -28,6 +28,7 @@
   const PROTOCOL_VERSION = 1;
   const MAX_BATCH_IDS = 1000;
   const MAX_AUTO_RETRIES = 3;
+  const GET_TIMEOUT_MS = 15000;
 
   /**
    * Validates a message identifier is a safe, bounded string.
@@ -120,15 +121,44 @@
       // Concurrency control: only one outgoing PUT transfer at a time
       this._putQueue = [];
       this._isSendingPut = false;
+      this._ackingCount = 0;
 
-      // Track in-flight PUT requests to avoid redundant GETs and reject unsolicited PUTs
-      this._inFlightGets = new Set();
+      // Track in-flight PUT requests (id -> timestampMs) to avoid redundant GETs, expire stale GETs, and reject unsolicited PUTs
+      this._inFlightGets = new Map();
+
+      // Track message IDs currently being committed in acceptMessage() to prevent overlapping imports and premature "In Sync" status
+      this._acceptingIds = new Set();
 
       // Track message IDs offered to the peer so only offered IDs can be acknowledged
       this._offeredIds = new Set();
 
       // Track per-ID acceptance failures in this session to prevent poison-pill retry loops
       this._failedAttempts = new Map();
+    }
+
+    /**
+     * Prune expired in-flight GET reservations so transiently missing/failed sender PUTs can be retried.
+     */
+    _pruneExpiredGets() {
+      const now = Date.now();
+      for (const [id, ts] of this._inFlightGets.entries()) {
+        if (now - ts >= GET_TIMEOUT_MS) {
+          this._inFlightGets.delete(id);
+        }
+      }
+    }
+
+    /**
+     * Returns true if a GET request for id is currently active and has not expired.
+     */
+    _isGetInFlight(id) {
+      if (!this._inFlightGets.has(id)) return false;
+      const ts = this._inFlightGets.get(id);
+      if (Date.now() - ts >= GET_TIMEOUT_MS) {
+        this._inFlightGets.delete(id);
+        return false;
+      }
+      return true;
     }
 
     /**
@@ -152,12 +182,15 @@
      * Broadcast real-time synchronization status (transfers ongoing vs complete sync).
      */
     _notifySyncStatus(detail = '') {
-      const isSyncing = this._isSendingPut || this._putQueue.length > 0 || this._inFlightGets.size > 0;
+      this._pruneExpiredGets();
+      const pendingOutgoing = this._putQueue.length + (this._isSendingPut ? 1 : 0) + this._ackingCount;
+      const pendingIncoming = this._inFlightGets.size + this._acceptingIds.size;
+      const isSyncing = pendingOutgoing > 0 || pendingIncoming > 0;
       const info = {
         isSyncing: isSyncing,
         state: this.state,
-        pendingOutgoing: this._putQueue.length + (this._isSendingPut ? 1 : 0),
-        pendingIncoming: this._inFlightGets.size,
+        pendingOutgoing: pendingOutgoing,
+        pendingIncoming: pendingIncoming,
         detail: detail || (isSyncing ? 'Synchronizing...' : (this.state === 'connected' ? 'In sync' : ''))
       };
       try {
@@ -171,12 +204,15 @@
      * Get snapshot of current synchronization status.
      */
     getSyncStatus() {
-      const isSyncing = this._isSendingPut || this._putQueue.length > 0 || this._inFlightGets.size > 0;
+      this._pruneExpiredGets();
+      const pendingOutgoing = this._putQueue.length + (this._isSendingPut ? 1 : 0) + this._ackingCount;
+      const pendingIncoming = this._inFlightGets.size + this._acceptingIds.size;
+      const isSyncing = pendingOutgoing > 0 || pendingIncoming > 0;
       return {
         isSyncing: isSyncing,
         state: this.state,
-        pendingOutgoing: this._putQueue.length + (this._isSendingPut ? 1 : 0),
-        pendingIncoming: this._inFlightGets.size
+        pendingOutgoing: pendingOutgoing,
+        pendingIncoming: pendingIncoming
       };
     }
 
@@ -250,7 +286,9 @@
       this._peerOfferedOnce = false;
       this._putQueue = [];
       this._isSendingPut = false;
+      this._ackingCount = 0;
       this._inFlightGets.clear();
+      this._acceptingIds.clear();
       this._offeredIds.clear();
       this._failedAttempts.clear();
       this._setState('disconnected');
@@ -321,7 +359,7 @@
         }
         if (data.type === 'READY') {
           this.log('info', 'Received READY from embedded peer');
-          // If embedded peer reloaded or restarted, reset port and re-initiate handshake
+          // If embedded peer reloaded or restarted, reset port and per-channel transfer state
           if (this.port) {
             try {
               this.port.close();
@@ -329,6 +367,10 @@
             this.port = null;
           }
           this._peerOfferedOnce = false;
+          this._putQueue = [];
+          this._isSendingPut = false;
+          this._inFlightGets.clear();
+          this._offeredIds.clear();
           this._setState('handshaking', 'Peer sent READY; re-establishing channel');
           this._initiateHostHandshake(event.origin);
         }
@@ -341,6 +383,16 @@
             clearInterval(this._readyInterval);
             this._readyInterval = null;
           }
+          if (this.port) {
+            try {
+              this.port.close();
+            } catch (e) {}
+          }
+          this._peerOfferedOnce = false;
+          this._putQueue = [];
+          this._isSendingPut = false;
+          this._inFlightGets.clear();
+          this._offeredIds.clear();
           this.port = event.ports[0];
           this.port.onmessage = this._portListener;
           this.log('info', 'Received MessagePort from host application');
@@ -488,6 +540,8 @@
 
       if (offeredIds.length === 0) return;
 
+      this._pruneExpiredGets();
+
       const alreadyAccepted = [];
       const repeatedReceipts = Object.create(null);
       const toFetch = [];
@@ -508,8 +562,8 @@
             this.log('warn', `Skipping automatic GET for message ${id} after ${failCount} failed acceptance attempts in this session`);
             continue;
           }
-          // If not currently in-flight
-          if (!this._inFlightGets.has(id)) {
+          // If not currently in-flight or being committed by acceptMessage
+          if (!this._isGetInFlight(id) && !this._acceptingIds.has(id)) {
             toFetch.push(id);
           }
         }
@@ -533,8 +587,9 @@
       // Rule 2: Receiver-controlled transfer
       // Request only messages that have not been accepted yet
       if (toFetch.length > 0) {
+        const now = Date.now();
         for (const id of toFetch) {
-          this._inFlightGets.add(id);
+          this._inFlightGets.set(id, now);
         }
         this._notifySyncStatus(`Requesting ${toFetch.length} unaccepted message(s)...`);
         this.log('info', `Requesting unaccepted message(s) via GET`, toFetch);
@@ -649,11 +704,12 @@
      */
     async _handlePut(put) {
       const id = put.id;
-      if (!isValidMessageId(id) || !this._inFlightGets.has(id)) {
-        this.log('warn', `Ignored unsolicited or invalid PUT for message ${id} (not requested via GET)`);
+      if (!isValidMessageId(id) || !this._inFlightGets.has(id) || this._acceptingIds.has(id)) {
+        this.log('warn', `Ignored unsolicited or duplicate in-flight PUT for message ${id}`);
         return;
       }
       this._inFlightGets.delete(id);
+      this._acceptingIds.add(id);
 
       const attachments = Array.isArray(put.attachments) ? put.attachments : [];
       this._notifySyncStatus(`Receiving message ${id} (${attachments.length} attachment(s))...`);
@@ -668,31 +724,30 @@
         attachmentCount: attachments.length
       });
 
-      // Duplicate check: if already accepted, send ACK again and do not import twice
-      const alreadyAccepted = await this.storage.isAccepted(id);
-      if (alreadyAccepted) {
-        this.log('info', `Message ${id} already accepted; sending ACK without re-importing`);
-        const receipts = Object.create(null);
-        if (typeof alreadyAccepted === 'string' && alreadyAccepted.length > 0) {
-          receipts[id] = alreadyAccepted;
-        } else if (typeof alreadyAccepted === 'object' && alreadyAccepted.ackReceipt) {
-          receipts[id] = alreadyAccepted.ackReceipt;
-        }
-        const ackMsg = {
-          protocol: PROTOCOL_NAME,
-          version: PROTOCOL_VERSION,
-          type: 'ACK',
-          ids: [id],
-          receipts: receipts
-        };
-        this._sendToPort(ackMsg);
-        this.onTransfer({ direction: 'outgoing', type: 'ACK', ids: [id], repeated: true });
-        this._notifySyncStatus();
-        return;
-      }
-
-      // Rule 3 & 4: Attempt atomic acceptance
       try {
+        // Duplicate check: if already accepted, send ACK again and do not import twice
+        const alreadyAccepted = await this.storage.isAccepted(id);
+        if (alreadyAccepted) {
+          this.log('info', `Message ${id} already accepted; sending ACK without re-importing`);
+          const receipts = Object.create(null);
+          if (typeof alreadyAccepted === 'string' && alreadyAccepted.length > 0) {
+            receipts[id] = alreadyAccepted;
+          } else if (typeof alreadyAccepted === 'object' && alreadyAccepted.ackReceipt) {
+            receipts[id] = alreadyAccepted.ackReceipt;
+          }
+          const ackMsg = {
+            protocol: PROTOCOL_NAME,
+            version: PROTOCOL_VERSION,
+            type: 'ACK',
+            ids: [id],
+            receipts: receipts
+          };
+          this._sendToPort(ackMsg);
+          this.onTransfer({ direction: 'outgoing', type: 'ACK', ids: [id], repeated: true });
+          return;
+        }
+
+        // Rule 3 & 4: Attempt atomic acceptance
         const result = await this.storage.acceptMessage({
           id: put.id,
           payload: (put.payload !== undefined && put.payload !== null) ? put.payload : {},
@@ -730,6 +785,7 @@
         this.log('error', `Failed to accept message ${id} (attempt ${fails}/${MAX_AUTO_RETRIES}): ${err.message}; NO ACK sent`);
         this.onError(err);
       } finally {
+        this._acceptingIds.delete(id);
         this._notifySyncStatus();
       }
     }
@@ -762,6 +818,8 @@
         }
       }
 
+      this._ackingCount++;
+      this._notifySyncStatus(`Acknowledging ${validIds.length} message(s)...`);
       try {
         await this.storage.onAcknowledged(validIds, receipts);
         for (const id of validIds) {
@@ -772,6 +830,7 @@
         this.log('error', 'Error processing ACK in local storage', err.message);
         this.onError(err);
       } finally {
+        this._ackingCount = Math.max(0, this._ackingCount - 1);
         this._notifySyncStatus();
       }
     }

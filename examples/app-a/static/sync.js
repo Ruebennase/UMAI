@@ -109,7 +109,7 @@
 
         return {
           id: meta.id,
-          payload: meta.payload || {},
+          payload: (meta.payload !== undefined && meta.payload !== null) ? meta.payload : {},
           attachments: files,
           signature: meta.signature || ''
         };
@@ -128,7 +128,8 @@
       async acceptMessage(msg) {
         const formData = new FormData();
         formData.append('id', msg.id);
-        formData.append('payload', JSON.stringify(msg.payload || {}));
+        const safePayload = (msg.payload !== undefined && msg.payload !== null) ? msg.payload : {};
+        formData.append('payload', JSON.stringify(safePayload));
         if (msg.signature) {
           formData.append('signature', msg.signature);
         }

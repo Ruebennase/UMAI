@@ -225,6 +225,77 @@ function createMockChannel() {
 
   console.log('✓ Test 4: Poison-pill retry backoff and manual reconcile reset passed');
 
+  // Test 5: Concurrent OFFER deduplication while acceptMessage is pending (F4),
+  // accurate getSyncStatus().isSyncing during acceptMessage (F8), and READY reload / expired GET recovery (F3)
+  let acceptCallsForSlowMsg = 0;
+  let releaseAcceptPromise = null;
+  let slowMsgAccepted = false;
+  const slowChannel = createMockChannel();
+
+  const senderSlow = new UmaiSession({
+    peerOrigin: 'http://peer.example',
+    role: 'host',
+    storage: {
+      getOutboxIds: async () => ['msg-slow-1'],
+      getMessage: async (id) => ({ id, payload: false, attachments: [] }),
+      isAccepted: async () => false,
+      acceptMessage: async () => true,
+      onAcknowledged: async () => {}
+    }
+  });
+
+  const receiverSlow = new UmaiSession({
+    peerOrigin: 'http://host.example',
+    role: 'embedded',
+    storage: {
+      getOutboxIds: async () => [],
+      getMessage: async () => null,
+      isAccepted: async () => slowMsgAccepted,
+      acceptMessage: async (msg) => {
+        acceptCallsForSlowMsg++;
+        assert.strictEqual(msg.payload, false, 'Falsy scalar payload (false) must be preserved');
+        await new Promise((resolve) => {
+          releaseAcceptPromise = resolve;
+        });
+        slowMsgAccepted = true;
+        return 'receipt-slow-1';
+      },
+      onAcknowledged: async () => {}
+    }
+  });
+
+  senderSlow.port = slowChannel.port1;
+  slowChannel.port1.onmessage = senderSlow._portListener;
+  senderSlow.state = 'connected';
+  receiverSlow.port = slowChannel.port2;
+  slowChannel.port2.onmessage = receiverSlow._portListener;
+  receiverSlow.state = 'connected';
+
+  // Trigger initial OFFER -> GET -> PUT, which pauses inside receiverSlow's acceptMessage
+  await senderSlow.reconcile(false);
+  await new Promise(r => setTimeout(r, 30));
+  assert.strictEqual(acceptCallsForSlowMsg, 1, 'First PUT should have entered acceptMessage');
+  assert.strictEqual(receiverSlow.getSyncStatus().isSyncing, true, 'isSyncing must remain true while acceptMessage is still running (F8)');
+  assert.strictEqual(receiverSlow.getSyncStatus().pendingIncoming, 1, 'pendingIncoming must be 1 while acceptMessage is still running');
+
+  // While acceptMessage is still running, another OFFER arrives — must NOT trigger a second GET or second acceptMessage (F4)
+  await senderSlow.reconcile(false);
+  await new Promise(r => setTimeout(r, 30));
+  assert.strictEqual(acceptCallsForSlowMsg, 1, 'Concurrent OFFER while acceptMessage is in-flight must not trigger duplicate acceptMessage (F4)');
+
+  // Complete acceptMessage
+  releaseAcceptPromise();
+  await new Promise(r => setTimeout(r, 30));
+  assert.strictEqual(receiverSlow.getSyncStatus().isSyncing, false, 'isSyncing must become false after acceptMessage finishes');
+
+  // Verify expired GET reservation recovery (F3): if an ID is in _inFlightGets with an expired timestamp, next OFFER re-requests it
+  receiverSlow._inFlightGets.set('msg-expired-get', Date.now() - 20000);
+  assert.strictEqual(receiverSlow._isGetInFlight('msg-expired-get'), false, 'Expired GET reservation must be pruned and allow retry (F3)');
+
+  senderSlow.stop();
+  receiverSlow.stop();
+  console.log('✓ Test 5: Concurrent acceptMessage deduplication (F4), sync status accuracy (F8), falsy payload (F6), and GET expiry (F3) passed');
+
   senderPoison.stop();
   receiverPoison.stop();
   secSession.stop();

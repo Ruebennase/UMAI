@@ -458,7 +458,8 @@
       async acceptMessage(putMsg) {
         const formData = new FormData();
         formData.append('id', putMsg.id);
-        formData.append('payload', JSON.stringify(putMsg.payload || {}));
+        const safePayload = (putMsg.payload !== undefined && putMsg.payload !== null) ? putMsg.payload : {};
+        formData.append('payload', JSON.stringify(safePayload));
         if (putMsg.signature) {
           formData.append('signature', putMsg.signature);
         }

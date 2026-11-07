@@ -58,20 +58,21 @@ type Message struct {
 
 // Storage manages local documents, outbox snapshots, inbox messages and accepted IDs.
 type Storage struct {
-	mu            sync.RWMutex
-	dataDir       string
-	docsDir       string
-	outboxDir     string
-	inboxDir      string
-	acceptedFile  string
-	maxUploadSize int64
-	acceptedIDs   map[string]bool
-	inFlightUntil map[string]time.Time
-	role          string
-	peerRole      string
-	ownPubKey     ed25519.PublicKey
-	ownPrivKey    ed25519.PrivateKey
-	peerPubKey    ed25519.PublicKey
+	mu               sync.RWMutex
+	dataDir          string
+	docsDir          string
+	outboxDir        string
+	inboxDir         string
+	acceptedFile     string
+	maxUploadSize    int64
+	acceptedIDs      map[string]bool
+	acceptedReceipts map[string]string
+	inFlightUntil    map[string]time.Time
+	role             string
+	peerRole         string
+	ownPubKey        ed25519.PublicKey
+	ownPrivKey       ed25519.PrivateKey
+	peerPubKey       ed25519.PublicKey
 }
 
 // NewStorage initializes storage directories and loads accepted message IDs.
@@ -93,14 +94,15 @@ func NewStorage(dataDir string, maxUploadSize int64) (*Storage, error) {
 	}
 
 	s := &Storage{
-		dataDir:       absDataDir,
-		docsDir:       docsDir,
-		outboxDir:     outboxDir,
-		inboxDir:      inboxDir,
-		acceptedFile:  acceptedFile,
-		maxUploadSize: maxUploadSize,
-		acceptedIDs:   make(map[string]bool),
-		inFlightUntil: make(map[string]time.Time),
+		dataDir:          absDataDir,
+		docsDir:          docsDir,
+		outboxDir:        outboxDir,
+		inboxDir:         inboxDir,
+		acceptedFile:     acceptedFile,
+		maxUploadSize:    maxUploadSize,
+		acceptedIDs:      make(map[string]bool),
+		acceptedReceipts: make(map[string]string),
+		inFlightUntil:    make(map[string]time.Time),
 	}
 
 	if err := s.loadAcceptedIDs(); err != nil {
@@ -629,13 +631,17 @@ func (s *Storage) ListAccepted() []string {
 	return ids
 }
 
-// ListAcceptedReceipts returns a map of accepted message ID -> cryptographic ACK receipt.
+// ListAcceptedReceipts returns a map of accepted message ID -> cryptographic ACK receipt from the in-memory cache.
 func (s *Storage) ListAcceptedReceipts() map[string]string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
 	receipts := make(map[string]string, len(s.acceptedIDs))
 	for id := range s.acceptedIDs {
+		if r, ok := s.acceptedReceipts[id]; ok {
+			receipts[id] = r
+			continue
+		}
 		msgFile := filepath.Join(s.inboxDir, id, "message.json")
 		if data, err := os.ReadFile(msgFile); err == nil {
 			var m Message
@@ -865,7 +871,17 @@ func (s *Storage) acceptMessageInternal(id string, payload any, attachments []At
 	}
 
 	targetDir := filepath.Join(s.inboxDir, cleanID)
-	// If targetDir somehow exists from aborted prior run, remove it
+	// Never overwrite an already-committed message.json directory; only remove incomplete remnants without message.json
+	if existingBytes, err := os.ReadFile(filepath.Join(targetDir, "message.json")); err == nil {
+		var existing Message
+		if json.Unmarshal(existingBytes, &existing) == nil && existing.ID == cleanID {
+			_ = os.RemoveAll(tmpDir)
+			s.acceptedIDs[cleanID] = true
+			s.acceptedReceipts[cleanID] = existing.AckReceipt
+			_ = s.persistAcceptedIDsLocked()
+			return &existing, nil
+		}
+	}
 	_ = os.RemoveAll(targetDir)
 
 	if err := os.Rename(tmpDir, targetDir); err != nil {
@@ -875,9 +891,11 @@ func (s *Storage) acceptMessageInternal(id string, payload any, attachments []At
 
 	// Mark accepted and write accepted.json atomically
 	s.acceptedIDs[cleanID] = true
+	s.acceptedReceipts[cleanID] = ackReceipt
 	if err := s.persistAcceptedIDsLocked(); err != nil {
 		// Rollback if persisting accepted IDs fails
 		delete(s.acceptedIDs, cleanID)
+		delete(s.acceptedReceipts, cleanID)
 		_ = os.RemoveAll(targetDir)
 		return nil, fmt.Errorf("persisting accepted ID: %w", err)
 	}
@@ -939,6 +957,7 @@ func (s *Storage) loadAcceptedIDs() error {
 			}
 			var msg Message
 			if err := json.Unmarshal(msgBytes, &msg); err == nil && msg.ID == cleanID {
+				s.acceptedReceipts[cleanID] = msg.AckReceipt
 				if !s.acceptedIDs[cleanID] {
 					s.acceptedIDs[cleanID] = true
 					reconciled = true

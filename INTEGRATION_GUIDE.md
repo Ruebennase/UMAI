@@ -145,11 +145,15 @@ If Application A (`https://app-a.company.com`) is embedded inside Application B 
    ```
 
 #### B. Include `umai.js` and Initialize the Session
-In Application A's web page:
+In Application A's web page (preferably placing the initialization script in an external `.js` file such as `/js/app-a-umai.js` so you can enforce a strict `script-src 'self'` Content-Security-Policy without `'unsafe-inline'`):
 
 ```html
 <script src="/js/umai.js"></script>
-<script>
+<script src="/js/app-a-umai.js"></script>
+```
+
+```javascript
+// /js/app-a-umai.js
   // 1. Implement the 5 storage methods connecting to your existing backend.
   //    (Supports both signed/receipt-verified servers like pkg/umaiserver and minimal unsigned endpoints.)
   const storage = {
@@ -221,7 +225,6 @@ In Application A's web page:
   });
 
   umai.start();
-</script>
 ```
 
 ---
@@ -237,12 +240,12 @@ Content-Security-Policy: frame-ancestors 'none'; frame-src 'self' https://app-a.
 #### B. Add the Iframe in Your HTML
 ```html
 <iframe id="legacy-app-frame" src="https://app-a.company.com/embedded-view" style="width: 100%; height: 600px; border: 1px solid #ccc;"></iframe>
+<script src="/js/umai.js"></script>
+<script src="/js/app-b-umai.js"></script>
 ```
 
-#### C. Initialize `UmaiSession` as Host
-```html
-<script src="/js/umai.js"></script>
-<script>
+#### C. Initialize `UmaiSession` as Host (`/js/app-b-umai.js`)
+```javascript
   const iframeElement = document.getElementById('legacy-app-frame');
 
   // Implement the same 5-method storage adapter for App B
@@ -251,7 +254,7 @@ Content-Security-Policy: frame-ancestors 'none'; frame-src 'self' https://app-a.
     async getMessage(id) { /* ... */ },
     async isAccepted(id) { /* ... */ },
     async acceptMessage(msg) { /* ... */ },
-    async onAcknowledged(ids) { /* ... */ }
+    async onAcknowledged(ids, receipts) { /* ... */ }
   };
 
   const umai = new UMAI.UmaiSession({
@@ -268,7 +271,6 @@ Content-Security-Policy: frame-ancestors 'none'; frame-src 'self' https://app-a.
   iframeElement.addEventListener('load', () => {
     umai.start();
   });
-</script>
 ```
 
 ---
