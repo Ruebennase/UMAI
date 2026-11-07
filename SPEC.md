@@ -72,6 +72,19 @@ When communication between peers is established or restored, both peers exchange
 #### Rule 8 — User Mediation & Bounded Execution
 Transfers occur exclusively while an active browser session connects both applications. Closing the browser tab pauses the transport immediately. Subsequent sessions resume reconciliation naturally via Rule 7.
 
+### 3.3 Separation of Technical Acceptance (`ACK`) from Business Classification & Legal Delivery
+
+UMAI strictly separates **transport-level technical acceptance** from **application-specific business processing**:
+
+1. **Durable Technical Acceptance (`ACK`):**
+   - Issuing an `ACK` (Rule 4) signifies solely that the receiving application has verified the technical integrity of the message (complete payload and attachments, plus optional cryptographic signature verification) and durably persisted it into an incoming staging store or **"Unassigned Incoming Tray"** alongside its Message ID in the Accepted Set.
+2. **Deferred Business Classification:**
+   - UMAI does **not** decide which business case, dossier, workflow, or category an incoming message belongs to, nor whether a user must supply additional business metadata.
+   - Receiving applications SHOULD accept valid incoming messages into a durable incoming tray first (returning `ACK` immediately so the sender can clean up its outbox) and allow the user or downstream application logic to classify, route, or reject the business record asynchronously afterward.
+   - Rejecting `acceptMessage()` due to missing interactive business context or downstream domain rules MUST be avoided, as it causes the transport layer to treat the transfer as a technical failure.
+3. **Distinction from Legal or Statutory Delivery Receipts:**
+   - A UMAI `ACK` (and its optional cryptographic `ack_receipt`) is a **technical transport confirmation** proving that the receiving system's storage layer accepted the bytes. It MUST NOT be conflated with a legally effective submission confirmation or statutory delivery receipt unless the application layer explicitly exchanges a separate, domain-level receipt message for that purpose.
+
 ---
 
 ## 4. Wire Format & Protocol Envelopes
@@ -147,26 +160,29 @@ interface UmaiEnvelope {
 The browser transport binding maps UMAI messages onto standard browser primitives:
 - `window.postMessage`
 - `MessageChannel` / `MessagePort`
-- HTML `<iframe>`
+- Cross-window references: HTML `<iframe>` (`iframe.contentWindow` / `window.parent`) **or** Top-Level Companion/Popup Windows (`window.open` / `window.opener`)
 - Structured Clone Algorithm
 
 ### 5.1 Handshake & Point-to-Point Channel Establishment
 
-To ensure strict origin isolation and prevent unauthorized snooping:
-1. **Topology:** Application B (Host) embeds Application A (Peer) within an `<iframe>`.
-2. **Readiness Signal:** Once loaded and authenticated, the embedded peer announces readiness to the parent window:
+The core `OFFER` / `GET` / `PUT` / `ACK` protocol operates strictly over a dedicated `MessagePort` and is independent of whether the peer window is embedded in an `<iframe>` or opened as a top-level browser window:
+
+1. **Supported Window Topologies:**
+   - **Embedded `<iframe>` Topology (Primary):** Application B (Host) embeds a lightweight sync page of Application A (`embedded` role) within an `<iframe>`. Here, the host targets `iframe.contentWindow` and the embedded peer targets `window.parent`.
+   - **Top-Level Companion / Popup Window Topology (Zero-Third-Party-Cookie Fallback):** Application B (Host) opens Application A (`embedded`/companion role) in a top-level window via `const peerWin = window.open(url, ...)` (or attaches to an existing opener relationship). Here, the host passes `peerWindow: peerWin` and the companion window targets `window.opener`. Because both applications run as top-level first-party windows, this topology operates without any reliance on third-party or partitioned cookies.
+2. **Readiness Signal:** Once loaded and authenticated, the peer window (`embedded` role) announces readiness to its host window (`window.parent` or `window.opener`):
    ```javascript
-   window.parent.postMessage({ protocol: "UMAI", version: 1, type: "READY" }, peerOrigin);
+   targetHostWindow.postMessage({ protocol: "UMAI", version: 1, type: "READY" }, peerOrigin);
    ```
-3. **Port Transfer:** The host validates `event.origin === peerOrigin`, instantiates a `MessageChannel`, retains `port1`, and transfers `port2` to the embedded window:
+3. **Port Transfer:** The host validates `event.origin === peerOrigin` (and verifies `event.source` matches the expected `iframe.contentWindow` or `peerWindow`), instantiates a `MessageChannel`, retains `port1`, and transfers `port2` to the peer window:
    ```javascript
-   iframe.contentWindow.postMessage(
+   targetPeerWindow.postMessage(
      { protocol: "UMAI", version: 1, type: "INIT" },
      peerOrigin,
      [channel.port2]
    );
    ```
-4. **Port Confirmation:** The embedded peer verifies `event.origin === peerOrigin`, claims `event.ports[0]`, and sends `INIT_ACK` over the private port.
+4. **Port Confirmation:** The peer window verifies `event.origin === peerOrigin` and `event.source`, claims `event.ports[0]`, and sends `INIT_ACK` over the private port.
 5. **Private Point-to-Point Channel:** All subsequent protocol messages (`OFFER`, `GET`, `PUT`, `ACK`) travel exclusively over the dedicated `MessagePort`.
 
 ### 5.2 Concurrency & Transfer Ordering

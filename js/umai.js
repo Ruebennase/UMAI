@@ -82,7 +82,8 @@
      * @param {Object} options
      * @param {string} options.peerOrigin Expected origin of the remote application (e.g. 'http://127.0.0.1:8081')
      * @param {string} [options.role] 'host' or 'embedded' (auto-detected if omitted)
-     * @param {HTMLIFrameElement} [options.iframe] The iframe element (required for 'host' role)
+     * @param {HTMLIFrameElement} [options.iframe] The iframe element (for 'host' role when using iframe embedding)
+     * @param {Window} [options.peerWindow] Optional direct Window reference (e.g. popup from window.open or window.opener)
      * @param {Object} options.storage Handlers for reading/writing local messages:
      *   - getOutboxIds(): Promise<string[]>
      *   - getMessage(id): Promise<{ id: string, payload: any, attachments: File[] }>
@@ -111,7 +112,9 @@
       this.onTransfer = options.onTransfer || (() => {});
 
       this.iframe = options.iframe || null;
-      this.role = options.role || (typeof window !== 'undefined' && window.parent !== window ? 'embedded' : 'host');
+      this.peerWindow = options.peerWindow || null;
+      const isChildContext = typeof window !== 'undefined' && ((window.parent && window.parent !== window) || !!window.opener);
+      this.role = options.role || (isChildContext && !this.iframe && !this.peerWindow ? 'embedded' : 'host');
 
       this.port = null;
       this.state = 'disconnected'; // 'disconnected' | 'handshaking' | 'connected'
@@ -134,6 +137,39 @@
 
       // Track per-ID acceptance failures in this session to prevent poison-pill retry loops
       this._failedAttempts = new Map();
+    }
+
+    /**
+     * Resolves the target Window for handshake messages (supports both iframe and top-level popup/opener windows).
+     */
+    _getTargetWindow() {
+      if (this.peerWindow && !this.peerWindow.closed) {
+        return this.peerWindow;
+      }
+      if (this.role === 'host') {
+        return (this.iframe && this.iframe.contentWindow) ? this.iframe.contentWindow : null;
+      }
+      if (typeof window !== 'undefined') {
+        if (window.parent && window.parent !== window) {
+          return window.parent;
+        }
+        if (window.opener && !window.opener.closed) {
+          return window.opener;
+        }
+      }
+      return null;
+    }
+
+    /**
+     * Dynamically bind or update a peer Window reference (e.g., after opening a top-level companion popup via window.open)
+     * and initiate the handshake.
+     * @param {Window} win
+     */
+    setPeerWindow(win) {
+      this.peerWindow = win || null;
+      if (this.role === 'host' && this.peerWindow && !this.peerWindow.closed) {
+        this._initiateHostHandshake();
+      }
     }
 
     /**
@@ -252,8 +288,8 @@
           }, 1000);
         }
       } else {
-        // Host role: if iframe is already loaded, we can initiate
-        if (this.iframe && this.iframe.contentWindow) {
+        // Host role: if target window (iframe or popup) is already available, we can initiate
+        if (this._getTargetWindow()) {
           this._initiateHostHandshake();
         }
       }
@@ -295,12 +331,13 @@
     }
 
     /**
-     * Send READY signal from embedded window to parent.
+     * Send READY signal from embedded/popup window to host (parent or opener).
      */
     _sendReadySignal() {
-      if (window.parent && window.parent !== window) {
+      const targetWin = this._getTargetWindow();
+      if (targetWin && (typeof window === 'undefined' || targetWin !== window)) {
         try {
-          window.parent.postMessage(
+          targetWin.postMessage(
             { protocol: PROTOCOL_NAME, version: PROTOCOL_VERSION, type: 'READY' },
             this.peerOrigin
           );
@@ -311,11 +348,12 @@
     }
 
     /**
-     * Host initializes MessageChannel and posts port2 to embedded iframe.
+     * Host initializes MessageChannel and posts port2 to peer window (iframe or popup).
      */
     _initiateHostHandshake(targetOrigin = null) {
-      if (!this.iframe || !this.iframe.contentWindow) {
-        this.log('warn', 'Cannot initiate handshake: iframe or contentWindow missing');
+      const targetWin = this._getTargetWindow();
+      if (!targetWin) {
+        this.log('warn', 'Cannot initiate handshake: target window (iframe or peerWindow) missing');
         return;
       }
 
@@ -326,13 +364,13 @@
         this.port = channel.port1;
         this.port.onmessage = this._portListener;
 
-        this.iframe.contentWindow.postMessage(
+        targetWin.postMessage(
           { protocol: PROTOCOL_NAME, version: PROTOCOL_VERSION, type: 'INIT' },
           destOrigin,
           [channel.port2]
         );
 
-        this.log('info', `Sent INIT and MessagePort to embedded application (${destOrigin})`);
+        this.log('info', `Sent INIT and MessagePort to peer application (${destOrigin})`);
       } catch (err) {
         this.log('error', 'Error creating MessageChannel/sending port', err.message);
         this.onError(err);
@@ -353,13 +391,18 @@
         return;
       }
 
+      const expectedSource = this._getTargetWindow();
+
       if (this.role === 'host') {
-        if (this.iframe && this.iframe.contentWindow && event.source && event.source !== this.iframe.contentWindow) {
+        if (expectedSource && event.source && event.source !== expectedSource) {
           return;
         }
         if (data.type === 'READY') {
-          this.log('info', 'Received READY from embedded peer');
-          // If embedded peer reloaded or restarted, reset port and per-channel transfer state
+          if (!this.peerWindow && !this.iframe && event.source) {
+            this.peerWindow = event.source;
+          }
+          this.log('info', 'Received READY from peer');
+          // If peer reloaded or restarted, reset port and per-channel transfer state
           if (this.port) {
             try {
               this.port.close();
@@ -375,7 +418,7 @@
           this._initiateHostHandshake(event.origin);
         }
       } else if (this.role === 'embedded') {
-        if (typeof window !== 'undefined' && window.parent && event.source && event.source !== window.parent) {
+        if (expectedSource && event.source && event.source !== expectedSource) {
           return;
         }
         if (data.type === 'INIT' && event.ports && event.ports.length > 0) {

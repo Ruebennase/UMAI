@@ -8,6 +8,7 @@
   const syncDetail = document.getElementById('sync-detail');
   const loginForm = document.getElementById('sync-login-form');
   const loginError = document.getElementById('sync-login-error');
+  const btnPopupAuth = document.getElementById('btn-popup-auth');
 
   let peerOrigin = '';
   let umaiSession = null;
@@ -210,6 +211,94 @@
       loginError.style.display = 'block';
     }
   });
+
+  // Top-level authentication with ephemeral WebCrypto Proof-of-Possession (ECDSA P-256) session bootstrap.
+  // Designed for Federated Identity Providers (OIDC / SAML / eID) that forbid iframe framing (X-Frame-Options: DENY)
+  // and browsers where third-party cookies/storage are partitioned across top-level sites.
+  function bytesToHex(bytes) {
+    return Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
+  }
+
+  let activeBootstrapPoll = null;
+
+  if (btnPopupAuth) {
+    btnPopupAuth.addEventListener('click', async function () {
+      loginError.style.display = 'none';
+      if (!window.crypto || !window.crypto.subtle) {
+        window.open('/', '_blank');
+        return;
+      }
+
+      try {
+        // 1. Generate a non-extractable ephemeral ECDSA P-256 key pair inside the iframe
+        const keyPair = await window.crypto.subtle.generateKey(
+          { name: 'ECDSA', namedCurve: 'P-256' },
+          false,
+          ['sign', 'verify']
+        );
+        const rawPub = new Uint8Array(await window.crypto.subtle.exportKey('raw', keyPair.publicKey));
+        const pubHex = bytesToHex(rawPub);
+
+        // 2. Register pending bootstrap transaction with App A's backend
+        const initRes = await fetch('/api/auth/bootstrap/init', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'X-UMAI-CSRF': '1' },
+          credentials: 'include',
+          body: JSON.stringify({ public_key: pubHex })
+        });
+        if (!initRes.ok) {
+          throw new Error('Failed to initialize auth bootstrap transaction');
+        }
+        const tx = await initRes.json();
+
+        // 3. Pre-compute the iframe's Proof-of-Possession signature over UMAI-BOOTSTRAP-V1:<tx_id>:<challenge>
+        const challengeBytes = new TextEncoder().encode(`UMAI-BOOTSTRAP-V1:${tx.tx_id}:${tx.challenge}`);
+        const sigBuf = await window.crypto.subtle.sign(
+          { name: 'ECDSA', hash: 'SHA-256' },
+          keyPair.privateKey,
+          challengeBytes
+        );
+        const sigHex = bytesToHex(new Uint8Array(sigBuf));
+
+        // 4. Open top-level authentication window on App A bound to tx_id and opener_nonce
+        const popupUrl = `/?auth_tx=${encodeURIComponent(tx.tx_id)}&opener_nonce=${encodeURIComponent(tx.opener_nonce)}`;
+        window.open(popupUrl, 'umai_top_level_auth', 'popup,width=520,height=640');
+
+        // 5. Poll /api/auth/bootstrap/redeem until the top-level window authorizes tx_id, then establish Partitioned iframe session
+        if (activeBootstrapPoll) clearInterval(activeBootstrapPoll);
+        let attempts = 0;
+        activeBootstrapPoll = setInterval(async () => {
+          attempts++;
+          if (attempts > 120) {
+            clearInterval(activeBootstrapPoll);
+            activeBootstrapPoll = null;
+            return;
+          }
+          try {
+            const redeemRes = await fetch('/api/auth/bootstrap/redeem', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json', 'X-UMAI-CSRF': '1' },
+              credentials: 'include',
+              body: JSON.stringify({ tx_id: tx.tx_id, signature: sigHex })
+            });
+            if (redeemRes.status === 202) {
+              return; // Still awaiting top-level user authentication
+            }
+            clearInterval(activeBootstrapPoll);
+            activeBootstrapPoll = null;
+            if (redeemRes.ok) {
+              startSyncWorker();
+            }
+          } catch (e) {
+            // ignore transient poll error
+          }
+        }, 1000);
+      } catch (err) {
+        loginError.textContent = err.message || 'Top-level bootstrap failed';
+        loginError.style.display = 'block';
+      }
+    });
+  }
 
   // Listen for parent control messages and cross-tab storage events
   window.addEventListener('message', function (e) {

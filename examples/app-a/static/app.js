@@ -107,7 +107,35 @@
     appContainer.style.display = 'none';
   }
 
-  function showApp() {
+  async function completePendingBootstrapIfPresent() {
+    const params = new URLSearchParams(window.location.search);
+    const txId = params.get('auth_tx');
+    const openerNonce = params.get('opener_nonce');
+    if (!txId || !openerNonce) return false;
+
+    try {
+      const res = await api('/api/auth/bootstrap/authorize', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ tx_id: txId, opener_nonce: openerNonce })
+      });
+      if (res.ok) {
+        window.history.replaceState({}, document.title, window.location.pathname);
+        if (window.opener) {
+          window.close();
+          return true;
+        }
+      }
+    } catch (e) {
+      // ignore bootstrap error and continue to normal app view
+    }
+    return false;
+  }
+
+  async function showApp() {
+    if (await completePendingBootstrapIfPresent()) {
+      return;
+    }
     authContainer.style.display = 'none';
     appContainer.style.display = 'block';
     initApp();

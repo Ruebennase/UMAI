@@ -40,13 +40,29 @@ To keep the protocol minimal and adaptable, UMAI cleanly separates **what the pr
 
 ## 2. The Problem It Solves
 
-Modern organizations frequently use separate, siloed web applications (e.g. an ERP on Domain A and a Document Management or Billing System on Domain B). Traditionally, integrating them requires:
-- Complex server-to-server REST / gRPC pipelines.
-- Direct firewall openings and VPN tunnels between VPCs.
-- Shared API keys, mutual TLS certificates, and service accounts.
-- Heavy middleware (RabbitMQ, Kafka, Zapier).
+### The Economic & Workflow Motivation: Eliminating the Mechanical Download/Upload Loop
 
-**The UMAI approach:** The authorized human user is *already* authenticated to both applications in their browser. By turning the browser tab into a secure mediator via standard Web APIs (`postMessage`, `MessageChannel`, `File` Structured Clone), applications can exchange verified, immutable records and large documents without server-to-server coupling.
+Across many industries and public-sector ecosystems, a central electronic messaging platform must exchange documents and structured records with dozens of independently developed **specialty applications** (case management, ERP, legal/medical practice software, billing, or document archives).
+
+While high-volume enterprises may invest heavily in custom server-to-server B2B integrations (VPNs, mutual TLS, custom REST/SOAP gateways, and service-account orchestration), building and maintaining direct backend integrations is **disproportionately expensive** for smaller or specialized software vendors. As a result, organizations fall back on manual human workflows:
+
+1. A message or document arrives in **Application A** (e.g., an electronic messaging platform).
+2. The user manually downloads the files and attachments to their local disk.
+3. The user switches tabs to **Application B** (their specialty application).
+4. The user manually uploads the files and re-types the metadata.
+5. The user repeats the same manual process in reverse when sending documents out.
+
+Notice that in this workflow, **the human user is already authenticated to both applications and already makes the business decisions** (which documents belong to which case or workflow). What wastes time and introduces errors is the purely mechanical download-and-upload loop.
+
+**The UMAI approach:** Instead of replacing human business judgment or requiring expensive server-to-server infrastructure, UMAI eliminates the mechanical transfer step. Because the user's browser is already connected to both applications, UMAI uses standard Web APIs (`postMessage`, `MessageChannel`, `File` Structured Clone) to reconcile pending outgoing and incoming messages automatically, reliably, and verifiably in the background—complementing conventional B2B APIs at a fraction of the integration cost.
+
+### Asymmetric Integration Economics: "Platform Implements Once, Specialty Apps Integrate in Days"
+
+In a typical hub-and-spoke ecosystem (demonstrated by our [Minimal Production View](#minimal-production-view-zero-distraction-ui)):
+- **Application A (Messaging Platform):** Implements UMAI once by providing a lightweight, self-contained embedded sync endpoint (`/sync.html`) that handles its own session management and Federated IdP login bootstrap.
+- **Application B (Specialty Application):** The user works primarily inside Application B, which embeds Application A's `/sync.html` frame (or opens it as a companion window) and implements the tiny 5-method storage adapter against its existing database.
+- **Strict Separation of Concerns:** Application B remains completely unaware of Application A's authentication internals (OIDC, SAML, MFA, government eID), and UMAI's technical delivery (`ACK`) simply places verified incoming items into Application B's durable **Incoming Tray** so the user can classify or assign them to a business case afterward.
+- **Low Integration Cost:** Because the protocol engine (`js/umai.js`) is used verbatim and existing database tables can back the 5-method adapter directly, a typical specialty application can integrate UMAI in **~4–7 developer-days**.
 
 ### Conceptual Lineage: Browsers as Zero-Install Store-Carry-Forward Couriers
 

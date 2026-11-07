@@ -296,6 +296,41 @@ function createMockChannel() {
   receiverSlow.stop();
   console.log('✓ Test 5: Concurrent acceptMessage deduplication (F4), sync status accuracy (F8), falsy payload (F6), and GET expiry (F3) passed');
 
+  // Test 6: Top-level companion/popup window binding via options.peerWindow (no iframe required)
+  let popupPortReceived = false;
+  const mockPopupWindow = {
+    closed: false,
+    postMessage(msg, targetOrigin, transfer) {
+      assert.strictEqual(msg.type, 'INIT', 'Host should send INIT to peerWindow');
+      assert.strictEqual(targetOrigin, 'http://companion.example', 'Host should pin targetOrigin on peerWindow');
+      if (transfer && transfer.length > 0) {
+        popupPortReceived = true;
+      }
+    }
+  };
+
+  const hostPopupSession = new UmaiSession({
+    peerOrigin: 'http://companion.example',
+    role: 'host',
+    peerWindow: mockPopupWindow,
+    storage: {
+      getOutboxIds: async () => [],
+      getMessage: async () => null,
+      isAccepted: async () => false,
+      acceptMessage: async () => true,
+      onAcknowledged: async () => {}
+    }
+  });
+
+  hostPopupSession._handleWindowMessage({
+    origin: 'http://companion.example',
+    source: mockPopupWindow,
+    data: { protocol: PROTOCOL_NAME, version: PROTOCOL_VERSION, type: 'READY' }
+  });
+  assert.strictEqual(popupPortReceived, true, 'Host session must complete handshake with top-level peerWindow without an iframe');
+  hostPopupSession.stop();
+  console.log('✓ Test 6: Top-level companion/popup window binding (peerWindow) passed');
+
   senderPoison.stop();
   receiverPoison.stop();
   secSession.stop();

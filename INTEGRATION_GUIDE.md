@@ -400,6 +400,57 @@ If you *are* developing or extending an application backend and want a clean, de
 
 ---
 
+### Pattern 5: Relational Database (SQL) & The "Incoming Tray" Pattern
+
+If your specialty application already uses a relational database (PostgreSQL, MySQL, SQL Server, Oracle, SQLite), **you do not need to write custom filesystem staging or crash-recovery code like `pkg/umaiserver/storage.go`**. A single database transaction with a `UNIQUE` constraint on `umai_message_id` gives you atomic commit (Rule 3), durable acceptance (Rule 4), and idempotent duplicate detection (Rule 5) automatically:
+
+```sql
+-- 1. Durable incoming tray table (technical acceptance is decoupled from business case assignment)
+CREATE TABLE umai_incoming_tray (
+    umai_message_id VARCHAR(128) PRIMARY KEY,
+    received_at     TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    payload_json    JSONB NOT NULL,
+    sender_sig      TEXT,
+    ack_receipt     TEXT,
+    -- Downstream business classification happens AFTER technical ACK:
+    assigned_case_id VARCHAR(64) NULL,
+    processing_state VARCHAR(32) NOT NULL DEFAULT 'UNASSIGNED'
+);
+```
+
+When `POST /api/inbox/accept` is called by `acceptMessage(msg)`:
+1. Begin an SQL transaction (`BEGIN`).
+2. Verify the sender's cryptographic signature (if enabled) and compute `ack_receipt`.
+3. Insert the message and attachments (`INSERT INTO umai_incoming_tray ... ON CONFLICT (umai_message_id) DO NOTHING`) with `processing_state = 'UNASSIGNED'`.
+4. Commit the transaction (`COMMIT`) and return `{ "accepted": true, "ack_receipt": "..." }`.
+5. Later, a user in your application opens the **Incoming Tray**, reviews the message, and assigns it to a business case or workflow (`UPDATE umai_incoming_tray SET assigned_case_id = ...`).
+
+> [!TIP]
+> **Why Separating Technical Acceptance from Business Classification Matters:**
+> Never reject `acceptMessage()` inside the UMAI transport layer just because a business field (like an internal case number) is unknown or needs human review. Accepting the message into an **Unassigned Incoming Tray** allows UMAI to `ACK` and clear the sender's outbox immediately while letting the human user classify the document in your UI afterward.
+
+---
+
+### Alternative Window Topology: Top-Level Companion / Popup Window (`window.open`)
+
+While embedding a background sync frame (`<iframe>`) is the most seamless UX, some environments or enterprise policies prohibit cross-origin iframes entirely. Because `js/umai.js` runs over a `MessagePort`, you can also connect two **top-level windows** via `window.open` with zero changes to your 5-method storage adapter:
+
+```javascript
+// In Host Application B (on user button click):
+const companionWin = window.open('https://app-a.company.com/sync.html', 'umai_companion', 'popup,width=460,height=600');
+
+const umai = new UMAI.UmaiSession({
+  peerOrigin: 'https://app-a.company.com',
+  role: 'host',
+  peerWindow: companionWin, // Uses top-level popup instead of an <iframe>!
+  storage: storage
+});
+umai.start();
+```
+Inside `https://app-a.company.com/sync.html`, `UmaiSession` automatically detects `window.opener` when `window.parent === window` and performs the exact same origin-pinned `READY` $\rightarrow$ `INIT` (`MessagePort`) $\rightarrow$ `INIT_ACK` handshake. Because both applications run as top-level windows, **zero third-party or partitioned cookies are required**.
+
+---
+
 ## 6. Real-Time Sync State Indicators (Transfer Ongoing vs. Complete Sync)
 
 In production user interfaces, users need clear visual feedback on whether synchronization is actively transferring data or whether both applications are completely in sync.
@@ -451,18 +502,21 @@ Both applications must explicitly trust the specific peer origin (never use `*`)
   Content-Security-Policy: frame-ancestors 'self' https://app-b.company.org;
   ```
 
-### 2. Authentication & Third-Party Cookie Restrictions (CHIPS)
+### 2. Authentication, Partitioned Cookies (CHIPS) & Top-Level IdP Bootstrap
 - **Production HTTPS Across Different Domains:** Modern browsers partition or block traditional third-party cookies inside cross-origin iframes. To maintain an authenticated session inside the embedded iframe, Application A should emit its session cookie with `Secure`, `SameSite=None`, and `Partitioned` (CHIPS):
   ```http
   Set-Cookie: session_token=xyz; Path=/; Secure; HttpOnly; SameSite=None; Partitioned;
   ```
-  *(Note: `pkg/umaiserver` automatically sets `Secure`, `SameSite=None`, and `Partitioned` when served over HTTPS or behind a TLS-terminating proxy setting `X-Forwarded-Proto: https`, and also supports an `X-UMAI-Session` header fallback.)*
-- **Local Development on `127.0.0.1` / `localhost` (RFC 6265 § 8.5):** Because browser cookies are not isolated by port number on the same IP, if you test both applications locally on `127.0.0.1:8081` and `127.0.0.1:8082`, use distinct cookie names (e.g. `umai_session_app_a` and `umai_session_app_b`) or `X-UMAI-Session` headers so logging into one port does not overwrite the other port's cookie.
+- **When Federated Identity Providers (OIDC / SAML / Government eID) Forbid Framing:** External identity providers typically set `X-Frame-Options: DENY` and cannot be rendered inside an `<iframe>`. Moreover, logging in inside a top-level popup sets a cookie in the *top-level* cookie partition, not the iframe's partition. To bridge this securely without manual pairing codes:
+  1. The embedded iframe generates a non-extractable WebCrypto `ECDSA P-256` key pair and registers a pending transaction (`POST /api/auth/bootstrap/init`).
+  2. A top-level popup authenticates the user at the IdP and authorizes the transaction (`POST /api/auth/bootstrap/authorize` with `opener_nonce`).
+  3. The iframe signs the server challenge with its non-extractable private key (`POST /api/auth/bootstrap/redeem`), receiving its `Partitioned` `HttpOnly` session cookie directly inside the iframe context (implemented as a reference blueprint in `pkg/umaiserver/auth.go` and `examples/app-a/static/sync.js`).
+- **Local Development on `127.0.0.1` / `localhost` (RFC 6265 § 8.5):** Because browser cookies are not isolated by port number on the same IP, if you test both applications locally on `127.0.0.1:8081` and `127.0.0.1:8082`, use distinct cookie names (e.g. `umai_session_a` and `umai_session_b`) so logging into one port does not overwrite the other port's cookie.
 
 ### 3. Secure Cross-Document Messaging (`postMessage` Origin Pinning)
 - **Handled Automatically by `js/umai.js`:** When you pass `peerOrigin` to `new UMAI.UmaiSession({ peerOrigin: 'https://...' })`, `umai.js` automatically:
   1. Passes the exact `peerOrigin` (never `'*'`) as the target origin on every `postMessage` call.
-  2. Verifies `event.origin === peerOrigin` and `event.source` (matching `iframe.contentWindow` or `window.parent`) before processing any handshake message.
+  2. Verifies `event.origin === peerOrigin` and `event.source` (matching `iframe.contentWindow`, `peerWindow`, `window.parent`, or `window.opener`) before processing any handshake message.
   3. Transfers a private `MessageChannel` (`MessagePort`) so all subsequent `OFFER`, `GET`, `PUT`, and `ACK` frames travel over a dedicated point-to-point port rather than the shared `window` event bus.
 - **Custom Control Messages:** If your UI sends any custom `window.postMessage` notifications outside `umai.js`, always specify the exact target origin (`iframeWindow.postMessage(data, 'https://app-a.company.com')`) and verify `if (event.origin !== 'https://expected-origin.com') return;` in your listener.
 
@@ -473,12 +527,23 @@ Both applications must explicitly trust the specific peer origin (never use `*`)
 
 ---
 
-## 8. Summary
+## 8. Integration Economics & Effort Estimate
 
-| Integration Type | Server-to-Server REST/gRPC | UMAI Browser Mediation |
+When a messaging platform (Application A) provides a ready-to-embed sync endpoint (`/sync.html`), an independently developed specialty application (Application B) with existing document/message tables can typically integrate UMAI in **4–7 developer-days**:
+
+| Specialty Application Task | Typical Implementation | Estimated Effort |
 |---|---|---|
-| **Network Configuration** | VPNs, NATs, firewall rules | Standard HTTPS browsing |
-| **Authentication** | Shared mTLS, API keys, OAuth client credentials | Existing user login session |
-| **Legacy Impact** | High (new network daemons, security reviews) | Low (a few UI scripts and standard HTTP handlers) |
+| **1. Embed Sync Frame & Status UI** | Embed `<iframe src="https://app-a.example/sync.html">`, set CSP `frame-src`, wire `onSyncStatus` badge. | **0.5 days** |
+| **2. Outgoing Adapter (`getOutboxIds`, `getMessage`, `onAcknowledged`)** | Query existing outgoing queue/snapshots and mark records as delivered upon `ACK`. | **1.0 – 2.0 days** |
+| **3. Incoming Adapter (`isAccepted`, `acceptMessage`)** | Insert incoming payload and files into an existing "Incoming Tray" SQL table with a `UNIQUE` constraint on `umai_message_id`. | **1.0 – 2.0 days** |
+| **4. Server-Side Signature & Receipt Verification (Optional)** | Verify `Ed25519` signature on `PUT` and sign `ACK` receipt using standard library crypto. | **0.5 – 1.0 days** |
+| **5. End-to-End & Fault Testing** | Verify duplicate suppression, interrupted transfers, and session permissions. | **1.0 – 1.5 days** |
+| **Total Specialty Application Effort** | **Zero VPNs, zero mTLS gateways, zero IdP credential sharing.** | **4 – 7 developer-days** |
+
+| Integration Dimension | Conventional Server-to-Server B2B API | UMAI Browser Mediation |
+|---|---|---|
+| **Network Configuration** | VPNs, NATs, firewall rules, service gateways | Standard HTTPS browsing (`connect-src 'self'`) |
+| **Authentication** | Shared mTLS, API keys, OAuth client credentials | Each app uses its own existing user session |
+| **Specialty App Effort** | Weeks to months per vendor | **~4–7 developer-days** (5-method adapter) |
 | **Data Immutability** | Complex distributed transactions | Built-in 4-message protocol with Rule 5 recovery |
 | **Implementation Effort** | Weeks / Months | An afternoon |
