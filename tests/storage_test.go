@@ -234,4 +234,33 @@ func TestStorage_CrashRecoveryAndFailClosedAck(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(tmpDir, "outbox", outMsg.ID)); err != nil {
 		t.Errorf("Outbox directory must NOT be deleted when AcknowledgeMessagesVerified fails closed")
 	}
+
+	// Verify D2: legitimate message IDs and document filenames containing ".tmp-" in the middle survive restart
+	if _, err := store2.SaveDocument("contract.tmp-final.txt", bytes.NewReader([]byte("important contract"))); err != nil {
+		t.Fatalf("SaveDocument(contract.tmp-final.txt): %v", err)
+	}
+	if _, err := store2.AcceptMessage("legit.tmp-message", map[string]string{"ok": "true"}, nil); err != nil {
+		t.Fatalf("AcceptMessage(legit.tmp-message): %v", err)
+	}
+
+	// Verify D3: case-colliding attachment filenames ("Invoice.txt" and "invoice.txt") are rejected
+	_, err = store2.AcceptMessage("msg-case-collision", map[string]string{}, []umaiserver.AttachmentReader{
+		{Name: "Invoice.txt", Reader: bytes.NewReader([]byte("first"))},
+		{Name: "invoice.txt", Reader: bytes.NewReader([]byte("second"))},
+	})
+	if err == nil {
+		t.Errorf("Expected case-colliding attachment filenames to be rejected (D3)")
+	}
+
+	// Restart into store3 and confirm legit.tmp-message and contract.tmp-final.txt are still intact!
+	store3, err := umaiserver.NewStorage(tmpDir, 10*1024*1024)
+	if err != nil {
+		t.Fatalf("Init storage 3: %v", err)
+	}
+	if _, err := store3.GetDocumentPath("contract.tmp-final.txt"); err != nil {
+		t.Errorf("Expected contract.tmp-final.txt to survive restart (D2), got: %v", err)
+	}
+	if _, err := store3.GetInboxMessage("legit.tmp-message"); err != nil {
+		t.Errorf("Expected legit.tmp-message in inbox to survive restart (D2), got: %v", err)
+	}
 }

@@ -147,11 +147,14 @@
       },
 
       async onAcknowledged(ids, receipts) {
-        await api('/api/outbox/ack', {
+        const res = await api('/api/outbox/ack', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ ids: ids, receipts: receipts || {} })
         });
+        if (!res.ok) {
+          throw new Error('Failed to acknowledge outbox messages on server');
+        }
       }
     };
 
@@ -219,7 +222,7 @@
     return Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
   }
 
-  let activeBootstrapPoll = null;
+  let activeBootstrapState = null;
 
   if (btnPopupAuth) {
     btnPopupAuth.addEventListener('click', async function () {
@@ -251,48 +254,17 @@
         }
         const tx = await initRes.json();
 
-        // 3. Pre-compute the iframe's Proof-of-Possession signature over UMAI-BOOTSTRAP-V1:<tx_id>:<challenge>
-        const challengeBytes = new TextEncoder().encode(`UMAI-BOOTSTRAP-V1:${tx.tx_id}:${tx.challenge}`);
-        const sigBuf = await window.crypto.subtle.sign(
-          { name: 'ECDSA', hash: 'SHA-256' },
-          keyPair.privateKey,
-          challengeBytes
-        );
-        const sigHex = bytesToHex(new Uint8Array(sigBuf));
-
-        // 4. Open top-level authentication window on App A bound to tx_id and opener_nonce
+        // 3. Open top-level authentication window on App A bound to tx_id and opener_nonce.
+        // Upon user authorization, the popup delivers a one-time auth_secret directly to this iframe
+        // via same-origin window.opener.postMessage, which we then sign with our non-extractable P-256 key.
         const popupUrl = `/?auth_tx=${encodeURIComponent(tx.tx_id)}&opener_nonce=${encodeURIComponent(tx.opener_nonce)}`;
-        window.open(popupUrl, 'umai_top_level_auth', 'popup,width=520,height=640');
-
-        // 5. Poll /api/auth/bootstrap/redeem until the top-level window authorizes tx_id, then establish Partitioned iframe session
-        if (activeBootstrapPoll) clearInterval(activeBootstrapPoll);
-        let attempts = 0;
-        activeBootstrapPoll = setInterval(async () => {
-          attempts++;
-          if (attempts > 120) {
-            clearInterval(activeBootstrapPoll);
-            activeBootstrapPoll = null;
-            return;
-          }
-          try {
-            const redeemRes = await fetch('/api/auth/bootstrap/redeem', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json', 'X-UMAI-CSRF': '1' },
-              credentials: 'include',
-              body: JSON.stringify({ tx_id: tx.tx_id, signature: sigHex })
-            });
-            if (redeemRes.status === 202) {
-              return; // Still awaiting top-level user authentication
-            }
-            clearInterval(activeBootstrapPoll);
-            activeBootstrapPoll = null;
-            if (redeemRes.ok) {
-              startSyncWorker();
-            }
-          } catch (e) {
-            // ignore transient poll error
-          }
-        }, 1000);
+        const popupWin = window.open(popupUrl, 'umai_top_level_auth', 'popup,width=520,height=640');
+        activeBootstrapState = {
+          txId: tx.tx_id,
+          challenge: tx.challenge,
+          privateKey: keyPair.privateKey,
+          popupWin: popupWin
+        };
       } catch (err) {
         loginError.textContent = err.message || 'Top-level bootstrap failed';
         loginError.style.display = 'block';
@@ -300,8 +272,51 @@
     });
   }
 
-  // Listen for parent control messages and cross-tab storage events
-  window.addEventListener('message', function (e) {
+  // Listen for same-origin popup bootstrap grant and parent control messages
+  window.addEventListener('message', async function (e) {
+    if (
+      activeBootstrapState &&
+      e.origin === window.location.origin &&
+      e.source === activeBootstrapState.popupWin &&
+      e.data &&
+      e.data.protocol === 'UMAI_BOOTSTRAP' &&
+      e.data.type === 'UMAI_BOOTSTRAP_GRANT' &&
+      e.data.tx_id === activeBootstrapState.txId &&
+      typeof e.data.auth_secret === 'string' &&
+      e.data.auth_secret.length > 0
+    ) {
+      const state = activeBootstrapState;
+      activeBootstrapState = null;
+      try {
+        const challengeBytes = new TextEncoder().encode(
+          `UMAI-BOOTSTRAP-V1:${state.txId}:${state.challenge}:${e.data.auth_secret}`
+        );
+        const sigBuf = await window.crypto.subtle.sign(
+          { name: 'ECDSA', hash: 'SHA-256' },
+          state.privateKey,
+          challengeBytes
+        );
+        const sigHex = bytesToHex(new Uint8Array(sigBuf));
+        const redeemRes = await fetch('/api/auth/bootstrap/redeem', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'X-UMAI-CSRF': '1' },
+          credentials: 'include',
+          body: JSON.stringify({
+            tx_id: state.txId,
+            auth_secret: e.data.auth_secret,
+            signature: sigHex
+          })
+        });
+        if (redeemRes.ok) {
+          startSyncWorker();
+        }
+      } catch (err) {
+        loginError.textContent = err.message || 'Failed to redeem bootstrap session';
+        loginError.style.display = 'block';
+      }
+      return;
+    }
+
     if (peerOrigin && e.origin !== peerOrigin) return;
     if (window.parent && e.source !== window.parent) return;
     if (!e.data || e.data.protocol !== 'UMAI_CONTROL') return;

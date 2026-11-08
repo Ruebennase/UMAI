@@ -34,10 +34,14 @@ var (
 
 // BootstrapTransaction represents a short-lived, ephemeral-key-bound authentication handoff
 // between a cross-origin embedded iframe and a top-level authentication window.
+// AuthSecret is minted exclusively upon AuthorizeBootstrap and returned only to the authenticated
+// top-level window (which passes it over window.opener.postMessage in browser memory), preventing
+// remote session-fixation or phishing-link transaction takeover.
 type BootstrapTransaction struct {
 	TxID         string
 	OpenerNonce  string
 	Challenge    string
+	AuthSecret   string
 	PublicKey    *ecdsa.PublicKey
 	Authorized   bool
 	AuthorizedBy string
@@ -315,10 +319,11 @@ func (am *AuthManager) InitBootstrap(pubKeyHex string) (*BootstrapTransaction, e
 }
 
 // AuthorizeBootstrap is called by an authenticated top-level window to approve a pending iframe transaction.
-// Requires matching the single-use openerNonce so an attacker cannot trick a user into approving an unrelated txID.
-func (am *AuthManager) AuthorizeBootstrap(txID, openerNonce, username string) error {
+// Mints and returns a single-use 256-bit AuthSecret exclusively to the authenticated top-level response so the
+// popup can pass it directly to window.opener via same-origin postMessage (preventing remote URL phishing takeover).
+func (am *AuthManager) AuthorizeBootstrap(txID, openerNonce, username string) (string, error) {
 	if txID == "" || openerNonce == "" || username == "" {
-		return ErrBootstrapInvalidProof
+		return "", ErrBootstrapInvalidProof
 	}
 
 	am.mu.Lock()
@@ -327,24 +332,28 @@ func (am *AuthManager) AuthorizeBootstrap(txID, openerNonce, username string) er
 	tx, exists := am.bootstraps[txID]
 	if !exists || time.Now().After(tx.ExpiresAt) {
 		delete(am.bootstraps, txID)
-		return ErrBootstrapNotFound
+		return "", ErrBootstrapNotFound
 	}
 
 	nHash := sha256.Sum256([]byte(openerNonce))
 	expHash := sha256.Sum256([]byte(tx.OpenerNonce))
 	if subtle.ConstantTimeCompare(nHash[:], expHash[:]) != 1 {
-		return ErrBootstrapInvalidProof
+		return "", ErrBootstrapInvalidProof
 	}
 
+	if tx.AuthSecret == "" {
+		tx.AuthSecret = generateRandomHex(32)
+	}
 	tx.Authorized = true
 	tx.AuthorizedBy = username
-	return nil
+	return tx.AuthSecret, nil
 }
 
-// RedeemBootstrap verifies the embedded iframe's ECDSA P-256 signature (IEEE P1363 r||s format from WebCrypto)
-// over "UMAI-BOOTSTRAP-V1:<txID>:<challenge>". Once verified, the transaction is consumed (single-use)
-// and a new authenticated session ID is minted for the iframe context.
-func (am *AuthManager) RedeemBootstrap(txID, sigHex string) (string, string, error) {
+// RedeemBootstrap verifies both the top-level AuthSecret (delivered in-browser via window.opener) and
+// the embedded iframe's ECDSA P-256 signature (IEEE P1363 r||s format from WebCrypto) over
+// "UMAI-BOOTSTRAP-V1:<txID>:<challenge>:<authSecret>". Once verified, the transaction is consumed
+// (single-use) and a new authenticated session ID is minted for the iframe context.
+func (am *AuthManager) RedeemBootstrap(txID, authSecret, sigHex string) (string, string, error) {
 	if txID == "" {
 		return "", "", ErrBootstrapNotFound
 	}
@@ -358,8 +367,19 @@ func (am *AuthManager) RedeemBootstrap(txID, sigHex string) (string, string, err
 		return "", "", ErrBootstrapNotFound
 	}
 
-	if !tx.Authorized || tx.AuthorizedBy == "" {
+	if !tx.Authorized || tx.AuthorizedBy == "" || tx.AuthSecret == "" {
 		return "", "", ErrBootstrapPending
+	}
+
+	if strings.TrimSpace(authSecret) == "" {
+		delete(am.bootstraps, txID)
+		return "", "", ErrBootstrapInvalidProof
+	}
+	sHash := sha256.Sum256([]byte(strings.TrimSpace(authSecret)))
+	expSHash := sha256.Sum256([]byte(tx.AuthSecret))
+	if subtle.ConstantTimeCompare(sHash[:], expSHash[:]) != 1 {
+		delete(am.bootstraps, txID)
+		return "", "", ErrBootstrapInvalidProof
 	}
 
 	rawSig, err := hex.DecodeString(strings.TrimSpace(sigHex))
@@ -371,7 +391,7 @@ func (am *AuthManager) RedeemBootstrap(txID, sigHex string) (string, string, err
 	rInt := new(big.Int).SetBytes(rawSig[:32])
 	sInt := new(big.Int).SetBytes(rawSig[32:])
 
-	msg := fmt.Sprintf("UMAI-BOOTSTRAP-V1:%s:%s", tx.TxID, tx.Challenge)
+	msg := fmt.Sprintf("UMAI-BOOTSTRAP-V1:%s:%s:%s", tx.TxID, tx.Challenge, tx.AuthSecret)
 	digest := sha256.Sum256([]byte(msg))
 
 	if !ecdsa.Verify(tx.PublicKey, digest[:], rInt, sInt) {
@@ -384,6 +404,25 @@ func (am *AuthManager) RedeemBootstrap(txID, sigHex string) (string, string, err
 	delete(am.bootstraps, txID)
 
 	now := time.Now()
+	for id, existing := range am.sessions {
+		if now.After(existing.ExpiresAt) {
+			delete(am.sessions, id)
+		}
+	}
+	if len(am.sessions) >= MaxActiveSessions {
+		var oldestID string
+		var oldestTime time.Time
+		for id, existing := range am.sessions {
+			if oldestID == "" || existing.CreatedAt.Before(oldestTime) {
+				oldestID = id
+				oldestTime = existing.CreatedAt
+			}
+		}
+		if oldestID != "" {
+			delete(am.sessions, oldestID)
+		}
+	}
+
 	sessionID := generateSessionID()
 	am.sessions[sessionID] = &Session{
 		ID:        sessionID,

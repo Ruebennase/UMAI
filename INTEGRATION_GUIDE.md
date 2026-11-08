@@ -212,11 +212,14 @@ In Application A's web page (preferably placing the initialization script in an 
     },
 
     async onAcknowledged(ids, receipts) {
-      await fetch('/api/outbox/acknowledge', {
+      const res = await fetch('/api/outbox/acknowledge', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ ids, receipts })
       });
+      if (!res.ok) {
+        throw new Error('Failed to acknowledge outbox messages on server');
+      }
     }
   };
 
@@ -303,9 +306,9 @@ The user is viewing an invoice or record already rendered on screen. The adapter
 ```javascript
 const domStorageAdapter = {
   async getOutboxIds() {
-    // If the page has an active document displayed, treat its ID as the outbox
-    const docId = document.getElementById('current-record-id')?.value;
-    return docId ? [docId] : [];
+    // If the page has an immutable snapshot ID displayed, treat its ID as the outbox
+    const snapshotId = document.getElementById('current-snapshot-id')?.value;
+    return snapshotId ? [snapshotId] : [];
   },
 
   async getMessage(id) {
@@ -313,22 +316,23 @@ const domStorageAdapter = {
     const fileInput = document.getElementById('existing-file-upload');
     const files = fileInput && fileInput.files.length > 0 ? Array.from(fileInput.files) : [];
 
+    // Rule 1: Return the immutable payload associated with this snapshot ID
     return {
       id: id,
-      payload: { title: title, extractedAt: new Date().toISOString() },
+      payload: { title: title },
       attachments: files // Native File objects directly from the browser input
     };
   },
 
   async isAccepted(id) {
-    // Check localStorage to see if we already received this record
-    return localStorage.getItem(`accepted_${id}`) !== null;
+    // Illustrative client-side check (production apps should query their backend's durable Accepted Set)
+    return { accepted: localStorage.getItem(`accepted_${id}`) !== null };
   },
 
   async acceptMessage(msg) {
     // INBOX: Populate the legacy app's existing form and submit it!
     const form = document.getElementById('legacy-import-form');
-    if (!form) return false;
+    if (!form) return { accepted: false };
 
     // Fill hidden or visible input fields
     document.getElementById('import-doc-id').value = msg.id;
@@ -343,9 +347,9 @@ const domStorageAdapter = {
     const response = await fetch(form.action, { method: form.method || 'POST', body: data });
     if (response.ok) {
       localStorage.setItem(`accepted_${msg.id}`, 'true');
-      return true;
+      return { accepted: true };
     }
-    return false;
+    return { accepted: false };
   },
 
   async onAcknowledged(ids) {
@@ -357,6 +361,10 @@ const domStorageAdapter = {
   }
 };
 ```
+
+> [!NOTE]
+> **Caveat on Pure Client-Side Acceptance Tracking (`localStorage`):**
+> Storing accepted IDs in browser `localStorage` is convenient for rapid prototyping, but if a user clears browser site data or switches computers, `localStorage` is lost. Production integrations should persist accepted Message IDs on the backend (e.g., via a `UNIQUE` column in the legacy form handler or Pattern 5/6 below) so Rule 5 deduplication survives across browsers and machines.
 
 ---
 
@@ -437,6 +445,17 @@ When `POST /api/inbox/accept` is called by `acceptMessage(msg)`:
 > Instead, human approval, selective transfer, and drag-and-drop belong cleanly **one layer above UMAI**:
 > - **Sender-Side Selection / Drag-and-Drop (Outbox Gating):** Keep draft documents in your normal application storage and only insert a message into the UMAI Outbox (`getOutboxIds()`) when the user clicks *"Send"* or drags-and-drops the item.
 > - **Receiver-Side Approval (Incoming Tray Gating):** Let UMAI transfer incoming messages automatically into your durable **Unassigned Incoming Tray** (`acceptMessage` → `ACK`), where your UI has the full verified payload, subject, and attachments and can let the user click *"Import to Case"* or *"Discard"* at their leisure.
+
+---
+
+### Pattern 6: Standalone File-Spool / Sidecar Bridge (Running `pkg/umaiserver` Alongside Your Application)
+
+Many existing specialty or packaged applications already exchange data via local "hot folders" (file spools) or local REST calls and prefer not to add UMAI endpoints directly to their core web application. You can run our Go server (`pkg/umaiserver`) as a **standalone sidecar / file-spool bridge**:
+
+- **How It Works:** Your application embeds `pkg/umaiserver`'s `/sync.html` (or opens it as a companion window) and interacts with `pkg/umaiserver`'s local data directory (`./data/outbox/` and `./data/inbox/`) or localhost HTTP API.
+- **Preventing Partial-Read / Partial-Write Race Conditions on the File Spool:**
+  1. **Incoming Messages (`inbox/{id}/`):** `pkg/umaiserver` stages all incoming attachments and `message.json` inside a hidden `.staging/` directory (`O_EXCL` + `fsync`), verifies the `Ed25519` signature, and only then executes an **atomic directory `rename()`** into `inbox/{id}/`. Consequently, any external process polling `inbox/` never observes a partially written message directory. Even if your external consumer archives or deletes `inbox/{id}/` after importing it into your database, `pkg/umaiserver` persists `accepted.json` and `accepted_receipts.json` separately so Rule 5 repeated `ACK` receipts remain durable across restarts.
+  2. **Outgoing Messages (`outbox/{id}/`):** When your external process creates an outgoing message on disk, either call `POST /api/docs` + `POST /api/outbox` (which stages, signs, and renames atomically) **or** stage the directory inside `.staging/` first (writing all files in `attachments/` and `message.json` before atomically `rename()`-ing the completed directory into `outbox/{id}/`). As an additional safeguard, `pkg/umaiserver` verifies that `message.json` is valid and that every listed attachment exists on disk with its exact declared byte size before offering the message ID via `OFFER`.
 
 ---
 

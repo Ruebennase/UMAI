@@ -4,18 +4,22 @@
  */
 
 const assert = require('assert');
-const { UmaiSession, PROTOCOL_NAME, PROTOCOL_VERSION, isValidUmaiMessage } = require('../js/umai.js');
+const { UmaiSession, PROTOCOL_NAME, PROTOCOL_VERSION, isValidUmaiMessage, isValidMessageId } = require('../js/umai.js');
 
 console.log('--- Running UMAI JavaScript Tests ---');
 
-// Test 1: Message Validation
+// Test 1: Message & ID Validation (C4)
 {
   assert.strictEqual(isValidUmaiMessage(null), null);
   assert.strictEqual(isValidUmaiMessage({}), false);
   assert.strictEqual(isValidUmaiMessage({ protocol: 'OTHER', version: 1, type: 'OFFER' }), false);
   assert.strictEqual(isValidUmaiMessage({ protocol: PROTOCOL_NAME, version: 2, type: 'OFFER' }), false);
   assert.strictEqual(isValidUmaiMessage({ protocol: PROTOCOL_NAME, version: 1, type: 'OFFER' }), true);
-  console.log('✓ Test 1: isValidUmaiMessage envelope validation passed');
+  assert.strictEqual(isValidMessageId('msg-123.ok_1'), true);
+  assert.strictEqual(isValidMessageId('../outside'), false, 'Traversal ID must be rejected (C4)');
+  assert.strictEqual(isValidMessageId('.tmp-hidden'), false, 'Leading dot ID must be rejected (C4)');
+  assert.strictEqual(isValidMessageId('a..b'), false, 'Double-dot ID must be rejected (C4)');
+  console.log('✓ Test 1: isValidUmaiMessage and isValidMessageId validation passed');
 }
 
 // Mock MessagePort for testing
@@ -371,6 +375,192 @@ function createMockChannel() {
   unboundHostSession.stop();
   hostPopupSession.stop();
   console.log('✓ Test 6: Top-level companion/popup window binding (peerWindow) & fail-closed source check passed');
+
+  // Test 7: Core Hardening — Wildcard origin rejection (C3), Generation isolation across channel replacement/stop (C1),
+  // Bounded GET/PUT concurrency (C2), and Strict attachment/boolean validation (C4)
+  {
+    // C3: Wildcard and non-HTTP(S) origins must be rejected at construction
+    assert.throws(() => new UmaiSession({ peerOrigin: '*', storage: {} }), /wildcards are forbidden/);
+    assert.throws(() => new UmaiSession({ peerOrigin: 'null', storage: {} }), /valid concrete http/);
+    assert.throws(() => new UmaiSession({ peerOrigin: 'javascript:alert(1)', storage: {} }), /valid concrete http/);
+
+    // C1: Pending getMessage() from an old channel must NOT leak onto a replacement channel,
+    // and stop() during isAccepted() must NOT invoke acceptMessage()
+    let releaseOldGetMessage = null;
+    const oldChan = createMockChannel();
+    const newChan = createMockChannel();
+    const genSender = new UmaiSession({
+      peerOrigin: 'http://peer.example',
+      role: 'host',
+      storage: {
+        getOutboxIds: async () => ['msg-gen-old'],
+        getMessage: async (id) => {
+          await new Promise(r => { releaseOldGetMessage = r; });
+          return { id, payload: { secret: 'old-account' }, attachments: [] };
+        },
+        isAccepted: async () => false,
+        acceptMessage: async () => true,
+        onAcknowledged: async () => {}
+      }
+    });
+    genSender.port = oldChan.port1;
+    oldChan.port1.onmessage = genSender._portListener;
+    genSender.state = 'connected';
+    await genSender.reconcile();
+    genSender._handleGet({ protocol: PROTOCOL_NAME, version: PROTOCOL_VERSION, type: 'GET', ids: ['msg-gen-old'] });
+    await new Promise(r => setTimeout(r, 10));
+    assert.strictEqual(typeof releaseOldGetMessage, 'function', 'Old getMessage should be pending');
+
+    // Simulate channel replacement (e.g. READY handshake / account switch) before old getMessage resolves
+    genSender._resetChannelState();
+    genSender.port = newChan.port1;
+    newChan.port1.onmessage = genSender._portListener;
+    genSender.state = 'connected';
+    releaseOldGetMessage();
+    await new Promise(r => setTimeout(r, 20));
+    const leakedPuts = newChan.port1.sent.filter(m => m.type === 'PUT');
+    assert.strictEqual(leakedPuts.length, 0, 'Pending getMessage from old generation must NOT transmit over replacement channel (C1)');
+    genSender.stop();
+
+    // Also verify stop() during isAccepted() prevents acceptMessage() from being called (C1)
+    let releaseIsAccepted = null;
+    let acceptCalledAfterStop = false;
+    const stopRecChan = createMockChannel();
+    const stopReceiver = new UmaiSession({
+      peerOrigin: 'http://host.example',
+      role: 'embedded',
+      storage: {
+        getOutboxIds: async () => [],
+        getMessage: async () => null,
+        isAccepted: async () => {
+          await new Promise(r => { releaseIsAccepted = r; });
+          return { accepted: false };
+        },
+        acceptMessage: async () => {
+          acceptCalledAfterStop = true;
+          return { accepted: true };
+        },
+        onAcknowledged: async () => {}
+      }
+    });
+    stopReceiver.port = stopRecChan.port1;
+    stopRecChan.port1.onmessage = stopReceiver._portListener;
+    stopReceiver.state = 'connected';
+    stopReceiver._inFlightGets.set('msg-stop-1', Date.now());
+    stopReceiver._handlePut({
+      protocol: PROTOCOL_NAME,
+      version: PROTOCOL_VERSION,
+      type: 'PUT',
+      id: 'msg-stop-1',
+      payload: {},
+      attachments: []
+    });
+    await new Promise(r => setTimeout(r, 10));
+    stopReceiver.stop();
+    releaseIsAccepted();
+    await new Promise(r => setTimeout(r, 20));
+    assert.strictEqual(acceptCalledAfterStop, false, 'acceptMessage must not be called after stop() (C1)');
+
+    // C2: Offer of 12 messages with default maxConcurrency=1 runs at most 1 acceptMessage at a time
+    const batchIds = Array.from({ length: 12 }, (_, i) => `msg-batch-${i + 1}`);
+    let currentConcurrentAccepts = 0;
+    let maxObservedConcurrentAccepts = 0;
+    const acceptedBatch = new Set();
+    const batchChan = createMockChannel();
+
+    const batchSender = new UmaiSession({
+      peerOrigin: 'http://peer.example',
+      role: 'host',
+      storage: {
+        getOutboxIds: async () => batchIds.filter(id => !acceptedBatch.has(id)),
+        getMessage: async (id) => ({ id, payload: { n: id }, attachments: [] }),
+        isAccepted: async () => false,
+        acceptMessage: async () => true,
+        onAcknowledged: async () => {}
+      }
+    });
+    const batchReceiver = new UmaiSession({
+      peerOrigin: 'http://host.example',
+      role: 'embedded',
+      maxConcurrency: 1,
+      storage: {
+        getOutboxIds: async () => [],
+        getMessage: async () => null,
+        isAccepted: async (id) => ({ accepted: acceptedBatch.has(id) }),
+        acceptMessage: async (msg) => {
+          currentConcurrentAccepts++;
+          if (currentConcurrentAccepts > maxObservedConcurrentAccepts) {
+            maxObservedConcurrentAccepts = currentConcurrentAccepts;
+          }
+          await new Promise(r => setTimeout(r, 5));
+          acceptedBatch.add(msg.id);
+          currentConcurrentAccepts--;
+          return { accepted: true };
+        },
+        onAcknowledged: async () => {}
+      }
+    });
+    batchSender.port = batchChan.port1;
+    batchChan.port1.onmessage = batchSender._portListener;
+    batchSender.state = 'connected';
+    batchReceiver.port = batchChan.port2;
+    batchChan.port2.onmessage = batchReceiver._portListener;
+    batchReceiver.state = 'connected';
+
+    await batchSender.reconcile();
+    await new Promise(r => setTimeout(r, 250));
+    assert.strictEqual(acceptedBatch.size, 12, 'All 12 offered messages must be accepted sequentially');
+    assert.strictEqual(maxObservedConcurrentAccepts, 1, 'maxConcurrency=1 must bound concurrent acceptMessage calls to 1 (C2)');
+    batchSender.stop();
+    batchReceiver.stop();
+
+    // C4: Malformed non-array attachments and truthy non-boolean { accepted: "false" } must be rejected
+    let badPutAccepted = false;
+    let stringFalseAckSent = false;
+    const c4Chan = createMockChannel();
+    const c4Receiver = new UmaiSession({
+      peerOrigin: 'http://host.example',
+      role: 'embedded',
+      storage: {
+        getOutboxIds: async () => [],
+        getMessage: async () => null,
+        isAccepted: async () => ({ accepted: false }),
+        acceptMessage: async (msg) => {
+          if (msg.id === 'msg-bad-att') badPutAccepted = true;
+          return { accepted: 'false' }; // Invalid string instead of boolean true
+        },
+        onAcknowledged: async () => {}
+      }
+    });
+    c4Receiver.port = c4Chan.port1;
+    c4Chan.port1.onmessage = c4Receiver._portListener;
+    c4Receiver.state = 'connected';
+
+    c4Receiver._inFlightGets.set('msg-bad-att', Date.now());
+    await c4Receiver._handlePut({
+      protocol: PROTOCOL_NAME,
+      version: PROTOCOL_VERSION,
+      type: 'PUT',
+      id: 'msg-bad-att',
+      payload: {},
+      attachments: 'not-an-array'
+    });
+    assert.strictEqual(badPutAccepted, false, 'Malformed non-array attachments must be rejected before acceptMessage (C4)');
+
+    c4Receiver._inFlightGets.set('msg-str-false', Date.now());
+    await c4Receiver._handlePut({
+      protocol: PROTOCOL_NAME,
+      version: PROTOCOL_VERSION,
+      type: 'PUT',
+      id: 'msg-str-false',
+      payload: {},
+      attachments: []
+    });
+    stringFalseAckSent = c4Chan.port1.sent.some(m => m.type === 'ACK' && m.ids.includes('msg-str-false'));
+    assert.strictEqual(stringFalseAckSent, false, '{ accepted: "false" } must NOT produce an ACK (C4)');
+    c4Receiver.stop();
+  }
+  console.log('✓ Test 7: Generation isolation (C1), bounded concurrency (C2), wildcard origin rejection (C3), and strict validation (C4) passed');
 
   senderPoison.stop();
   receiverPoison.stop();

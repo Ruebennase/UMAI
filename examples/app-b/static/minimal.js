@@ -230,11 +230,14 @@
     },
 
     async onAcknowledged(ids, receipts) {
-      await api('/api/outbox/ack', {
+      const res = await api('/api/outbox/ack', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ ids: ids, receipts: receipts || {} })
       });
+      if (!res.ok) {
+        throw new Error('Failed to acknowledge outbox messages on server');
+      }
       refreshOutboxCount();
     }
   };

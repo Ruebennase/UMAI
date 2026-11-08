@@ -4,6 +4,22 @@
 # on a single VPS with automatic TLS certificate provisioning.
 #
 # Replace 'app-a.example.ch' and 'app-b.example.net' with your actual registered domain names.
+#
+# IMPORTANT: When PeerOrigin or PeerEmbedURL is a non-loopback origin, pkg/umaiserver
+# refuses to start with built-in demo keys or the default demo password even when
+# listening on 127.0.0.1. Always supply explicit Ed25519 keys and credentials:
+#
+#   UMAI_SIGNING_PRIVATE_KEY=<app-a-priv-hex> \
+#   UMAI_PEER_PUBLIC_KEY=<app-b-pub-hex> \
+#   UMAI_AUTH_PASS=<strong-password-a> \
+#   ./bin/app-a -addr 127.0.0.1:8081 -peer-origin https://app-b.example.net
+#
+#   UMAI_SIGNING_PRIVATE_KEY=<app-b-priv-hex> \
+#   UMAI_PEER_PUBLIC_KEY=<app-a-pub-hex> \
+#   UMAI_AUTH_PASS=<strong-password-b> \
+#   ./bin/app-b -addr 127.0.0.1:8082 \
+#     -peer-origin https://app-a.example.ch \
+#     -peer-embed-url https://app-a.example.ch/sync.html
 
 # ==============================================================================
 # Application A (Embedded Peer)

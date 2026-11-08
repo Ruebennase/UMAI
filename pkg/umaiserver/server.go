@@ -40,12 +40,16 @@ func NewServer(cfg Config, staticDir string) (*Server, error) {
 		}
 	}
 
-	if !cfg.AllowDemoDefaults && !isLoopbackHostPort(cfg.ListenAddr) {
+	isLocalOnly := isLoopbackHostPort(cfg.ListenAddr) &&
+		isLoopbackOriginURL(cfg.PeerOrigin) &&
+		isLoopbackOriginURL(cfg.PeerEmbedURL)
+
+	if !cfg.AllowDemoDefaults && !isLocalOnly {
 		if strings.TrimSpace(cfg.SigningPrivateKey) == "" || strings.TrimSpace(cfg.PeerPublicKey) == "" {
-			return nil, fmt.Errorf("refusing to use deterministic demo Ed25519 keys on non-loopback address %q: set UMAI_SIGNING_PRIVATE_KEY and UMAI_PEER_PUBLIC_KEY (or pass -demo)", cfg.ListenAddr)
+			return nil, fmt.Errorf("refusing to use deterministic demo Ed25519 keys for non-loopback deployment (addr=%q, peer=%q): set UMAI_SIGNING_PRIVATE_KEY and UMAI_PEER_PUBLIC_KEY (or pass -demo)", cfg.ListenAddr, cfg.PeerOrigin)
 		}
 		if cfg.AuthPassword == "" || cfg.AuthPassword == "umai123" {
-			return nil, fmt.Errorf("refusing to use default demo password on non-loopback address %q: set -pass / UMAI_AUTH_PASS (or pass -demo)", cfg.ListenAddr)
+			return nil, fmt.Errorf("refusing to use default demo password for non-loopback deployment (addr=%q, peer=%q): set -pass / UMAI_AUTH_PASS (or pass -demo)", cfg.ListenAddr, cfg.PeerOrigin)
 		}
 	}
 
@@ -87,6 +91,17 @@ func NewServer(cfg Config, staticDir string) (*Server, error) {
 
 	s.registerRoutes()
 	return s, nil
+}
+
+func isLoopbackOriginURL(rawURL string) bool {
+	if strings.TrimSpace(rawURL) == "" {
+		return true
+	}
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Host == "" {
+		return false
+	}
+	return isLoopbackHostPort(u.Host)
 }
 
 func newStaticFileHandler(staticDir string) http.Handler {
@@ -449,20 +464,23 @@ func (s *Server) handleBootstrapAuthorize(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	if err := s.auth.AuthorizeBootstrap(req.TxID, req.OpenerNonce, sess.Username); err != nil {
+	authSecret, err := s.auth.AuthorizeBootstrap(req.TxID, req.OpenerNonce, sess.Username)
+	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"authorized": true,
-		"tx_id":      req.TxID,
+		"authorized":  true,
+		"tx_id":       req.TxID,
+		"auth_secret": authSecret,
 	})
 }
 
 type bootstrapRedeemRequest struct {
-	TxID      string `json:"tx_id"`
-	Signature string `json:"signature"`
+	TxID       string `json:"tx_id"`
+	AuthSecret string `json:"auth_secret"`
+	Signature  string `json:"signature"`
 }
 
 func (s *Server) handleBootstrapRedeem(w http.ResponseWriter, r *http.Request) {
@@ -477,7 +495,7 @@ func (s *Server) handleBootstrapRedeem(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	sessionID, username, err := s.auth.RedeemBootstrap(req.TxID, req.Signature)
+	sessionID, username, err := s.auth.RedeemBootstrap(req.TxID, req.AuthSecret, req.Signature)
 	if err != nil {
 		if errors.Is(err, ErrBootstrapPending) {
 			writeJSON(w, http.StatusAccepted, map[string]any{

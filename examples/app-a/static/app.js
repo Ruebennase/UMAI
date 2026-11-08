@@ -113,6 +113,22 @@
     const openerNonce = params.get('opener_nonce');
     if (!txId || !openerNonce) return false;
 
+    // Security (D1): Require a live in-browser window.opener relationship and explicit user confirmation
+    // before authorizing a pending iframe bootstrap transaction, and deliver the resulting one-time
+    // auth_secret exclusively via same-origin postMessage to window.opener (never via URL).
+    if (!window.opener || window.opener === window) {
+      window.history.replaceState({}, document.title, window.location.pathname);
+      return false;
+    }
+
+    if (typeof window.confirm === 'function') {
+      const approved = window.confirm('Authorize the embedded UMAI synchronization frame to connect to your session?');
+      if (!approved) {
+        window.history.replaceState({}, document.title, window.location.pathname);
+        return false;
+      }
+    }
+
     try {
       const res = await api('/api/auth/bootstrap/authorize', {
         method: 'POST',
@@ -120,8 +136,15 @@
         body: JSON.stringify({ tx_id: txId, opener_nonce: openerNonce })
       });
       if (res.ok) {
+        const data = await res.json();
         window.history.replaceState({}, document.title, window.location.pathname);
-        if (window.opener) {
+        if (window.opener && data.auth_secret) {
+          window.opener.postMessage({
+            protocol: 'UMAI_BOOTSTRAP',
+            type: 'UMAI_BOOTSTRAP_GRANT',
+            tx_id: txId,
+            auth_secret: data.auth_secret
+          }, window.location.origin);
           window.close();
           return true;
         }
@@ -482,11 +505,14 @@
       },
 
       async onAcknowledged(ids, receipts) {
-        await api('/api/outbox/ack', {
+        const res = await api('/api/outbox/ack', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ ids, receipts: receipts || {} })
         });
+        if (!res.ok) {
+          throw new Error('Failed to acknowledge outbox messages on server');
+        }
         await loadOutbox();
       }
     };

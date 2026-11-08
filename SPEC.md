@@ -47,7 +47,7 @@ UMAI defines exactly four operations. No additional message types are required f
 
 #### Rule 1 — Immutability & Globally Unique Message IDs
 Every message is assigned a globally unique identifier (Message ID) upon creation. Once offered, its payload and attachments MUST NEVER change. Any modification to metadata or attachments constitutes a new message and requires a distinct Message ID.
-- **Normative Message ID Format:** A Message ID MUST be a non-empty ASCII string of `1` to `128` characters restricted to `[a-zA-Z0-9._-]`, and MUST NOT equal `"."` or contain `".."`.
+- **Normative Message ID Format:** A Message ID MUST be a non-empty ASCII string of `1` to `128` characters matching `^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$` (starting with an ASCII alphanumeric character), and MUST NOT contain `".."`.
 - **Collision Resistance & Entropy:** Senders MUST generate Message IDs with at least **64 bits of cryptographic randomness** (CSPRNG), such as `msg-<unix_ms>-<16_hex_chars>` (as implemented in `pkg/umaiserver`) or a standard UUIDv4 / UUIDv7 (`36` characters), so that Message IDs are globally unique across sessions, restarts, and tenants without central coordination.
 
 #### Rule 2 — Receiver-Controlled Transfer
@@ -190,7 +190,7 @@ The core `OFFER` / `GET` / `PUT` / `ACK` protocol operates strictly over a dedic
 5. **Private Point-to-Point Channel:** All subsequent protocol messages (`OFFER`, `GET`, `PUT`, `ACK`) travel exclusively over the dedicated `MessagePort`.
 
 ### 5.2 Concurrency, Transfer Ordering & Recommended Size Bounds
-To prevent browser memory exhaustion, an implementation SHOULD serialize `PUT` transfers, transmitting at most one `PUT` message at a time per direction. Because browser `MessagePort` transfers clone `File`/`Blob` metadata and backend storage adapters typically buffer or stream a single message per HTTP request, implementations SHOULD bound individual messages to a practical interactive envelope (for example, `<= 50 MB` total attachment size and `<= 50` attachments per message, configurable by the deployment).
+To prevent browser memory exhaustion and uncontrolled adapter amplification, an implementation SHOULD bound both outgoing `PUT` concurrency and receiver-side `GET` / `acceptMessage` concurrency (`maxConcurrency = 1` by default in `js/umai.js`, configurable up to `16`), requesting and committing messages in bounded windows rather than dispatching hundreds of concurrent `acceptMessage` calls. Because browser `MessagePort` transfers clone `File`/`Blob` metadata and backend storage adapters typically buffer or stream a single message per HTTP request, implementations SHOULD bound individual messages to a practical interactive envelope (default `<= 50 MB` total attachment size and `<= 50` attachments per message in `js/umai.js`, configurable by the deployment).
 
 ---
 
