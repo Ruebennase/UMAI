@@ -11,6 +11,7 @@ import (
 
 func TestStaticAssets_ServingAndMimeTypes(t *testing.T) {
 	cfg := umaiserver.DefaultConfig("app-b")
+	cfg.AllowDemoDefaults = true
 	cfg.DataDir = t.TempDir()
 
 	staticDir, err := filepath.Abs("../examples/app-b/static")
@@ -78,6 +79,7 @@ func TestStaticAssets_ServingAndMimeTypes(t *testing.T) {
 
 	// 7. Test App A serving /sync.html
 	cfgA := umaiserver.DefaultConfig("app-a")
+	cfgA.AllowDemoDefaults = true
 	cfgA.DataDir = t.TempDir()
 	staticDirA, err := filepath.Abs("../examples/app-a/static")
 	if err != nil {

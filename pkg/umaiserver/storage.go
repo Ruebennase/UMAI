@@ -147,10 +147,10 @@ func (s *Storage) PeerPublicKeyHex() string {
 	return hex.EncodeToString(s.peerPubKey)
 }
 
-// sanitizeFilename strips directory elements and keeps only a safe base filename (rejecting leading dots and "..").
+// sanitizeFilename strips directory elements and keeps only a safe base filename (rejecting ".", "..", and ".DS_Store").
 func sanitizeFilename(name string) (string, error) {
 	base := filepath.Base(filepath.Clean(name))
-	if base == "." || base == "/" || base == "\\" || base == "" || strings.HasPrefix(base, ".") || strings.Contains(base, "..") {
+	if base == "." || base == ".." || base == "/" || base == "\\" || base == "" || base == ".DS_Store" || strings.Contains(base, "..") {
 		return "", ErrTraversal
 	}
 	// Strip null bytes and control chars
@@ -160,21 +160,17 @@ func sanitizeFilename(name string) (string, error) {
 		}
 		return r
 	}, base)
-	if clean == "" || strings.HasPrefix(clean, ".") || strings.Contains(clean, "..") {
+	if clean == "" || clean == "." || clean == ".." || clean == ".DS_Store" || strings.Contains(clean, "..") {
 		return "", ErrTraversal
 	}
 	return clean, nil
 }
 
 // sanitizeID enforces the SPEC.md normative Message ID grammar:
-// 1..128 ASCII characters in [a-zA-Z0-9._-], starting with an alphanumeric character, and containing no "..".
+// 1..128 ASCII characters in [a-zA-Z0-9._-], excluding ".", "..", and any ".." sequence.
 func sanitizeID(id string) (string, error) {
 	clean := strings.TrimSpace(id)
-	if clean == "" || len(clean) > 128 {
-		return "", ErrInvalidID
-	}
-	first := clean[0]
-	if !((first >= 'a' && first <= 'z') || (first >= 'A' && first <= 'Z') || (first >= '0' && first <= '9')) {
+	if clean == "" || len(clean) > 128 || clean == "." || clean == ".." || strings.Contains(clean, "..") {
 		return "", ErrInvalidID
 	}
 	for _, r := range clean {
@@ -182,18 +178,21 @@ func sanitizeID(id string) (string, error) {
 			return "", ErrInvalidID
 		}
 	}
-	if strings.Contains(clean, "..") {
-		return "", ErrInvalidID
-	}
 	return clean, nil
 }
 
-// syncDir flushes directory metadata after file creation or rename.
-func syncDir(dirPath string) {
-	if d, err := os.Open(dirPath); err == nil {
-		_ = d.Sync()
-		_ = d.Close()
+// syncDir flushes directory metadata after file creation or rename and returns any synchronization error.
+func syncDir(dirPath string) error {
+	d, err := os.Open(dirPath)
+	if err != nil {
+		return err
 	}
+	syncErr := d.Sync()
+	closeErr := d.Close()
+	if syncErr != nil {
+		return syncErr
+	}
+	return closeErr
 }
 
 // GenerateMessageID generates a cryptographically random, globally unique message ID.
@@ -219,7 +218,7 @@ func (s *Storage) ListDocuments() ([]DocumentInfo, error) {
 
 	var docs []DocumentInfo
 	for _, entry := range entries {
-		if entry.IsDir() || strings.HasPrefix(entry.Name(), ".") {
+		if entry.IsDir() || entry.Name() == ".DS_Store" {
 			continue
 		}
 		info, err := entry.Info()
@@ -275,13 +274,22 @@ func (s *Storage) SaveDocument(filename string, r io.Reader) (*DocumentInfo, err
 		_ = os.Remove(tmpPath)
 		return nil, err
 	}
-	_ = f.Close()
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		return nil, err
+	}
+	if err := syncDir(s.stagingDir); err != nil {
+		_ = os.Remove(tmpPath)
+		return nil, err
+	}
 
 	if err := os.Rename(tmpPath, targetPath); err != nil {
 		_ = os.Remove(tmpPath)
 		return nil, err
 	}
-	syncDir(s.docsDir)
+	if err := syncDir(s.docsDir); err != nil {
+		return nil, err
+	}
 
 	hashStr := hex.EncodeToString(hasher.Sum(nil))
 	return &DocumentInfo{
@@ -356,19 +364,18 @@ func (s *Storage) CreateOutboxMessage(payload any, docNames []string) (*Message,
 	var attachments []AttachmentInfo
 	seenNames := make(map[string]bool)
 
-	// Copy selected documents into staging snapshot directory
+	// Copy selected documents into staging snapshot directory using O_EXCL to detect filesystem collisions
 	for _, rawName := range docNames {
 		cleanName, err := sanitizeFilename(rawName)
 		if err != nil {
 			_ = os.RemoveAll(tmpDir)
 			return nil, err
 		}
-		foldedName := strings.ToLower(cleanName)
-		if seenNames[foldedName] {
+		if seenNames[cleanName] {
 			_ = os.RemoveAll(tmpDir)
 			return nil, fmt.Errorf("%w: %s", ErrDuplicateAttachment, cleanName)
 		}
-		seenNames[foldedName] = true
+		seenNames[cleanName] = true
 
 		srcPath := filepath.Join(s.docsDir, cleanName)
 		if fi, err := os.Lstat(srcPath); err != nil || !fi.Mode().IsRegular() {
@@ -412,7 +419,10 @@ func (s *Storage) CreateOutboxMessage(payload any, docNames []string) (*Message,
 			_ = os.RemoveAll(tmpDir)
 			return nil, err
 		}
-		_ = dstFile.Close()
+		if err := dstFile.Close(); err != nil {
+			_ = os.RemoveAll(tmpDir)
+			return nil, err
+		}
 
 		attachments = append(attachments, AttachmentInfo{
 			Name:   cleanName,
@@ -420,7 +430,10 @@ func (s *Storage) CreateOutboxMessage(payload any, docNames []string) (*Message,
 			SHA256: hex.EncodeToString(hasher.Sum(nil)),
 		})
 	}
-	syncDir(attachmentsDir)
+	if err := syncDir(attachmentsDir); err != nil {
+		_ = os.RemoveAll(tmpDir)
+		return nil, err
+	}
 
 	sigHex, err := SignPutMessage(s.ownPrivKey, s.role, s.peerRole, msgID, payload, attachments)
 	if err != nil {
@@ -446,7 +459,9 @@ func (s *Storage) CreateOutboxMessage(payload any, docNames []string) (*Message,
 		_ = os.RemoveAll(tmpDir)
 		return nil, err
 	}
-	syncDir(s.outboxDir)
+	if err := syncDir(s.outboxDir); err != nil {
+		return nil, err
+	}
 
 	return msg, nil
 }
@@ -474,7 +489,7 @@ func (s *Storage) ListOutboxForSession(sessionKey string) ([]*Message, error) {
 	var inFlight []*Message
 
 	for _, entry := range entries {
-		if !entry.IsDir() || strings.HasPrefix(entry.Name(), ".") {
+		if !entry.IsDir() {
 			continue
 		}
 		cleanID, err := sanitizeID(entry.Name())
@@ -724,16 +739,20 @@ func (s *Storage) ListInbox() ([]*Message, error) {
 
 	var msgs []*Message
 	for _, entry := range entries {
-		if !entry.IsDir() || strings.HasPrefix(entry.Name(), ".") {
+		if !entry.IsDir() {
 			continue
 		}
-		msgFile := filepath.Join(s.inboxDir, entry.Name(), "message.json")
+		cleanID, err := sanitizeID(entry.Name())
+		if err != nil {
+			continue
+		}
+		msgFile := filepath.Join(s.inboxDir, cleanID, "message.json")
 		data, err := os.ReadFile(msgFile)
 		if err != nil {
 			continue
 		}
 		var msg Message
-		if err := json.Unmarshal(data, &msg); err == nil {
+		if err := json.Unmarshal(data, &msg); err == nil && msg.ID == cleanID {
 			msgs = append(msgs, &msg)
 		}
 	}
@@ -856,12 +875,11 @@ func (s *Storage) acceptMessageInternal(id string, payload any, attachments []At
 			_ = os.RemoveAll(tmpDir)
 			return nil, err
 		}
-		foldedName := strings.ToLower(cleanName)
-		if seenNames[foldedName] {
+		if seenNames[cleanName] {
 			_ = os.RemoveAll(tmpDir)
 			return nil, fmt.Errorf("%w: %s", ErrDuplicateAttachment, cleanName)
 		}
-		seenNames[foldedName] = true
+		seenNames[cleanName] = true
 
 		dstPath := filepath.Join(tmpAttachmentsDir, cleanName)
 		// Use O_EXCL so case-insensitive or Unicode-normalizing filesystems never overwrite an existing attachment
@@ -896,7 +914,10 @@ func (s *Storage) acceptMessageInternal(id string, payload any, attachments []At
 			_ = os.RemoveAll(tmpDir)
 			return nil, err
 		}
-		_ = dstFile.Close()
+		if err := dstFile.Close(); err != nil {
+			_ = os.RemoveAll(tmpDir)
+			return nil, err
+		}
 
 		attInfos = append(attInfos, AttachmentInfo{
 			Name:   cleanName,
@@ -904,7 +925,10 @@ func (s *Storage) acceptMessageInternal(id string, payload any, attachments []At
 			SHA256: hex.EncodeToString(hasher.Sum(nil)),
 		})
 	}
-	syncDir(tmpAttachmentsDir)
+	if err := syncDir(tmpAttachmentsDir); err != nil {
+		_ = os.RemoveAll(tmpDir)
+		return nil, err
+	}
 
 	// Enforce Ed25519 signature verification when required and peer public key is configured
 	if (requireSignature || sigHex != "") && len(s.peerPubKey) > 0 {
@@ -932,7 +956,14 @@ func (s *Storage) acceptMessageInternal(id string, payload any, attachments []At
 		_ = os.RemoveAll(tmpDir)
 		return nil, err
 	}
-	syncDir(tmpDir)
+	if err := syncDir(tmpDir); err != nil {
+		_ = os.RemoveAll(tmpDir)
+		return nil, err
+	}
+	if err := syncDir(s.stagingDir); err != nil {
+		_ = os.RemoveAll(tmpDir)
+		return nil, err
+	}
 
 	targetDir := filepath.Join(s.inboxDir, cleanID)
 	// Never overwrite an already-committed message.json directory; only remove incomplete remnants without message.json
@@ -942,7 +973,9 @@ func (s *Storage) acceptMessageInternal(id string, payload any, attachments []At
 			_ = os.RemoveAll(tmpDir)
 			s.acceptedIDs[cleanID] = true
 			s.acceptedReceipts[cleanID] = existing.AckReceipt
-			_ = s.persistAcceptedIDsLocked()
+			if err := s.persistAcceptedIDsLocked(); err != nil {
+				return nil, err
+			}
 			return &existing, nil
 		}
 	}
@@ -952,7 +985,10 @@ func (s *Storage) acceptMessageInternal(id string, payload any, attachments []At
 		_ = os.RemoveAll(tmpDir)
 		return nil, err
 	}
-	syncDir(s.inboxDir)
+	if err := syncDir(s.inboxDir); err != nil {
+		_ = os.RemoveAll(targetDir)
+		return nil, err
+	}
 
 	// Mark accepted and write accepted.json + accepted_receipts.json atomically
 	s.acceptedIDs[cleanID] = true
@@ -973,21 +1009,12 @@ func (s *Storage) acceptMessageInternal(id string, payload any, attachments []At
 // -----------------------------------------------------------------------------
 
 func (s *Storage) loadAcceptedIDs() error {
-	// 1. Purge dedicated .staging directory and any root-prefix .tmp-* remnants from prior interrupted runs.
-	// Never match substrings inside committed message IDs or document filenames (since sanitizeID and
-	// sanitizeFilename strictly forbid leading dots, committed entries never start with ".tmp-").
+	// 1. Purge dedicated .staging directory from prior interrupted runs.
+	// Never scan or delete files in docs/, outbox/, inbox/, or dataDir by substring or prefix,
+	// so valid message IDs or filenames starting with "." (e.g. ".tmp-1") are never touched.
 	_ = os.RemoveAll(s.stagingDir)
-	_ = os.MkdirAll(s.stagingDir, 0700)
-
-	for _, dir := range []string{s.docsDir, s.outboxDir, s.inboxDir, s.dataDir} {
-		if entries, err := os.ReadDir(dir); err == nil {
-			for _, entry := range entries {
-				name := entry.Name()
-				if strings.HasPrefix(name, ".tmp-") {
-					_ = os.RemoveAll(filepath.Join(dir, name))
-				}
-			}
-		}
+	if err := os.MkdirAll(s.stagingDir, 0700); err != nil {
+		return err
 	}
 
 	// 2. Load persisted accepted.json and accepted_receipts.json if present
@@ -1024,7 +1051,7 @@ func (s *Storage) loadAcceptedIDs() error {
 	reconciled := false
 	if entries, err := os.ReadDir(s.inboxDir); err == nil {
 		for _, entry := range entries {
-			if !entry.IsDir() || strings.HasPrefix(entry.Name(), ".") {
+			if !entry.IsDir() {
 				continue
 			}
 			cleanID, err := sanitizeID(entry.Name())
@@ -1064,7 +1091,9 @@ func (s *Storage) persistAcceptedIDsLocked() error {
 		return err
 	}
 	if len(s.acceptedReceipts) > 0 {
-		_ = s.writeAtomicJSON(s.acceptedReceiptsFile, s.acceptedReceipts)
+		if err := s.writeAtomicJSON(s.acceptedReceiptsFile, s.acceptedReceipts); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -1092,12 +1121,21 @@ func (s *Storage) writeAtomicJSON(targetPath string, v any) error {
 		_ = os.Remove(tmpPath)
 		return err
 	}
-	_ = f.Close()
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	if err := syncDir(s.stagingDir); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
 
 	if err := os.Rename(tmpPath, targetPath); err != nil {
 		_ = os.Remove(tmpPath)
 		return err
 	}
-	syncDir(filepath.Dir(targetPath))
+	if err := syncDir(filepath.Dir(targetPath)); err != nil {
+		return err
+	}
 	return nil
 }

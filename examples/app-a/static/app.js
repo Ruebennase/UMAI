@@ -40,8 +40,9 @@
   const inboxCount = document.getElementById('inbox-count');
   const logBox = document.getElementById('log-box');
 
-  // Check if embedded in iframe
+  // Check if embedded in iframe or opened as a companion popup window
   const isEmbedded = window.parent !== window;
+  const isChildPeer = isEmbedded || Boolean(window.opener && window.opener !== window);
   if (isEmbedded && iframeCookieNotice) {
     iframeCookieNotice.style.display = 'block';
   }
@@ -107,58 +108,7 @@
     appContainer.style.display = 'none';
   }
 
-  async function completePendingBootstrapIfPresent() {
-    const params = new URLSearchParams(window.location.search);
-    const txId = params.get('auth_tx');
-    const openerNonce = params.get('opener_nonce');
-    if (!txId || !openerNonce) return false;
-
-    // Security (D1): Require a live in-browser window.opener relationship and explicit user confirmation
-    // before authorizing a pending iframe bootstrap transaction, and deliver the resulting one-time
-    // auth_secret exclusively via same-origin postMessage to window.opener (never via URL).
-    if (!window.opener || window.opener === window) {
-      window.history.replaceState({}, document.title, window.location.pathname);
-      return false;
-    }
-
-    if (typeof window.confirm === 'function') {
-      const approved = window.confirm('Authorize the embedded UMAI synchronization frame to connect to your session?');
-      if (!approved) {
-        window.history.replaceState({}, document.title, window.location.pathname);
-        return false;
-      }
-    }
-
-    try {
-      const res = await api('/api/auth/bootstrap/authorize', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ tx_id: txId, opener_nonce: openerNonce })
-      });
-      if (res.ok) {
-        const data = await res.json();
-        window.history.replaceState({}, document.title, window.location.pathname);
-        if (window.opener && data.auth_secret) {
-          window.opener.postMessage({
-            protocol: 'UMAI_BOOTSTRAP',
-            type: 'UMAI_BOOTSTRAP_GRANT',
-            tx_id: txId,
-            auth_secret: data.auth_secret
-          }, window.location.origin);
-          window.close();
-          return true;
-        }
-      }
-    } catch (e) {
-      // ignore bootstrap error and continue to normal app view
-    }
-    return false;
-  }
-
-  async function showApp() {
-    if (await completePendingBootstrapIfPresent()) {
-      return;
-    }
+  function showApp() {
     authContainer.style.display = 'none';
     appContainer.style.display = 'block';
     initApp();
@@ -528,7 +478,7 @@
 
     umaiSession = new UMAI.UmaiSession({
       peerOrigin: peerOrigin,
-      role: isEmbedded ? 'embedded' : 'host',
+      role: isChildPeer ? 'embedded' : 'host',
       storage: storage,
       onStatusChange({ state, detail }) {
         connBadge.className = `badge badge-${state}`;

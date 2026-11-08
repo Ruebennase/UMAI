@@ -194,18 +194,18 @@ func TestStorage_CrashRecoveryAndFailClosedAck(t *testing.T) {
 	}
 
 	// Simulate a crash right after inbox/{id} was renamed into place before accepted.json was written,
-	// plus an orphaned .tmp- directory left behind in inbox/
+	// plus an orphaned staging directory left behind in .staging/
 	_ = os.Remove(filepath.Join(tmpDir, "accepted.json"))
-	orphanTmp := filepath.Join(tmpDir, "inbox", ".tmp-msg-orphan-12345")
+	orphanTmp := filepath.Join(tmpDir, ".staging", "inbox-msg-orphan-12345")
 	_ = os.MkdirAll(orphanTmp, 0700)
 
-	// Restart storage: NewStorage must purge .tmp-* and reconcile inbox/msg-crash-99 into acceptedIDs
+	// Restart storage: NewStorage must purge .staging/ and reconcile inbox/msg-crash-99 into acceptedIDs
 	store2, err := umaiserver.NewStorage(tmpDir, 10*1024*1024)
 	if err != nil {
 		t.Fatalf("Init storage 2: %v", err)
 	}
 	if _, err := os.Stat(orphanTmp); !os.IsNotExist(err) {
-		t.Errorf("Expected orphaned .tmp directory to be purged on startup")
+		t.Errorf("Expected orphaned .staging directory to be purged on startup")
 	}
 	if !store2.IsAccepted("msg-crash-99") {
 		t.Errorf("Expected msg-crash-99 to be reconciled from inbox/ into acceptedIDs on startup")
@@ -235,24 +235,27 @@ func TestStorage_CrashRecoveryAndFailClosedAck(t *testing.T) {
 		t.Errorf("Outbox directory must NOT be deleted when AcknowledgeMessagesVerified fails closed")
 	}
 
-	// Verify D2: legitimate message IDs and document filenames containing ".tmp-" in the middle survive restart
+	// Verify D2: legitimate message IDs and document filenames containing ".tmp-" or starting with "." (e.g. ".tmp-1") survive restart and appear in listings
 	if _, err := store2.SaveDocument("contract.tmp-final.txt", bytes.NewReader([]byte("important contract"))); err != nil {
 		t.Fatalf("SaveDocument(contract.tmp-final.txt): %v", err)
+	}
+	if _, err := store2.AcceptMessage(".tmp-1", map[string]string{"ok": "true"}, nil); err != nil {
+		t.Fatalf("AcceptMessage(.tmp-1): %v", err)
 	}
 	if _, err := store2.AcceptMessage("legit.tmp-message", map[string]string{"ok": "true"}, nil); err != nil {
 		t.Fatalf("AcceptMessage(legit.tmp-message): %v", err)
 	}
 
-	// Verify D3: case-colliding attachment filenames ("Invoice.txt" and "invoice.txt") are rejected
-	_, err = store2.AcceptMessage("msg-case-collision", map[string]string{}, []umaiserver.AttachmentReader{
+	// Verify D3: duplicate attachment filenames in a message are rejected via O_EXCL / exact deduplication
+	_, err = store2.AcceptMessage("msg-dup-collision", map[string]string{}, []umaiserver.AttachmentReader{
 		{Name: "Invoice.txt", Reader: bytes.NewReader([]byte("first"))},
-		{Name: "invoice.txt", Reader: bytes.NewReader([]byte("second"))},
+		{Name: "Invoice.txt", Reader: bytes.NewReader([]byte("second"))},
 	})
 	if err == nil {
-		t.Errorf("Expected case-colliding attachment filenames to be rejected (D3)")
+		t.Errorf("Expected colliding attachment filenames to be rejected (D3)")
 	}
 
-	// Restart into store3 and confirm legit.tmp-message and contract.tmp-final.txt are still intact!
+	// Restart into store3 and confirm .tmp-1, legit.tmp-message, and contract.tmp-final.txt are still intact and listed!
 	store3, err := umaiserver.NewStorage(tmpDir, 10*1024*1024)
 	if err != nil {
 		t.Fatalf("Init storage 3: %v", err)
@@ -260,7 +263,23 @@ func TestStorage_CrashRecoveryAndFailClosedAck(t *testing.T) {
 	if _, err := store3.GetDocumentPath("contract.tmp-final.txt"); err != nil {
 		t.Errorf("Expected contract.tmp-final.txt to survive restart (D2), got: %v", err)
 	}
+	if _, err := store3.GetInboxMessage(".tmp-1"); err != nil {
+		t.Errorf("Expected .tmp-1 in inbox to survive restart (D2), got: %v", err)
+	}
 	if _, err := store3.GetInboxMessage("legit.tmp-message"); err != nil {
 		t.Errorf("Expected legit.tmp-message in inbox to survive restart (D2), got: %v", err)
+	}
+	inboxMsgs, err := store3.ListInbox()
+	if err != nil {
+		t.Fatalf("ListInbox: %v", err)
+	}
+	foundDotTmp := false
+	for _, m := range inboxMsgs {
+		if m.ID == ".tmp-1" {
+			foundDotTmp = true
+		}
+	}
+	if !foundDotTmp {
+		t.Errorf("Expected .tmp-1 to be returned by ListInbox() (D2)")
 	}
 }

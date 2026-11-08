@@ -40,8 +40,34 @@
   let embedUrl = '';
   let syncUrl = '';
   let umaiSession = null;
+  let companionWin = null;
+  let companionMonitor = null;
   let isAppAAuthenticated = false;
   let workerSyncStatus = null;
+
+  function openCompanionWindow() {
+    if (!syncUrl) return;
+    companionWin = window.open(syncUrl, 'umai_companion_a', 'popup,width=420,height=360');
+    if (umaiSession && companionWin) {
+      umaiSession.setPeerWindow(companionWin);
+    }
+    if (companionMonitor) {
+      clearInterval(companionMonitor);
+    }
+    companionMonitor = setInterval(function () {
+      if (!companionWin || companionWin.closed) {
+        clearInterval(companionMonitor);
+        companionMonitor = null;
+        companionWin = null;
+        if (umaiSession) {
+          umaiSession.setPeerWindow(null);
+        }
+        if (workerFrame && workerFrame.contentWindow && peerOrigin) {
+          workerFrame.contentWindow.postMessage({ protocol: 'UMAI_CONTROL', type: 'PING_AUTH' }, peerOrigin);
+        }
+      }
+    }, 1000);
+  }
 
   async function api(path, options = {}) {
     options.credentials = 'include';
@@ -311,11 +337,18 @@
     }
   }
 
-  // Listen to messages from worker frame
+  // Listen to messages from worker frame or companion window
   window.addEventListener('message', function (e) {
     if (peerOrigin && e.origin !== peerOrigin) return;
-    if (workerFrame && workerFrame.contentWindow && e.source !== workerFrame.contentWindow) return;
+    const isFromIframe = Boolean(workerFrame && workerFrame.contentWindow && e.source === workerFrame.contentWindow);
+    const isFromCompanion = Boolean(companionWin && !companionWin.closed && e.source === companionWin);
+    if (!isFromIframe && !isFromCompanion) return;
     if (!e.data || e.data.protocol !== 'UMAI_CONTROL') return;
+
+    if (e.data.type === 'OPEN_COMPANION') {
+      openCompanionWindow();
+      return;
+    }
 
     if (e.data.type === 'AUTH_REQUIRED') {
       isAppAAuthenticated = false;
@@ -326,7 +359,9 @@
     } else if (e.data.type === 'AUTH_OK') {
       isAppAAuthenticated = true;
       trayContent.style.display = 'none';
-      trayLabel.textContent = '● Application A Sync Worker (Connected)';
+      trayLabel.textContent = isFromCompanion
+        ? '● Application A Companion Window (Connected)'
+        : '● Application A Sync Worker (Connected)';
       trayToggleIcon.textContent = '▲ Expand';
       updateIndicator();
       if (umaiSession) {
@@ -362,8 +397,11 @@
     }
     if (umaiSession) {
       umaiSession.reconcile();
-      if (workerFrame && workerFrame.contentWindow && peerOrigin) {
-        workerFrame.contentWindow.postMessage({ protocol: 'UMAI_CONTROL', type: 'TRIGGER_SYNC' }, peerOrigin);
+      const targetWin = (companionWin && !companionWin.closed)
+        ? companionWin
+        : (workerFrame ? workerFrame.contentWindow : null);
+      if (targetWin && peerOrigin) {
+        targetWin.postMessage({ protocol: 'UMAI_CONTROL', type: 'TRIGGER_SYNC' }, peerOrigin);
       }
     }
   });

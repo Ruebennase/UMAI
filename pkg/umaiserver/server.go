@@ -44,12 +44,22 @@ func NewServer(cfg Config, staticDir string) (*Server, error) {
 		isLoopbackOriginURL(cfg.PeerOrigin) &&
 		isLoopbackOriginURL(cfg.PeerEmbedURL)
 
-	if !cfg.AllowDemoDefaults && !isLocalOnly {
-		if strings.TrimSpace(cfg.SigningPrivateKey) == "" || strings.TrimSpace(cfg.PeerPublicKey) == "" {
-			return nil, fmt.Errorf("refusing to use deterministic demo Ed25519 keys for non-loopback deployment (addr=%q, peer=%q): set UMAI_SIGNING_PRIVATE_KEY and UMAI_PEER_PUBLIC_KEY (or pass -demo)", cfg.ListenAddr, cfg.PeerOrigin)
+	usingDemoKeys := strings.TrimSpace(cfg.SigningPrivateKey) == "" || strings.TrimSpace(cfg.PeerPublicKey) == ""
+	usingDemoPassword := cfg.AuthPassword == "" || cfg.AuthPassword == "umai123"
+
+	if !cfg.AllowDemoDefaults {
+		if usingDemoKeys {
+			return nil, fmt.Errorf("production mode refuses built-in demo Ed25519 keys (addr=%q): set UMAI_SIGNING_PRIVATE_KEY and UMAI_PEER_PUBLIC_KEY, or pass -demo for local evaluation", cfg.ListenAddr)
 		}
-		if cfg.AuthPassword == "" || cfg.AuthPassword == "umai123" {
-			return nil, fmt.Errorf("refusing to use default demo password for non-loopback deployment (addr=%q, peer=%q): set -pass / UMAI_AUTH_PASS (or pass -demo)", cfg.ListenAddr, cfg.PeerOrigin)
+		if usingDemoPassword {
+			return nil, fmt.Errorf("production mode refuses default demo password (addr=%q): set -pass / UMAI_AUTH_PASS, or pass -demo for local evaluation", cfg.ListenAddr)
+		}
+	} else if !isLocalOnly {
+		if usingDemoKeys {
+			return nil, fmt.Errorf("refusing to use deterministic demo Ed25519 keys for non-loopback deployment (addr=%q, peer=%q): set UMAI_SIGNING_PRIVATE_KEY and UMAI_PEER_PUBLIC_KEY", cfg.ListenAddr, cfg.PeerOrigin)
+		}
+		if usingDemoPassword {
+			return nil, fmt.Errorf("refusing to use default demo password for non-loopback deployment (addr=%q, peer=%q): set -pass / UMAI_AUTH_PASS", cfg.ListenAddr, cfg.PeerOrigin)
 		}
 	}
 
@@ -289,9 +299,6 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /api/auth/login", s.handleLogin)
 	s.mux.HandleFunc("POST /api/auth/logout", s.handleLogout)
 	s.mux.HandleFunc("GET /api/auth/me", s.handleAuthMe)
-	s.mux.HandleFunc("POST /api/auth/bootstrap/init", s.handleBootstrapInit)
-	s.mux.HandleFunc("POST /api/auth/bootstrap/authorize", s.requireAuth(s.handleBootstrapAuthorize))
-	s.mux.HandleFunc("POST /api/auth/bootstrap/redeem", s.handleBootstrapRedeem)
 
 	// Documents
 	s.mux.HandleFunc("GET /api/docs", s.requireAuth(s.handleListDocs))
@@ -408,110 +415,6 @@ func (s *Server) handleAuthMe(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"authenticated": true,
 		"username":      sess.Username,
-	})
-}
-
-type bootstrapInitRequest struct {
-	PublicKey string `json:"public_key"`
-}
-
-func (s *Server) handleBootstrapInit(w http.ResponseWriter, r *http.Request) {
-	if !isJSONContentType(r) {
-		writeJSON(w, http.StatusUnsupportedMediaType, map[string]string{"error": "Content-Type must be application/json"})
-		return
-	}
-	r.Body = http.MaxBytesReader(w, r.Body, 64*1024)
-	var req bootstrapInitRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
-		return
-	}
-
-	tx, err := s.auth.InitBootstrap(req.PublicKey)
-	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
-		return
-	}
-
-	writeJSON(w, http.StatusOK, map[string]string{
-		"tx_id":        tx.TxID,
-		"opener_nonce": tx.OpenerNonce,
-		"challenge":    tx.Challenge,
-	})
-}
-
-type bootstrapAuthorizeRequest struct {
-	TxID        string `json:"tx_id"`
-	OpenerNonce string `json:"opener_nonce"`
-}
-
-func (s *Server) handleBootstrapAuthorize(w http.ResponseWriter, r *http.Request) {
-	if !isJSONContentType(r) {
-		writeJSON(w, http.StatusUnsupportedMediaType, map[string]string{"error": "Content-Type must be application/json"})
-		return
-	}
-	sessionID := s.auth.GetSessionID(r)
-	sess, ok := s.auth.ValidateSession(sessionID)
-	if !ok {
-		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
-		return
-	}
-
-	r.Body = http.MaxBytesReader(w, r.Body, 64*1024)
-	var req bootstrapAuthorizeRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
-		return
-	}
-
-	authSecret, err := s.auth.AuthorizeBootstrap(req.TxID, req.OpenerNonce, sess.Username)
-	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
-		return
-	}
-
-	writeJSON(w, http.StatusOK, map[string]any{
-		"authorized":  true,
-		"tx_id":       req.TxID,
-		"auth_secret": authSecret,
-	})
-}
-
-type bootstrapRedeemRequest struct {
-	TxID       string `json:"tx_id"`
-	AuthSecret string `json:"auth_secret"`
-	Signature  string `json:"signature"`
-}
-
-func (s *Server) handleBootstrapRedeem(w http.ResponseWriter, r *http.Request) {
-	if !isJSONContentType(r) {
-		writeJSON(w, http.StatusUnsupportedMediaType, map[string]string{"error": "Content-Type must be application/json"})
-		return
-	}
-	r.Body = http.MaxBytesReader(w, r.Body, 64*1024)
-	var req bootstrapRedeemRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
-		return
-	}
-
-	sessionID, username, err := s.auth.RedeemBootstrap(req.TxID, req.AuthSecret, req.Signature)
-	if err != nil {
-		if errors.Is(err, ErrBootstrapPending) {
-			writeJSON(w, http.StatusAccepted, map[string]any{
-				"authenticated": false,
-				"pending":       true,
-			})
-			return
-		}
-		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": err.Error()})
-		return
-	}
-
-	s.auth.SetSessionCookie(w, r, sessionID)
-	writeJSON(w, http.StatusOK, map[string]any{
-		"authenticated": true,
-		"username":      username,
 	})
 }
 

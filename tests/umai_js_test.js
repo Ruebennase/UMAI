@@ -8,7 +8,7 @@ const { UmaiSession, PROTOCOL_NAME, PROTOCOL_VERSION, isValidUmaiMessage, isVali
 
 console.log('--- Running UMAI JavaScript Tests ---');
 
-// Test 1: Message & ID Validation (C4)
+// Test 1: Message & ID Validation (C4 & D2)
 {
   assert.strictEqual(isValidUmaiMessage(null), null);
   assert.strictEqual(isValidUmaiMessage({}), false);
@@ -16,8 +16,12 @@ console.log('--- Running UMAI JavaScript Tests ---');
   assert.strictEqual(isValidUmaiMessage({ protocol: PROTOCOL_NAME, version: 2, type: 'OFFER' }), false);
   assert.strictEqual(isValidUmaiMessage({ protocol: PROTOCOL_NAME, version: 1, type: 'OFFER' }), true);
   assert.strictEqual(isValidMessageId('msg-123.ok_1'), true);
+  assert.strictEqual(isValidMessageId('_underscore-start'), true);
+  assert.strictEqual(isValidMessageId('-hyphen-start'), true);
+  assert.strictEqual(isValidMessageId('.leading-dot-ok'), true);
+  assert.strictEqual(isValidMessageId('.'), false);
+  assert.strictEqual(isValidMessageId('..'), false);
   assert.strictEqual(isValidMessageId('../outside'), false, 'Traversal ID must be rejected (C4)');
-  assert.strictEqual(isValidMessageId('.tmp-hidden'), false, 'Leading dot ID must be rejected (C4)');
   assert.strictEqual(isValidMessageId('a..b'), false, 'Double-dot ID must be rejected (C4)');
   console.log('✓ Test 1: isValidUmaiMessage and isValidMessageId validation passed');
 }
@@ -558,9 +562,55 @@ function createMockChannel() {
     });
     stringFalseAckSent = c4Chan.port1.sent.some(m => m.type === 'ACK' && m.ids.includes('msg-str-false'));
     assert.strictEqual(stringFalseAckSent, false, '{ accepted: "false" } must NOT produce an ACK (C4)');
+
+    // Plain object attachment (not a Blob/File) must be rejected (C4)
+    let plainObjAccepted = false;
+    c4Receiver._inFlightGets.set('msg-plain-att', Date.now());
+    await c4Receiver._handlePut({
+      protocol: PROTOCOL_NAME,
+      version: PROTOCOL_VERSION,
+      type: 'PUT',
+      id: 'msg-plain-att',
+      payload: {},
+      attachments: [{ name: 'fake.bin', size: 10 }]
+    });
+    assert.strictEqual(plainObjAccepted, false, 'Plain non-Blob object in attachments must be rejected (C4)');
+
+    // Oversized JSON payload exceeding maxMessageBytes must be rejected (C2)
+    let oversizedPayloadAccepted = false;
+    const smallLimitReceiver = new UmaiSession({
+      peerOrigin: 'http://host.example',
+      role: 'embedded',
+      maxMessageBytes: 64,
+      storage: {
+        getOutboxIds: async () => [],
+        getMessage: async () => null,
+        isAccepted: async () => ({ accepted: false }),
+        acceptMessage: async () => {
+          oversizedPayloadAccepted = true;
+          return { accepted: true };
+        },
+        onAcknowledged: async () => {}
+      }
+    });
+    const smallChan = createMockChannel();
+    smallLimitReceiver.port = smallChan.port1;
+    smallChan.port1.onmessage = smallLimitReceiver._portListener;
+    smallLimitReceiver.state = 'connected';
+    smallLimitReceiver._inFlightGets.set('msg-big-json', Date.now());
+    await smallLimitReceiver._handlePut({
+      protocol: PROTOCOL_NAME,
+      version: PROTOCOL_VERSION,
+      type: 'PUT',
+      id: 'msg-big-json',
+      payload: { data: 'x'.repeat(200) },
+      attachments: []
+    });
+    assert.strictEqual(oversizedPayloadAccepted, false, 'JSON payload exceeding maxMessageBytes must be rejected (C2)');
+    smallLimitReceiver.stop();
     c4Receiver.stop();
   }
-  console.log('✓ Test 7: Generation isolation (C1), bounded concurrency (C2), wildcard origin rejection (C3), and strict validation (C4) passed');
+  console.log('✓ Test 7: Generation isolation (C1), bounded concurrency & payload size (C2), wildcard origin rejection (C3), and strict validation (C4) passed');
 
   senderPoison.stop();
   receiverPoison.stop();

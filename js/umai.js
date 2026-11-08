@@ -34,19 +34,21 @@
   const DEFAULT_MAX_ATTACHMENTS = 50;
   const DEFAULT_MAX_MESSAGE_BYTES = 50 * 1024 * 1024;
   const MAX_SIGNATURE_LEN = 4096;
-  const MESSAGE_ID_REGEX = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/;
+  const MESSAGE_ID_REGEX = /^[a-zA-Z0-9._-]{1,128}$/;
 
   /**
    * Validates a message identifier against the SPEC.md normative grammar:
-   * 1..128 ASCII characters in [a-zA-Z0-9._-], starting with alphanumeric, and containing no "..".
+   * 1..128 ASCII characters in [a-zA-Z0-9._-], excluding ".", "..", and any ".." sequence.
    */
   function isValidMessageId(id) {
     return (
       typeof id === 'string' &&
       id.length >= 1 &&
       id.length <= 128 &&
-      MESSAGE_ID_REGEX.test(id) &&
-      !id.includes('..')
+      id !== '.' &&
+      id !== '..' &&
+      !id.includes('..') &&
+      MESSAGE_ID_REGEX.test(id)
     );
   }
 
@@ -83,43 +85,58 @@
   }
 
   /**
-   * Validates whether incoming origin matches expected origin (HTTP/HTTPS only).
-   * Enforces exact origin equality by default; optional allowLoopbackEquivalence permits
-   * localhost <-> 127.0.0.1 on matching scheme and port when explicitly enabled for local testing.
+   * Validates whether incoming origin strictly equals expected origin (HTTP/HTTPS only).
    */
-  function isAllowedOrigin(incomingOrigin, expectedOrigin, allowLoopbackEquivalence = false) {
+  function isAllowedOrigin(incomingOrigin, expectedOrigin) {
     const inc = parseHttpOrigin(incomingOrigin);
     const exp = parseHttpOrigin(expectedOrigin);
     if (!inc || !exp) return false;
-    if (inc.origin === exp.origin) return true;
-    if (allowLoopbackEquivalence) {
-      const isLoopback = (host) => host === 'localhost' || host === '127.0.0.1';
-      if (isLoopback(inc.hostname) && isLoopback(exp.hostname) && inc.port === exp.port && inc.protocol === exp.protocol) {
-        return true;
-      }
-    }
-    return false;
+    return inc.origin === exp.origin;
   }
 
   /**
-   * Validates an attachment entry is a native File/Blob or structured binary object with non-negative size.
+   * Validates an attachment entry is a native File/Blob instance with a non-negative finite byte size.
    */
   function isValidAttachment(att) {
-    if (!att || typeof att !== 'object' || Array.isArray(att)) return false;
-    if (typeof Blob !== 'undefined' && att instanceof Blob) {
-      return typeof att.size === 'number' && att.size >= 0;
+    if (typeof Blob === 'undefined' || !att || !(att instanceof Blob)) {
+      return false;
     }
-    return typeof att.name === 'string' && att.name.length > 0 && typeof att.size === 'number' && att.size >= 0;
+    return typeof att.size === 'number' && Number.isFinite(att.size) && att.size >= 0;
   }
 
   /**
-   * Validates an attachments array and returns total byte size, or -1 if invalid/exceeding bounds.
+   * Measures the UTF-8 serialized JSON byte length of a message payload, or returns -1 if unserializable.
    */
-  function validateAttachmentsAndSize(attachments, maxAttachments, maxMessageBytes) {
+  function measurePayloadBytes(payload) {
+    try {
+      const safePayload = (payload !== undefined && payload !== null) ? payload : {};
+      const jsonStr = JSON.stringify(safePayload);
+      if (typeof jsonStr !== 'string') return -1;
+      if (typeof TextEncoder !== 'undefined') {
+        return new TextEncoder().encode(jsonStr).byteLength;
+      }
+      if (typeof Buffer !== 'undefined') {
+        return Buffer.byteLength(jsonStr, 'utf8');
+      }
+      return jsonStr.length;
+    } catch (e) {
+      return -1;
+    }
+  }
+
+  /**
+   * Validates payload and attachments against maxAttachments and maxMessageBytes (including JSON payload bytes).
+   * Returns total byte size (payload + attachments), or -1 if invalid or exceeding bounds.
+   */
+  function validateMessageSize(payload, attachments, maxAttachments, maxMessageBytes) {
+    const payloadBytes = measurePayloadBytes(payload);
+    if (payloadBytes < 0 || payloadBytes > maxMessageBytes) {
+      return -1;
+    }
     if (!Array.isArray(attachments) || attachments.length > maxAttachments) {
       return -1;
     }
-    let totalBytes = 0;
+    let totalBytes = payloadBytes;
     for (let i = 0; i < attachments.length; i++) {
       const att = attachments[i];
       if (!isValidAttachment(att)) {
@@ -166,8 +183,7 @@
      * @param {Window} [options.peerWindow] Optional direct Window reference (e.g. popup from window.open or window.opener)
      * @param {number} [options.maxConcurrency=1] Controlled concurrency limit for in-flight PUT transfers per direction (1..16)
      * @param {number} [options.maxAttachments=50] Maximum attachments permitted per message
-     * @param {number} [options.maxMessageBytes=52428800] Maximum total attachment byte size per message (default 50 MB)
-     * @param {boolean} [options.allowLoopbackEquivalence=false] Optional local-dev flag allowing localhost <-> 127.0.0.1 on same port
+     * @param {number} [options.maxMessageBytes=52428800] Maximum total message byte size (JSON payload + attachments, default 50 MB)
      * @param {Object} options.storage Handlers for reading/writing local messages:
      *   - getOutboxIds(): Promise<string[]>
      *   - getMessage(id): Promise<{ id: string, payload: any, attachments: File[], signature?: string }>
@@ -192,7 +208,6 @@
       }
 
       this.peerOrigin = parsedPeerOrigin.origin;
-      this.allowLoopbackEquivalence = Boolean(options.allowLoopbackEquivalence);
       this.maxConcurrency = (typeof options.maxConcurrency === 'number' && options.maxConcurrency >= 1)
         ? Math.min(Math.floor(options.maxConcurrency), MAX_CONCURRENCY_CAP)
         : DEFAULT_MAX_CONCURRENCY;
@@ -221,10 +236,14 @@
       this._windowListener = this._handleWindowMessage.bind(this);
       this._portListener = (event) => this._handlePortMessage(event, this._generation, this.port);
 
-      // Concurrency control: bounded outgoing PUT transfers and bounded incoming GET/PUT processing
+      // Concurrency control: bounded outgoing PUT transfers and bounded incoming OFFER/GET/PUT processing
       this._putQueue = [];
       this._activeSendCount = 0;
       this._ackingCount = 0;
+
+      // Coalesced incoming OFFER queue and single-worker flag
+      this._pendingOfferIds = new Set();
+      this._processingOffers = false;
 
       // Receiver GET windowing queue and in-flight tracking (id -> timestampMs)
       this._pendingGetQueue = [];
@@ -269,9 +288,15 @@
      * @param {Window} win
      */
     setPeerWindow(win) {
-      this.peerWindow = win || null;
-      if (this.role === 'host' && this.peerWindow && !this.peerWindow.closed) {
-        this._initiateHostHandshake();
+      const nextWin = (win && !win.closed) ? win : null;
+      if (this.peerWindow === nextWin) return;
+      this.peerWindow = nextWin;
+      this._resetChannelState();
+      if (this.state !== 'disconnected') {
+        this._setState('handshaking', this.peerWindow ? 'Switching to companion window' : 'Switching to embedded iframe');
+        if (this.role === 'host' && this._getTargetWindow()) {
+          this._initiateHostHandshake();
+        }
       }
     }
 
@@ -301,6 +326,8 @@
       this._putQueue = [];
       this._activeSendCount = 0;
       this._ackingCount = 0;
+      this._pendingOfferIds.clear();
+      this._processingOffers = false;
       this._pendingGetQueue = [];
       this._inFlightGets.clear();
       this._acceptingIds.clear();
@@ -357,7 +384,7 @@
     _notifySyncStatus(detail = '') {
       this._pruneExpiredGets();
       const pendingOutgoing = this._putQueue.length + this._activeSendCount + this._ackingCount;
-      const pendingIncoming = this._pendingGetQueue.length + this._inFlightGets.size + this._acceptingIds.size + this._incomingPutQueue.length;
+      const pendingIncoming = this._pendingOfferIds.size + this._pendingGetQueue.length + this._inFlightGets.size + this._acceptingIds.size + this._incomingPutQueue.length;
       const isSyncing = pendingOutgoing > 0 || pendingIncoming > 0;
       const info = {
         isSyncing: isSyncing,
@@ -379,7 +406,7 @@
     getSyncStatus() {
       this._pruneExpiredGets();
       const pendingOutgoing = this._putQueue.length + this._activeSendCount + this._ackingCount;
-      const pendingIncoming = this._pendingGetQueue.length + this._inFlightGets.size + this._acceptingIds.size + this._incomingPutQueue.length;
+      const pendingIncoming = this._pendingOfferIds.size + this._pendingGetQueue.length + this._inFlightGets.size + this._acceptingIds.size + this._incomingPutQueue.length;
       const isSyncing = pendingOutgoing > 0 || pendingIncoming > 0;
       return {
         isSyncing: isSyncing,
@@ -391,9 +418,10 @@
 
     /**
      * Start the UMAI adapter and initiate handshake with peer.
+     * Idempotent when already connected or handshaking so redundant start() calls never disrupt an active channel.
      */
     start() {
-      if (this.state === 'connected') return;
+      if (this.state === 'connected' || this.state === 'handshaking') return;
 
       this._setState('handshaking', `Starting as ${this.role}`);
       if (typeof window !== 'undefined' && window.addEventListener && !this._windowListenerRegistered) {
@@ -481,7 +509,7 @@
       }
 
       const destOrigin = targetOrigin || this.peerOrigin;
-      if (!isAllowedOrigin(destOrigin, this.peerOrigin, this.allowLoopbackEquivalence)) {
+      if (!isAllowedOrigin(destOrigin, this.peerOrigin)) {
         this.log('error', `Refusing to initiate handshake with disallowed origin: ${destOrigin}`);
         return;
       }
@@ -512,7 +540,7 @@
      */
     _handleWindowMessage(event) {
       // Validate origin strictly
-      if (!isAllowedOrigin(event.origin, this.peerOrigin, this.allowLoopbackEquivalence)) {
+      if (!isAllowedOrigin(event.origin, this.peerOrigin)) {
         return;
       }
 
@@ -620,8 +648,10 @@
             this.log('warn', `Unknown message type received: ${data.type}`);
         }
       } catch (err) {
-        this.log('error', `Error handling ${data.type} message`, err.message);
-        this.onError(err);
+        if (this._isGenerationActive(gen, port)) {
+          this.log('error', `Error handling ${data.type} message`, err.message);
+          this.onError(err);
+        }
       }
     }
 
@@ -669,7 +699,9 @@
         }
 
         for (const id of ids) {
-          this._offeredIds.add(id);
+          if (this._offeredIds.size < MAX_BATCH_IDS) {
+            this._offeredIds.add(id);
+          }
         }
 
         this.log('info', `Reconciling: offering ${ids.length} outbox message(s)`, ids);
@@ -693,9 +725,8 @@
 
     /**
      * Handles incoming OFFER:
-     * - Partitions IDs into already accepted vs. not accepted.
-     * - Rule 5: For already accepted IDs, sends repeated ACK immediately!
-     * - Rule 2: For unaccepted IDs, enqueues them and sends bounded GET requests up to maxConcurrency.
+     * - Coalesces offered IDs into a bounded set (_pendingOfferIds) so repeated OFFER frames
+     *   never spawn unbounded parallel isAccepted() loops.
      */
     async _handleOffer(offer, gen = this._generation, port = this.port) {
       if (!this._isGenerationActive(gen, port) || !offer || !Array.isArray(offer.ids)) {
@@ -715,60 +746,96 @@
 
       if (offeredIds.length === 0) return;
 
-      this._pruneExpiredGets();
-
-      const alreadyAccepted = [];
-      const repeatedReceipts = Object.create(null);
-
       for (const id of offeredIds) {
-        if (!this._isGenerationActive(gen, port)) return;
-        const acc = parseAcceptanceResult(await this.storage.isAccepted(id));
-        if (!this._isGenerationActive(gen, port)) return;
-
-        if (acc.accepted) {
-          this._failedAttempts.delete(id);
-          alreadyAccepted.push(id);
-          if (acc.ackReceipt) {
-            repeatedReceipts[id] = acc.ackReceipt;
-          }
-        } else {
-          const failCount = this._failedAttempts.get(id) || 0;
-          if (failCount >= MAX_AUTO_RETRIES) {
-            this.log('warn', `Skipping automatic GET for message ${id} after ${failCount} failed acceptance attempts in this session`);
-            continue;
-          }
-          // Enqueue for bounded GET if not already queued, in-flight, or being committed
-          if (
-            !this._isGetInFlight(id) &&
-            !this._acceptingIds.has(id) &&
-            !this._pendingGetQueue.includes(id) &&
-            this._pendingGetQueue.length < MAX_BATCH_IDS
-          ) {
-            this._pendingGetQueue.push(id);
-          }
+        if (this._pendingOfferIds.size >= MAX_BATCH_IDS) {
+          break;
         }
+        this._pendingOfferIds.add(id);
       }
 
-      if (!this._isGenerationActive(gen, port)) return;
+      await this._drainPendingOffers(gen, port);
+    }
 
-      // Rule 5: Repeated acknowledgements
-      // If any offered message was already accepted, ACK it immediately again!
-      if (alreadyAccepted.length > 0) {
-        this.log('info', `Rule 5: Sending repeated ACK for already accepted ID(s)`, alreadyAccepted);
-        const ackMsg = {
-          protocol: PROTOCOL_NAME,
-          version: PROTOCOL_VERSION,
-          type: 'ACK',
-          ids: alreadyAccepted,
-          receipts: repeatedReceipts
-        };
-        if (this._sendToPort(ackMsg, gen, port)) {
-          this.onTransfer({ direction: 'outgoing', type: 'ACK', ids: alreadyAccepted, repeated: true });
-        }
+    /**
+     * Single-worker loop per generation that drains coalesced _pendingOfferIds,
+     * sends repeated ACKs for already-accepted IDs (Rule 5), and enqueues unaccepted IDs for bounded GETs (Rule 2).
+     */
+    async _drainPendingOffers(gen = this._generation, port = this.port) {
+      if (!this._isGenerationActive(gen, port) || this._processingOffers || this._pendingOfferIds.size === 0) {
+        return;
       }
 
-      // Rule 2: Receiver-controlled transfer with bounded GET window (maxConcurrency)
-      this._dispatchNextGets(gen, port);
+      this._processingOffers = true;
+      try {
+        while (this._isGenerationActive(gen, port) && this._pendingOfferIds.size > 0) {
+          this._pruneExpiredGets();
+          const batch = Array.from(this._pendingOfferIds).slice(0, MAX_BATCH_IDS);
+          for (const id of batch) {
+            this._pendingOfferIds.delete(id);
+          }
+
+          const alreadyAccepted = [];
+          const repeatedReceipts = Object.create(null);
+
+          for (const id of batch) {
+            if (!this._isGenerationActive(gen, port)) return;
+            const acc = parseAcceptanceResult(await this.storage.isAccepted(id));
+            if (!this._isGenerationActive(gen, port)) return;
+
+            if (acc.accepted) {
+              this._failedAttempts.delete(id);
+              alreadyAccepted.push(id);
+              if (acc.ackReceipt) {
+                repeatedReceipts[id] = acc.ackReceipt;
+              }
+            } else {
+              const failCount = this._failedAttempts.get(id) || 0;
+              if (failCount >= MAX_AUTO_RETRIES) {
+                this.log('warn', `Skipping automatic GET for message ${id} after ${failCount} failed acceptance attempts in this session`);
+                continue;
+              }
+              const totalOutstanding =
+                this._pendingGetQueue.length +
+                this._inFlightGets.size +
+                this._acceptingIds.size +
+                this._incomingPutQueue.length;
+              if (
+                !this._isGetInFlight(id) &&
+                !this._acceptingIds.has(id) &&
+                !this._pendingGetQueue.includes(id) &&
+                totalOutstanding < MAX_BATCH_IDS
+              ) {
+                this._pendingGetQueue.push(id);
+              }
+            }
+          }
+
+          if (!this._isGenerationActive(gen, port)) return;
+
+          // Rule 5: Repeated acknowledgements
+          if (alreadyAccepted.length > 0) {
+            this.log('info', `Rule 5: Sending repeated ACK for already accepted ID(s)`, alreadyAccepted);
+            const ackMsg = {
+              protocol: PROTOCOL_NAME,
+              version: PROTOCOL_VERSION,
+              type: 'ACK',
+              ids: alreadyAccepted,
+              receipts: repeatedReceipts
+            };
+            if (this._sendToPort(ackMsg, gen, port)) {
+              this.onTransfer({ direction: 'outgoing', type: 'ACK', ids: alreadyAccepted, repeated: true });
+            }
+          }
+
+          // Rule 2: Receiver-controlled transfer with bounded GET window (maxConcurrency)
+          this._dispatchNextGets(gen, port);
+        }
+      } finally {
+        if (this._isGenerationActive(gen, port)) {
+          this._processingOffers = false;
+          this._notifySyncStatus();
+        }
+      }
     }
 
     /**
@@ -838,6 +905,7 @@
      * Enqueues a message ID to be transferred as a PUT (deduplicating already queued IDs and capping queue size).
      */
     _queuePut(id, gen = this._generation, port = this.port) {
+      if (!this._isGenerationActive(gen, port)) return;
       if (this._putQueue.includes(id) || this._putQueue.length >= MAX_BATCH_IDS) {
         return;
       }
@@ -875,15 +943,15 @@
         if (msg.id !== id) {
           throw new Error(`Storage getMessage(${id}) returned mismatched message ID: ${msg.id}`);
         }
-        if (validateAttachmentsAndSize(msg.attachments, this.maxAttachments, this.maxMessageBytes) < 0) {
-          throw new Error(`Outgoing message ${id} attachments invalid or exceed size/count bounds`);
+        const safePayload = (msg.payload !== undefined && msg.payload !== null) ? msg.payload : {};
+        if (validateMessageSize(safePayload, msg.attachments, this.maxAttachments, this.maxMessageBytes) < 0) {
+          throw new Error(`Outgoing message ${id} payload or attachments invalid or exceed size/count bounds`);
         }
         const sigStr = (msg.signature !== undefined && msg.signature !== null) ? msg.signature : '';
         if (typeof sigStr !== 'string' || sigStr.length > MAX_SIGNATURE_LEN) {
           throw new Error(`Outgoing message ${id} has invalid signature field`);
         }
 
-        const safePayload = (msg.payload !== undefined && msg.payload !== null) ? msg.payload : {};
         const putMsg = {
           protocol: PROTOCOL_NAME,
           version: PROTOCOL_VERSION,
@@ -913,7 +981,7 @@
           this.onError(err);
         }
       } finally {
-        if (this._generation === gen) {
+        if (this._isGenerationActive(gen, port)) {
           this._activeSendCount = Math.max(0, this._activeSendCount - 1);
           this._notifySyncStatus();
           // Process next item in queue if still active
@@ -925,7 +993,7 @@
     /**
      * Handles incoming PUT:
      * - Rule 2: Enforces receiver-controlled transfer (rejects unsolicited PUTs not in _inFlightGets).
-     * - Rule 3: Complete messages only. Validates attachments array and bounds before acceptance.
+     * - Rule 3: Complete messages only. Validates payload + attachments array and bounds before acceptance.
      * - Queues and processes incoming PUTs within maxConcurrency so receiver work is strictly bounded.
      */
     async _handlePut(put, gen = this._generation, port = this.port) {
@@ -933,7 +1001,12 @@
         return;
       }
       const id = put.id;
-      if (!isValidMessageId(id) || !this._isGetInFlight(id) || this._acceptingIds.has(id)) {
+      if (
+        !isValidMessageId(id) ||
+        !this._isGetInFlight(id) ||
+        this._acceptingIds.has(id) ||
+        (this._incomingPutQueue.length + this._activeAcceptCount) >= this.maxConcurrency
+      ) {
         this.log('warn', `Ignored unsolicited or duplicate in-flight PUT for message ${id}`);
         return;
       }
@@ -941,14 +1014,15 @@
 
       // Validate wire format & bounds (Rule 3: reject malformed/incomplete envelopes before touching storage)
       const sigStr = (put.signature !== undefined && put.signature !== null) ? put.signature : '';
+      const safePayload = (put.payload !== undefined && put.payload !== null) ? put.payload : {};
       if (
         typeof sigStr !== 'string' ||
         sigStr.length > MAX_SIGNATURE_LEN ||
-        validateAttachmentsAndSize(put.attachments, this.maxAttachments, this.maxMessageBytes) < 0
+        validateMessageSize(safePayload, put.attachments, this.maxAttachments, this.maxMessageBytes) < 0
       ) {
         const fails = (this._failedAttempts.get(id) || 0) + 1;
         this._failedAttempts.set(id, fails);
-        const err = new Error(`Rejected PUT for message ${id}: invalid attachments or exceeded size/count bounds`);
+        const err = new Error(`Rejected PUT for message ${id}: invalid payload/attachments or exceeded size/count bounds`);
         this.log('error', err.message);
         this.onError(err);
         this._notifySyncStatus();
@@ -1063,7 +1137,7 @@
           this.onError(err);
         }
       } finally {
-        if (this._generation === gen) {
+        if (this._isGenerationActive(gen, port)) {
           this._acceptingIds.delete(id);
           this._activeAcceptCount = Math.max(0, this._activeAcceptCount - 1);
           this._notifySyncStatus();
@@ -1126,7 +1200,7 @@
           this.onError(err);
         }
       } finally {
-        if (this._generation === gen) {
+        if (this._isGenerationActive(gen, port)) {
           this._ackingCount = Math.max(0, this._ackingCount - 1);
           this._notifySyncStatus();
         }

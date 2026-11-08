@@ -532,15 +532,15 @@ Both applications must explicitly trust the specific peer origin (never use `*`)
   Content-Security-Policy: frame-ancestors 'self' https://app-b.company.org;
   ```
 
-### 2. Authentication, Partitioned Cookies (CHIPS) & Top-Level IdP Bootstrap
+### 2. Authentication, Partitioned Cookies (CHIPS) & First-Party Companion Window Fallback
 - **Production HTTPS Across Different Domains:** Modern browsers partition or block traditional third-party cookies inside cross-origin iframes. To maintain an authenticated session inside the embedded iframe, Application A should emit its session cookie with `Secure`, `SameSite=None`, and `Partitioned` (CHIPS):
   ```http
   Set-Cookie: session_token=xyz; Path=/; Secure; HttpOnly; SameSite=None; Partitioned;
   ```
-- **When Federated Identity Providers (OIDC / SAML / Government eID) Forbid Framing:** External identity providers typically set `X-Frame-Options: DENY` and cannot be rendered inside an `<iframe>`. Moreover, logging in inside a top-level popup sets a cookie in the *top-level* cookie partition, not the iframe's partition. To bridge this securely without manual pairing codes:
-  1. The embedded iframe generates a non-extractable WebCrypto `ECDSA P-256` key pair and registers a pending transaction (`POST /api/auth/bootstrap/init`).
-  2. A top-level popup authenticates the user at the IdP and authorizes the transaction (`POST /api/auth/bootstrap/authorize` with `opener_nonce`).
-  3. The iframe signs the server challenge with its non-extractable private key (`POST /api/auth/bootstrap/redeem`), receiving its `Partitioned` `HttpOnly` session cookie directly inside the iframe context (implemented as a reference blueprint in `pkg/umaiserver/auth.go` and `examples/app-a/static/sync.js`).
+- **When Federated Identity Providers (OIDC / SAML / Enterprise SSO) Forbid Framing or Browsers Block Third-Party Cookies:** External identity providers typically set `X-Frame-Options: DENY` and cannot be rendered inside an `<iframe>`, and strict browser privacy settings may block third-party cookies inside iframes altogether. Instead of inventing custom cross-context token-transfer endpoints, switch `UmaiSession` to **First-Party Companion Window Mode**:
+  1. On user click ("Open Companion Window"), Host Application B opens `https://app-a.company.com/sync.html?companion=1` (or Application A's top-level workspace) via `const companionWin = window.open(url, 'umai_companion', 'popup,width=440,height=560')` (without `noopener`).
+  2. Host Application B binds its `UmaiSession` to that top-level window via `umai.setPeerWindow(companionWin)`.
+  3. Inside the companion window, Application A runs in a **first-party top-level context** where standard `SameSite=Lax` cookies and normal OIDC/SAML redirects work out of the box, and `UmaiSession` (`role: 'embedded'`) automatically handshakes with `window.opener` over a dedicated `MessagePort` (implemented in `examples/app-a/static/sync.js`, `examples/app-b/static/minimal.js`, and `examples/app-b/static/app.js`).
 - **Local Development on `127.0.0.1` / `localhost` (RFC 6265 § 8.5):** Because browser cookies are not isolated by port number on the same IP, if you test both applications locally on `127.0.0.1:8081` and `127.0.0.1:8082`, use distinct cookie names (e.g. `umai_session_a` and `umai_session_b`) so logging into one port does not overwrite the other port's cookie.
 
 ### 3. Secure Cross-Document Messaging (`postMessage` Origin Pinning)

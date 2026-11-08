@@ -2,13 +2,9 @@ package tests
 
 import (
 	"bytes"
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"fmt"
 	"io"
 	"mime/multipart"
 	"net/http"
@@ -33,6 +29,7 @@ func setupApp(t *testing.T, role string, peerOrigin string) *TestApp {
 	cfg := umaiserver.DefaultConfig(role)
 	cfg.DataDir = dataDir
 	cfg.PeerOrigin = peerOrigin
+	cfg.AllowDemoDefaults = true
 
 	staticDir := t.TempDir()
 	_ = os.WriteFile(staticDir+"/index.html", []byte("<html></html>"), 0644)
@@ -617,163 +614,26 @@ func TestSecurity_StrictCSP_CookieCSRF_NilPayload_And_DuplicateProbe(t *testing.
 	}
 }
 
-func encodeUncompressedP256PublicKey(pub *ecdsa.PublicKey) string {
-	raw := make([]byte, 65)
-	raw[0] = 0x04
-	pub.X.FillBytes(raw[1:33])
-	pub.Y.FillBytes(raw[33:65])
-	return hex.EncodeToString(raw)
-}
-
-func signP1363(t *testing.T, priv *ecdsa.PrivateKey, msg string) string {
-	digest := sha256.Sum256([]byte(msg))
-	r, s, err := ecdsa.Sign(rand.Reader, priv, digest[:])
-	if err != nil {
-		t.Fatalf("ecdsa.Sign: %v", err)
-	}
-	sig := make([]byte, 64)
-	r.FillBytes(sig[:32])
-	s.FillBytes(sig[32:])
-	return hex.EncodeToString(sig)
-}
-
-func TestAuth_EphemeralPoPBootstrap_And_TamperRejection(t *testing.T) {
-	appA := setupApp(t, "app-a", "http://127.0.0.1:8082")
-
-	// 1. Generate ephemeral P-256 key pair (simulating non-extractable WebCrypto key inside embedded iframe)
-	privKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		t.Fatalf("GenerateKey: %v", err)
-	}
-	pubHex := encodeUncompressedP256PublicKey(&privKey.PublicKey)
-
-	// 2. Call POST /api/auth/bootstrap/init
-	initBody, _ := json.Marshal(map[string]string{"public_key": pubHex})
-	reqInit, _ := http.NewRequest("POST", "/api/auth/bootstrap/init", bytes.NewReader(initBody))
-	reqInit.Header.Set("Content-Type", "application/json")
-	reqInit.Header.Set("X-UMAI-CSRF", "1")
-	resInit := appA.Do(reqInit)
-	defer resInit.Body.Close()
-	if resInit.StatusCode != http.StatusOK {
-		t.Fatalf("Expected 200 OK from bootstrap/init, got %d", resInit.StatusCode)
-	}
-	var initResp struct {
-		TxID        string `json:"tx_id"`
-		OpenerNonce string `json:"opener_nonce"`
-		Challenge   string `json:"challenge"`
-	}
-	_ = json.NewDecoder(resInit.Body).Decode(&initResp)
-	if initResp.TxID == "" || initResp.OpenerNonce == "" || initResp.Challenge == "" {
-		t.Fatalf("Incomplete bootstrap init response: %+v", initResp)
+func TestProductionMode_RejectsDemoDefaults_And_NonLoopbackPeer(t *testing.T) {
+	// 1. Verify D4 protection: Production mode (AllowDemoDefaults: false) rejects demo defaults even on 127.0.0.1
+	prodCfg := umaiserver.DefaultConfig("app-a")
+	prodCfg.DataDir = t.TempDir()
+	prodCfg.AllowDemoDefaults = false
+	if _, err := umaiserver.NewServer(prodCfg, ""); err == nil {
+		t.Fatalf("Expected production mode (AllowDemoDefaults=false) to refuse built-in demo keys/password even on loopback (D4)")
 	}
 
-	// 3. Before top-level authorization, redeem returns 202 Accepted (pending) without consuming transaction
-	validSig := signP1363(t, privKey, fmt.Sprintf("UMAI-BOOTSTRAP-V1:%s:%s", initResp.TxID, initResp.Challenge))
-	redeemBody, _ := json.Marshal(map[string]string{"tx_id": initResp.TxID, "signature": validSig})
-	reqPending, _ := http.NewRequest("POST", "/api/auth/bootstrap/redeem", bytes.NewReader(redeemBody))
-	reqPending.Header.Set("Content-Type", "application/json")
-	reqPending.Header.Set("X-UMAI-CSRF", "1")
-	resPending := appA.Do(reqPending)
-	defer resPending.Body.Close()
-	if resPending.StatusCode != http.StatusAccepted {
-		t.Fatalf("Expected 202 Accepted while bootstrap is pending, got %d", resPending.StatusCode)
-	}
-
-	// 4. Authorize with wrong opener_nonce must be rejected (400 Bad Request)
-	badAuthBody, _ := json.Marshal(map[string]string{"tx_id": initResp.TxID, "opener_nonce": "wrong-nonce"})
-	reqBadAuth, _ := authenticatedRequest("POST", "/api/auth/bootstrap/authorize", appA.SessionID, bytes.NewReader(badAuthBody), "application/json")
-	resBadAuth := appA.Do(reqBadAuth)
-	defer resBadAuth.Body.Close()
-	if resBadAuth.StatusCode != http.StatusBadRequest {
-		t.Fatalf("Expected 400 Bad Request for wrong opener_nonce, got %d", resBadAuth.StatusCode)
-	}
-
-	// 5. Authorize with valid opener_nonce and top-level authenticated session succeeds and returns auth_secret
-	goodAuthBody, _ := json.Marshal(map[string]string{"tx_id": initResp.TxID, "opener_nonce": initResp.OpenerNonce})
-	reqGoodAuth, _ := authenticatedRequest("POST", "/api/auth/bootstrap/authorize", appA.SessionID, bytes.NewReader(goodAuthBody), "application/json")
-	resGoodAuth := appA.Do(reqGoodAuth)
-	defer resGoodAuth.Body.Close()
-	if resGoodAuth.StatusCode != http.StatusOK {
-		t.Fatalf("Expected 200 OK from bootstrap/authorize, got %d", resGoodAuth.StatusCode)
-	}
-	var authResp struct {
-		Authorized bool   `json:"authorized"`
-		TxID       string `json:"tx_id"`
-		AuthSecret string `json:"auth_secret"`
-	}
-	_ = json.NewDecoder(resGoodAuth.Body).Decode(&authResp)
-	if !authResp.Authorized || authResp.AuthSecret == "" {
-		t.Fatalf("Expected auth_secret from bootstrap/authorize, got %+v", authResp)
-	}
-
-	// 5b. Verify D1 protection: attempting to redeem without auth_secret (e.g. remote attacker who only knows tx_id & challenge) fails
-	reqInit2, _ := http.NewRequest("POST", "/api/auth/bootstrap/init", bytes.NewReader(initBody))
-	reqInit2.Header.Set("Content-Type", "application/json")
-	reqInit2.Header.Set("X-UMAI-CSRF", "1")
-	resInit2 := appA.Do(reqInit2)
-	defer resInit2.Body.Close()
-	var initResp2 struct {
-		TxID        string `json:"tx_id"`
-		OpenerNonce string `json:"opener_nonce"`
-		Challenge   string `json:"challenge"`
-	}
-	_ = json.NewDecoder(resInit2.Body).Decode(&initResp2)
-	authBody2, _ := json.Marshal(map[string]string{"tx_id": initResp2.TxID, "opener_nonce": initResp2.OpenerNonce})
-	reqAuth2, _ := authenticatedRequest("POST", "/api/auth/bootstrap/authorize", appA.SessionID, bytes.NewReader(authBody2), "application/json")
-	resAuth2 := appA.Do(reqAuth2)
-	_ = resAuth2.Body.Close()
-	attackerSigWithoutSecret := signP1363(t, privKey, fmt.Sprintf("UMAI-BOOTSTRAP-V1:%s:%s:", initResp2.TxID, initResp2.Challenge))
-	attackerRedeemBody, _ := json.Marshal(map[string]string{"tx_id": initResp2.TxID, "auth_secret": "", "signature": attackerSigWithoutSecret})
-	reqAttackerRedeem, _ := http.NewRequest("POST", "/api/auth/bootstrap/redeem", bytes.NewReader(attackerRedeemBody))
-	reqAttackerRedeem.Header.Set("Content-Type", "application/json")
-	reqAttackerRedeem.Header.Set("X-UMAI-CSRF", "1")
-	resAttackerRedeem := appA.Do(reqAttackerRedeem)
-	defer resAttackerRedeem.Body.Close()
-	if resAttackerRedeem.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("Expected 401 Unauthorized when redeeming without top-level auth_secret (D1), got %d", resAttackerRedeem.StatusCode)
-	}
-
-	// 6. Redeem with valid auth_secret (delivered over window.opener) + Proof-of-Possession signature succeeds and issues HttpOnly session cookie
-	validSigWithSecret := signP1363(t, privKey, fmt.Sprintf("UMAI-BOOTSTRAP-V1:%s:%s:%s", initResp.TxID, initResp.Challenge, authResp.AuthSecret))
-	redeemWithSecretBody, _ := json.Marshal(map[string]string{
-		"tx_id":       initResp.TxID,
-		"auth_secret": authResp.AuthSecret,
-		"signature":   validSigWithSecret,
-	})
-	reqRedeem, _ := http.NewRequest("POST", "/api/auth/bootstrap/redeem", bytes.NewReader(redeemWithSecretBody))
-	reqRedeem.Header.Set("Content-Type", "application/json")
-	reqRedeem.Header.Set("X-UMAI-CSRF", "1")
-	resRedeem := appA.Do(reqRedeem)
-	defer resRedeem.Body.Close()
-	if resRedeem.StatusCode != http.StatusOK {
-		t.Fatalf("Expected 200 OK from bootstrap/redeem, got %d", resRedeem.StatusCode)
-	}
-	cookies := resRedeem.Cookies()
-	if len(cookies) == 0 || !cookies[0].HttpOnly {
-		t.Fatalf("Expected HttpOnly session cookie from bootstrap/redeem, got %+v", cookies)
-	}
-
-	// 7. Replaying the same tx_id a second time must fail (single-use redemption)
-	reqReplay, _ := http.NewRequest("POST", "/api/auth/bootstrap/redeem", bytes.NewReader(redeemWithSecretBody))
-	reqReplay.Header.Set("Content-Type", "application/json")
-	reqReplay.Header.Set("X-UMAI-CSRF", "1")
-	resReplay := appA.Do(reqReplay)
-	defer resReplay.Body.Close()
-	if resReplay.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("Expected 401 Unauthorized on replayed bootstrap redemption, got %d", resReplay.StatusCode)
-	}
-
-	// 8. Verify D4 protection: loopback ListenAddr with non-loopback PeerOrigin refuses demo defaults
-	_, err = umaiserver.NewServer(umaiserver.Config{
-		AppName:      "Public Peer Behind Reverse Proxy",
-		Role:         "app-a",
-		ListenAddr:   "127.0.0.1:8081",
-		PeerOrigin:   "https://app-b.example.net",
-		DataDir:      t.TempDir(),
-		AuthUsername: "admin",
-		AuthPassword: "umai123",
-	}, "")
-	if err == nil {
+	// 2. Verify D4 protection: Even with AllowDemoDefaults=true, a non-loopback PeerOrigin refuses demo defaults
+	if _, err := umaiserver.NewServer(umaiserver.Config{
+		AppName:           "Public Peer Behind Reverse Proxy",
+		Role:              "app-a",
+		ListenAddr:        "127.0.0.1:8081",
+		PeerOrigin:        "https://app-b.example.net",
+		DataDir:           t.TempDir(),
+		AuthUsername:      "admin",
+		AuthPassword:      "umai123",
+		AllowDemoDefaults: true,
+	}, ""); err == nil {
 		t.Fatalf("Expected NewServer to refuse demo defaults when PeerOrigin is non-loopback (D4)")
 	}
 }

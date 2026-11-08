@@ -153,12 +153,20 @@
     logBox.innerHTML = '';
   });
 
-  // --- Iframe controls ---
+  // --- Iframe & Companion Window controls ---
+  let companionWin = null;
+  let companionMonitor = null;
+
   btnReloadIframe.addEventListener('click', () => {
     if (peerIframe && serverConfig) {
+      if (companionWin && !companionWin.closed) {
+        companionWin.close();
+      }
+      companionWin = null;
       peerIframe.src = serverConfig.peer_embed_url || serverConfig.peer_origin;
       appendLog('info', 'Reloading embedded Application A iframe');
       if (umaiSession) {
+        umaiSession.setPeerWindow(null);
         umaiSession.stop();
         setTimeout(() => {
           initUmaiSession(serverConfig.peer_origin);
@@ -166,6 +174,38 @@
       }
     }
   });
+
+  if (btnOpenTop) {
+    btnOpenTop.addEventListener('click', (e) => {
+      e.preventDefault();
+      if (!serverConfig || !serverConfig.peer_origin) return;
+      let targetUrl = serverConfig.peer_origin;
+      if (window.location.hostname === 'localhost') {
+        targetUrl = targetUrl.replace('127.0.0.1', 'localhost');
+      } else if (window.location.hostname === '127.0.0.1') {
+        targetUrl = targetUrl.replace('localhost', '127.0.0.1');
+      }
+      companionWin = window.open(targetUrl, 'umai_companion_a', 'width=960,height=720,resizable=yes,scrollbars=yes');
+      if (umaiSession && companionWin) {
+        appendLog('info', 'Opened Application A in companion window; binding UMAI channel');
+        umaiSession.setPeerWindow(companionWin);
+      }
+      if (companionMonitor) {
+        clearInterval(companionMonitor);
+      }
+      companionMonitor = setInterval(() => {
+        if (!companionWin || companionWin.closed) {
+          clearInterval(companionMonitor);
+          companionMonitor = null;
+          companionWin = null;
+          if (umaiSession) {
+            appendLog('info', 'Companion window closed; reverting UMAI channel to embedded iframe');
+            umaiSession.setPeerWindow(null);
+          }
+        }
+      }, 1000);
+    });
+  }
 
   // --- Initialization ---
   async function initApp() {

@@ -247,13 +247,13 @@ UMAI is designed so that developers can integrate existing or legacy application
 In separate terminal tabs (using dedicated local data directories so both applications operate independently):
 
 ```bash
-# Terminal 1: Start Application A (stores docs & outbox in ./data-a)
-go run ./examples/app-a/main.go -addr 127.0.0.1:8081 -peer http://127.0.0.1:8082 -data ./data-a
+# Terminal 1: Start Application A in local demo mode (stores docs & outbox in ./data-a)
+go run ./examples/app-a/main.go -demo -addr 127.0.0.1:8081 -peer http://127.0.0.1:8082 -data ./data-a
 ```
 
 ```bash
-# Terminal 2: Start Application B (Host, stores docs & outbox in ./data-b)
-go run ./examples/app-b/main.go -addr 127.0.0.1:8082 -peer http://127.0.0.1:8081 -data ./data-b
+# Terminal 2: Start Application B in local demo mode (Host, stores docs & outbox in ./data-b)
+go run ./examples/app-b/main.go -demo -addr 127.0.0.1:8082 -peer http://127.0.0.1:8081 -data ./data-b
 ```
 
 Open your browser to:
@@ -348,7 +348,7 @@ UMAI clearly separates **what the browser protocol enforces directly** from **se
 
 ## 10. Production Deployment Behind Caddy
 
-For deployment over the public internet with TLS termination on two separate domains (e.g. `https://app-a.example.ch` and `https://app-b.example.net`), `pkg/umaiserver` requires explicit `Ed25519` signing keys and non-default credentials whenever `-peer` is a non-loopback domain:
+For deployment over the public internet with TLS termination on two separate domains (e.g. `https://app-a.example.org` and `https://app-b.example.net`), `pkg/umaiserver` requires explicit `Ed25519` signing keys and non-default credentials unless `-demo` (or `UMAI_DEMO=1`) is explicitly passed for local loopback evaluation:
 
 1. Copy `deploy/Caddyfile.example` to your Caddy configuration.
 2. Start Application A with its private signing key, Peer B's public key, and a strong password:
@@ -363,7 +363,7 @@ For deployment over the public internet with TLS termination on two separate dom
    UMAI_SIGNING_PRIVATE_KEY="<app-b-ed25519-priv-hex>" \
    UMAI_PEER_PUBLIC_KEY="<app-a-ed25519-pub-hex>" \
    UMAI_AUTH_PASS="<strong-password-b>" \
-   ./app-b -addr 127.0.0.1:8082 -peer https://app-a.example.ch -embed-url https://app-a.example.ch -data ./data-b
+   ./app-b -addr 127.0.0.1:8082 -peer https://app-a.example.org -embed-url https://app-a.example.org -data ./data-b
    ```
 4. Caddy automatically provisions Let's Encrypt certificates and enforces the necessary `Content-Security-Policy: frame-ancestors` headers.
 

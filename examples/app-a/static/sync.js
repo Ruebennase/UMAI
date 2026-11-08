@@ -14,9 +14,20 @@
   let umaiSession = null;
   let isAuthenticated = false;
 
+  function getHostWindow() {
+    if (window.parent && window.parent !== window) {
+      return window.parent;
+    }
+    if (window.opener && !window.opener.closed && window.opener !== window) {
+      return window.opener;
+    }
+    return null;
+  }
+
   function notifyParent(type, payload = {}) {
-    if (window.parent && window.parent !== window && peerOrigin) {
-      window.parent.postMessage({
+    const hostWin = getHostWindow();
+    if (hostWin && peerOrigin) {
+      hostWin.postMessage({
         protocol: 'UMAI_CONTROL',
         source: 'app-a',
         type: type,
@@ -215,110 +226,25 @@
     }
   });
 
-  // Top-level authentication with ephemeral WebCrypto Proof-of-Possession (ECDSA P-256) session bootstrap.
-  // Designed for Federated Identity Providers (OIDC / SAML / eID) that forbid iframe framing (X-Frame-Options: DENY)
-  // and browsers where third-party cookies/storage are partitioned across top-level sites.
-  function bytesToHex(bytes) {
-    return Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
-  }
-
-  let activeBootstrapState = null;
-
+  // Companion window fallback: if third-party cookies are blocked or an external IdP forbids framing,
+  // request the host window to open this sync worker as a first-party top-level companion window
+  // bound via UMAI's native peerWindow / window.opener MessageChannel transport.
   if (btnPopupAuth) {
-    btnPopupAuth.addEventListener('click', async function () {
+    btnPopupAuth.addEventListener('click', function () {
       loginError.style.display = 'none';
-      if (!window.crypto || !window.crypto.subtle) {
-        window.open('/', '_blank');
-        return;
-      }
-
-      try {
-        // 1. Generate a non-extractable ephemeral ECDSA P-256 key pair inside the iframe
-        const keyPair = await window.crypto.subtle.generateKey(
-          { name: 'ECDSA', namedCurve: 'P-256' },
-          false,
-          ['sign', 'verify']
-        );
-        const rawPub = new Uint8Array(await window.crypto.subtle.exportKey('raw', keyPair.publicKey));
-        const pubHex = bytesToHex(rawPub);
-
-        // 2. Register pending bootstrap transaction with App A's backend
-        const initRes = await fetch('/api/auth/bootstrap/init', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'X-UMAI-CSRF': '1' },
-          credentials: 'include',
-          body: JSON.stringify({ public_key: pubHex })
-        });
-        if (!initRes.ok) {
-          throw new Error('Failed to initialize auth bootstrap transaction');
-        }
-        const tx = await initRes.json();
-
-        // 3. Open top-level authentication window on App A bound to tx_id and opener_nonce.
-        // Upon user authorization, the popup delivers a one-time auth_secret directly to this iframe
-        // via same-origin window.opener.postMessage, which we then sign with our non-extractable P-256 key.
-        const popupUrl = `/?auth_tx=${encodeURIComponent(tx.tx_id)}&opener_nonce=${encodeURIComponent(tx.opener_nonce)}`;
-        const popupWin = window.open(popupUrl, 'umai_top_level_auth', 'popup,width=520,height=640');
-        activeBootstrapState = {
-          txId: tx.tx_id,
-          challenge: tx.challenge,
-          privateKey: keyPair.privateKey,
-          popupWin: popupWin
-        };
-      } catch (err) {
-        loginError.textContent = err.message || 'Top-level bootstrap failed';
-        loginError.style.display = 'block';
+      if (window.parent && window.parent !== window && peerOrigin) {
+        notifyParent('OPEN_COMPANION');
+      } else {
+        window.open('/sync.html', 'umai_companion_a', 'popup,width=420,height=360');
       }
     });
   }
 
-  // Listen for same-origin popup bootstrap grant and parent control messages
-  window.addEventListener('message', async function (e) {
-    if (
-      activeBootstrapState &&
-      e.origin === window.location.origin &&
-      e.source === activeBootstrapState.popupWin &&
-      e.data &&
-      e.data.protocol === 'UMAI_BOOTSTRAP' &&
-      e.data.type === 'UMAI_BOOTSTRAP_GRANT' &&
-      e.data.tx_id === activeBootstrapState.txId &&
-      typeof e.data.auth_secret === 'string' &&
-      e.data.auth_secret.length > 0
-    ) {
-      const state = activeBootstrapState;
-      activeBootstrapState = null;
-      try {
-        const challengeBytes = new TextEncoder().encode(
-          `UMAI-BOOTSTRAP-V1:${state.txId}:${state.challenge}:${e.data.auth_secret}`
-        );
-        const sigBuf = await window.crypto.subtle.sign(
-          { name: 'ECDSA', hash: 'SHA-256' },
-          state.privateKey,
-          challengeBytes
-        );
-        const sigHex = bytesToHex(new Uint8Array(sigBuf));
-        const redeemRes = await fetch('/api/auth/bootstrap/redeem', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'X-UMAI-CSRF': '1' },
-          credentials: 'include',
-          body: JSON.stringify({
-            tx_id: state.txId,
-            auth_secret: e.data.auth_secret,
-            signature: sigHex
-          })
-        });
-        if (redeemRes.ok) {
-          startSyncWorker();
-        }
-      } catch (err) {
-        loginError.textContent = err.message || 'Failed to redeem bootstrap session';
-        loginError.style.display = 'block';
-      }
-      return;
-    }
-
+  // Listen for control messages from the host window (iframe parent or companion opener)
+  window.addEventListener('message', function (e) {
     if (peerOrigin && e.origin !== peerOrigin) return;
-    if (window.parent && e.source !== window.parent) return;
+    const hostWin = getHostWindow();
+    if (hostWin && e.source !== hostWin) return;
     if (!e.data || e.data.protocol !== 'UMAI_CONTROL') return;
     if (e.data.type === 'TRIGGER_SYNC') {
       if (umaiSession && isAuthenticated) {
