@@ -174,7 +174,7 @@ The core `OFFER` / `GET` / `PUT` / `ACK` protocol operates strictly over a dedic
    ```javascript
    targetHostWindow.postMessage({ protocol: "UMAI", version: 1, type: "READY" }, peerOrigin);
    ```
-3. **Port Transfer:** The host validates `event.origin === peerOrigin` (and verifies `event.source` matches the expected `iframe.contentWindow` or `peerWindow`), instantiates a `MessageChannel`, retains `port1`, and transfers `port2` to the peer window:
+3. **Port Transfer (Fail-Closed Window Binding):** The host validates `event.origin === peerOrigin` and strictly verifies that the expected target window (`iframe.contentWindow` or `peerWindow`) is bound and open (`expectedSource !== null`) and that `event.source === expectedSource` (never dynamically adopting an unbound `event.source`). It then instantiates a `MessageChannel`, retains `port1`, and transfers `port2` to the peer window:
    ```javascript
    targetPeerWindow.postMessage(
      { protocol: "UMAI", version: 1, type: "INIT" },
@@ -182,7 +182,7 @@ The core `OFFER` / `GET` / `PUT` / `ACK` protocol operates strictly over a dedic
      [channel.port2]
    );
    ```
-4. **Port Confirmation:** The peer window verifies `event.origin === peerOrigin` and `event.source`, claims `event.ports[0]`, and sends `INIT_ACK` over the private port.
+4. **Port Confirmation:** The peer window verifies `event.origin === peerOrigin` and strictly checks that `expectedSource` (`window.parent` or `window.opener`) is non-null and `event.source === expectedSource`, claims `event.ports[0]`, and sends `INIT_ACK` over the private port.
 5. **Private Point-to-Point Channel:** All subsequent protocol messages (`OFFER`, `GET`, `PUT`, `ACK`) travel exclusively over the dedicated `MessagePort`.
 
 ### 5.2 Concurrency & Transfer Ordering

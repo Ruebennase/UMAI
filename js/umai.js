@@ -392,15 +392,15 @@
       }
 
       const expectedSource = this._getTargetWindow();
+      // Fail-closed window binding: both host and embedded roles must know their target window
+      // in advance (iframe.contentWindow, peerWindow, window.parent, or window.opener), and
+      // event.source must strictly equal expectedSource. Never auto-adopt an unknown window.
+      if (!expectedSource || !event.source || event.source !== expectedSource) {
+        return;
+      }
 
       if (this.role === 'host') {
-        if (expectedSource && event.source && event.source !== expectedSource) {
-          return;
-        }
         if (data.type === 'READY') {
-          if (!this.peerWindow && !this.iframe && event.source) {
-            this.peerWindow = event.source;
-          }
           this.log('info', 'Received READY from peer');
           // If peer reloaded or restarted, reset port and per-channel transfer state
           if (this.port) {
@@ -418,9 +418,6 @@
           this._initiateHostHandshake(event.origin);
         }
       } else if (this.role === 'embedded') {
-        if (expectedSource && event.source && event.source !== expectedSource) {
-          return;
-        }
         if (data.type === 'INIT' && event.ports && event.ports.length > 0) {
           if (this._readyInterval) {
             clearInterval(this._readyInterval);

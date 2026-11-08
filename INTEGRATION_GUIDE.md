@@ -426,8 +426,11 @@ When `POST /api/inbox/accept` is called by `acceptMessage(msg)`:
 5. Later, a user in your application opens the **Incoming Tray**, reviews the message, and assigns it to a business case or workflow (`UPDATE umai_incoming_tray SET assigned_case_id = ...`).
 
 > [!TIP]
-> **Why Separating Technical Acceptance from Business Classification Matters:**
-> Never reject `acceptMessage()` inside the UMAI transport layer just because a business field (like an internal case number) is unknown or needs human review. Accepting the message into an **Unassigned Incoming Tray** allows UMAI to `ACK` and clear the sender's outbox immediately while letting the human user classify the document in your UI afterward.
+> **Why Separating Technical Acceptance from Business Classification Matters (And How User Approval / Drag-and-Drop Works Above UMAI):**
+> Never reject `acceptMessage()` inside the UMAI transport layer just because a business field (like an internal case number) is unknown or needs human review, and do not pause the transport state machine between `OFFER` and `GET` (since `OFFER` carries only opaque IDs, not subjects or metadata).
+> Instead, human approval, selective transfer, and drag-and-drop belong cleanly **one layer above UMAI**:
+> - **Sender-Side Selection / Drag-and-Drop (Outbox Gating):** Keep draft documents in your normal application storage and only insert a message into the UMAI Outbox (`getOutboxIds()`) when the user clicks *"Send"* or drags-and-drops the item.
+> - **Receiver-Side Approval (Incoming Tray Gating):** Let UMAI transfer incoming messages automatically into your durable **Unassigned Incoming Tray** (`acceptMessage` $\rightarrow$ `ACK`), where your UI has the full verified payload, subject, and attachments and can let the user click *"Import to Case"* or *"Discard"* at their leisure.
 
 ---
 
@@ -460,6 +463,8 @@ The `UmaiSession` provides an `onSyncStatus` callback specifically for this purp
 ```javascript
 const umai = new UMAI.UmaiSession({
   peerOrigin: 'https://app-a.company.com',
+  role: 'host',
+  iframe: document.getElementById('legacy-app-frame'),
   storage: myStorageAdapter,
   onSyncStatus({ isSyncing, state, pendingOutgoing, pendingIncoming, detail }) {
     const badge = document.getElementById('sync-indicator');

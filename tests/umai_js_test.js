@@ -328,8 +328,45 @@ function createMockChannel() {
     data: { protocol: PROTOCOL_NAME, version: PROTOCOL_VERSION, type: 'READY' }
   });
   assert.strictEqual(popupPortReceived, true, 'Host session must complete handshake with top-level peerWindow without an iframe');
+
+  // Verify fail-closed window binding:
+  // 1) A different window from the same peerOrigin must be rejected
+  popupPortReceived = false;
+  const rogueSameOriginWindow = {
+    closed: false,
+    postMessage() {
+      popupPortReceived = true;
+    }
+  };
+  hostPopupSession._handleWindowMessage({
+    origin: 'http://companion.example',
+    source: rogueSameOriginWindow,
+    data: { protocol: PROTOCOL_NAME, version: PROTOCOL_VERSION, type: 'READY' }
+  });
+  assert.strictEqual(popupPortReceived, false, 'Handshake must reject READY from a different Window of the same peerOrigin');
+
+  // 2) An unbound host session (no iframe, no peerWindow) must fail closed and NEVER auto-adopt event.source
+  const unboundHostSession = new UmaiSession({
+    peerOrigin: 'http://companion.example',
+    role: 'host',
+    storage: {
+      getOutboxIds: async () => [],
+      getMessage: async () => null,
+      isAccepted: async () => false,
+      acceptMessage: async () => true,
+      onAcknowledged: async () => {}
+    }
+  });
+  unboundHostSession._handleWindowMessage({
+    origin: 'http://companion.example',
+    source: rogueSameOriginWindow,
+    data: { protocol: PROTOCOL_NAME, version: PROTOCOL_VERSION, type: 'READY' }
+  });
+  assert.strictEqual(unboundHostSession.peerWindow, null, 'Unbound host session must not auto-adopt event.source on READY');
+  assert.strictEqual(popupPortReceived, false, 'Unbound host session must not send INIT');
+  unboundHostSession.stop();
   hostPopupSession.stop();
-  console.log('✓ Test 6: Top-level companion/popup window binding (peerWindow) passed');
+  console.log('✓ Test 6: Top-level companion/popup window binding (peerWindow) & fail-closed source check passed');
 
   senderPoison.stop();
   receiverPoison.stop();
