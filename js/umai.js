@@ -75,6 +75,23 @@
   }
 
   /**
+   * Normalizes an adapter acceptance response ({ accepted: boolean, ackReceipt?: string } or boolean).
+   */
+  function parseAcceptanceResult(res) {
+    if (res && typeof res === 'object') {
+      const accepted = res.accepted !== undefined ? Boolean(res.accepted) : Boolean(res.ackReceipt || res.ack_receipt);
+      const ackReceipt = typeof res.ackReceipt === 'string'
+        ? res.ackReceipt
+        : (typeof res.ack_receipt === 'string' ? res.ack_receipt : '');
+      return { accepted, ackReceipt };
+    }
+    return {
+      accepted: Boolean(res),
+      ackReceipt: ''
+    };
+  }
+
+  /**
    * Main UMAI Session Adapter.
    */
   class UmaiSession {
@@ -86,10 +103,10 @@
      * @param {Window} [options.peerWindow] Optional direct Window reference (e.g. popup from window.open or window.opener)
      * @param {Object} options.storage Handlers for reading/writing local messages:
      *   - getOutboxIds(): Promise<string[]>
-     *   - getMessage(id): Promise<{ id: string, payload: any, attachments: File[] }>
-     *   - isAccepted(id): Promise<boolean>
-     *   - acceptMessage(msg: { id: string, payload: any, attachments: File[] }): Promise<boolean>
-     *   - onAcknowledged(ids: string[]): Promise<void>
+     *   - getMessage(id): Promise<{ id: string, payload: any, attachments: File[], signature?: string }>
+     *   - isAccepted(id): Promise<{ accepted: boolean, ackReceipt?: string } | boolean>
+     *   - acceptMessage(msg: { id: string, payload: any, attachments: File[], signature?: string }): Promise<{ accepted: boolean, ackReceipt?: string } | boolean>
+     *   - onAcknowledged(ids: string[], receipts?: Record<string, string>): Promise<void>
      * @param {Function} [options.onStatusChange] Callback: ({ state, detail }) => void
      * @param {Function} [options.onLog] Callback: ({ level, message, details }) => void
      * @param {Function} [options.onError] Callback: (error) => void
@@ -587,14 +604,12 @@
       const toFetch = [];
 
       for (const id of offeredIds) {
-        const accResult = await this.storage.isAccepted(id);
-        if (accResult) {
+        const acc = parseAcceptanceResult(await this.storage.isAccepted(id));
+        if (acc.accepted) {
           this._failedAttempts.delete(id);
           alreadyAccepted.push(id);
-          if (typeof accResult === 'string' && accResult.length > 0) {
-            repeatedReceipts[id] = accResult;
-          } else if (typeof accResult === 'object' && accResult.ackReceipt) {
-            repeatedReceipts[id] = accResult.ackReceipt;
+          if (acc.ackReceipt) {
+            repeatedReceipts[id] = acc.ackReceipt;
           }
         } else {
           const failCount = this._failedAttempts.get(id) || 0;
@@ -766,14 +781,12 @@
 
       try {
         // Duplicate check: if already accepted, send ACK again and do not import twice
-        const alreadyAccepted = await this.storage.isAccepted(id);
-        if (alreadyAccepted) {
+        const alreadyAcc = parseAcceptanceResult(await this.storage.isAccepted(id));
+        if (alreadyAcc.accepted) {
           this.log('info', `Message ${id} already accepted; sending ACK without re-importing`);
           const receipts = Object.create(null);
-          if (typeof alreadyAccepted === 'string' && alreadyAccepted.length > 0) {
-            receipts[id] = alreadyAccepted;
-          } else if (typeof alreadyAccepted === 'object' && alreadyAccepted.ackReceipt) {
-            receipts[id] = alreadyAccepted.ackReceipt;
+          if (alreadyAcc.ackReceipt) {
+            receipts[id] = alreadyAcc.ackReceipt;
           }
           const ackMsg = {
             protocol: PROTOCOL_NAME,
@@ -788,21 +801,19 @@
         }
 
         // Rule 3 & 4: Attempt atomic acceptance
-        const result = await this.storage.acceptMessage({
+        const acceptRes = parseAcceptanceResult(await this.storage.acceptMessage({
           id: put.id,
           payload: (put.payload !== undefined && put.payload !== null) ? put.payload : {},
           attachments: attachments,
           signature: typeof put.signature === 'string' ? put.signature : ''
-        });
+        }));
 
-        if (result) {
+        if (acceptRes.accepted) {
           this._failedAttempts.delete(id);
           this.log('info', `Successfully accepted message ${id}. Sending ACK.`);
           const receipts = Object.create(null);
-          if (typeof result === 'string' && result.length > 0) {
-            receipts[id] = result;
-          } else if (typeof result === 'object' && result.ackReceipt) {
-            receipts[id] = result.ackReceipt;
+          if (acceptRes.ackReceipt) {
+            receipts[id] = acceptRes.ackReceipt;
           }
           const ackMsg = {
             protocol: PROTOCOL_NAME,

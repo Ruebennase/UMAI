@@ -196,10 +196,10 @@ function createMockChannel() {
     storage: {
       getOutboxIds: async () => [],
       getMessage: async () => null,
-      isAccepted: async () => false,
+      isAccepted: async () => ({ accepted: false }),
       acceptMessage: async () => {
         poisonAttempts++;
-        return false; // Reject acceptance
+        return { accepted: false }; // Reject acceptance via structured object
       },
       onAcknowledged: async () => {}
     }
@@ -232,15 +232,18 @@ function createMockChannel() {
   let slowMsgAccepted = false;
   const slowChannel = createMockChannel();
 
+  let ackReceiptsOnSenderSlow = {};
   const senderSlow = new UmaiSession({
     peerOrigin: 'http://peer.example',
     role: 'host',
     storage: {
       getOutboxIds: async () => ['msg-slow-1'],
       getMessage: async (id) => ({ id, payload: false, attachments: [] }),
-      isAccepted: async () => false,
-      acceptMessage: async () => true,
-      onAcknowledged: async () => {}
+      isAccepted: async () => ({ accepted: false }),
+      acceptMessage: async () => ({ accepted: true }),
+      onAcknowledged: async (ids, receipts) => {
+        if (receipts) Object.assign(ackReceiptsOnSenderSlow, receipts);
+      }
     }
   });
 
@@ -250,7 +253,7 @@ function createMockChannel() {
     storage: {
       getOutboxIds: async () => [],
       getMessage: async () => null,
-      isAccepted: async () => slowMsgAccepted,
+      isAccepted: async () => ({ accepted: slowMsgAccepted, ackReceipt: slowMsgAccepted ? 'receipt-slow-1' : '' }),
       acceptMessage: async (msg) => {
         acceptCallsForSlowMsg++;
         assert.strictEqual(msg.payload, false, 'Falsy scalar payload (false) must be preserved');
@@ -258,7 +261,7 @@ function createMockChannel() {
           releaseAcceptPromise = resolve;
         });
         slowMsgAccepted = true;
-        return 'receipt-slow-1';
+        return { accepted: true, ackReceipt: 'receipt-slow-1' };
       },
       onAcknowledged: async () => {}
     }
@@ -287,6 +290,7 @@ function createMockChannel() {
   releaseAcceptPromise();
   await new Promise(r => setTimeout(r, 30));
   assert.strictEqual(receiverSlow.getSyncStatus().isSyncing, false, 'isSyncing must become false after acceptMessage finishes');
+  assert.strictEqual(ackReceiptsOnSenderSlow['msg-slow-1'], 'receipt-slow-1', 'Structured { accepted: true, ackReceipt } must propagate receipt in ACK');
 
   // Verify expired GET reservation recovery (F3): if an ID is in _inFlightGets with an expired timestamp, next OFFER re-requests it
   receiverSlow._inFlightGets.set('msg-expired-get', Date.now() - 20000);

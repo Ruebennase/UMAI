@@ -450,9 +450,9 @@
         const res = await api('/api/accepted/receipts');
         const receiptsMap = await res.json();
         if (receiptsMap && Object.prototype.hasOwnProperty.call(receiptsMap, id)) {
-          return receiptsMap[id] || true;
+          return { accepted: true, ackReceipt: receiptsMap[id] || '' };
         }
-        return false;
+        return { accepted: false };
       },
 
       async acceptMessage(putMsg) {
@@ -476,9 +476,9 @@
         if (res.ok) {
           const data = await res.json();
           await loadInbox();
-          return data.ack_receipt || true;
+          return { accepted: true, ackReceipt: data.ack_receipt || '' };
         }
-        return false;
+        return { accepted: false };
       },
 
       async onAcknowledged(ids, receipts) {

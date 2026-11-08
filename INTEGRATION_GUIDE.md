@@ -108,17 +108,17 @@ interface UmaiStorageAdapter {
   } | null>;
 
   // 3. Checks whether a message ID has already been accepted in the past (Rule 5).
-  // May return a boolean or the stored cryptographic ACK receipt string for repeated ACKs.
-  isAccepted(id: string): Promise<boolean | string>;
+  // Returns { accepted: boolean, ackReceipt?: string } (or a plain boolean for simple unsigned adapters).
+  isAccepted(id: string): Promise<{ accepted: boolean; ackReceipt?: string } | boolean>;
 
   // 4. Commits an incoming complete message and its File attachments (Rule 3 & 4).
-  // Returns true (or the receiving server's cryptographic ACK receipt string) on success, false on error.
+  // Returns { accepted: boolean, ackReceipt?: string } (or a plain boolean for simple unsigned adapters).
   acceptMessage(msg: {
     id: string;
     payload: any;
     attachments: File[];
     signature?: string;
-  }): Promise<boolean | string>;
+  }): Promise<{ accepted: boolean; ackReceipt?: string } | boolean>;
 
   // 5. Cleans up acknowledged message IDs from the outbox (Rule 6), passing any signed ACK receipts.
   onAcknowledged(ids: string[], receipts?: Record<string, string>): Promise<void>;
@@ -184,8 +184,11 @@ In Application A's web page (preferably placing the initialization script in an 
     async isAccepted(id) {
       const res = await fetch(`/api/accepted/check?id=${encodeURIComponent(id)}`);
       const data = await res.json();
-      // Return the stored cryptographic ack_receipt string (if signed) or boolean true/false
-      return data.accepted ? (data.ack_receipt || true) : false;
+      // Return structured { accepted, ackReceipt } object
+      return {
+        accepted: Boolean(data.accepted),
+        ackReceipt: data.ack_receipt || ''
+      };
     },
 
     async acceptMessage(msg) {
@@ -200,9 +203,12 @@ In Application A's web page (preferably placing the initialization script in an 
       }
 
       const res = await fetch('/api/inbox/accept', { method: 'POST', body: formData });
-      if (!res.ok) return false;
+      if (!res.ok) return { accepted: false };
       const data = await res.json().catch(() => ({}));
-      return data.ack_receipt || true;
+      return {
+        accepted: true,
+        ackReceipt: data.ack_receipt || ''
+      };
     },
 
     async onAcknowledged(ids, receipts) {
@@ -430,7 +436,7 @@ When `POST /api/inbox/accept` is called by `acceptMessage(msg)`:
 > Never reject `acceptMessage()` inside the UMAI transport layer just because a business field (like an internal case number) is unknown or needs human review, and do not pause the transport state machine between `OFFER` and `GET` (since `OFFER` carries only opaque IDs, not subjects or metadata).
 > Instead, human approval, selective transfer, and drag-and-drop belong cleanly **one layer above UMAI**:
 > - **Sender-Side Selection / Drag-and-Drop (Outbox Gating):** Keep draft documents in your normal application storage and only insert a message into the UMAI Outbox (`getOutboxIds()`) when the user clicks *"Send"* or drags-and-drops the item.
-> - **Receiver-Side Approval (Incoming Tray Gating):** Let UMAI transfer incoming messages automatically into your durable **Unassigned Incoming Tray** (`acceptMessage` $\rightarrow$ `ACK`), where your UI has the full verified payload, subject, and attachments and can let the user click *"Import to Case"* or *"Discard"* at their leisure.
+> - **Receiver-Side Approval (Incoming Tray Gating):** Let UMAI transfer incoming messages automatically into your durable **Unassigned Incoming Tray** (`acceptMessage` → `ACK`), where your UI has the full verified payload, subject, and attachments and can let the user click *"Import to Case"* or *"Discard"* at their leisure.
 
 ---
 
@@ -450,7 +456,7 @@ const umai = new UMAI.UmaiSession({
 });
 umai.start();
 ```
-Inside `https://app-a.company.com/sync.html`, `UmaiSession` automatically detects `window.opener` when `window.parent === window` and performs the exact same origin-pinned `READY` $\rightarrow$ `INIT` (`MessagePort`) $\rightarrow$ `INIT_ACK` handshake. Because both applications run as top-level windows, **zero third-party or partitioned cookies are required**.
+Inside `https://app-a.company.com/sync.html`, `UmaiSession` automatically detects `window.opener` when `window.parent === window` and performs the exact same origin-pinned `READY` → `INIT` (`MessagePort`) → `INIT_ACK` handshake. Because both applications run as top-level windows, **zero third-party or partitioned cookies are required**.
 
 ---
 
@@ -527,8 +533,8 @@ Both applications must explicitly trust the specific peer origin (never use `*`)
 
 ### 4. Protocol Invariants
 1. **Rule 1 — Immutability:** Never modify a message once offered. If data changes, generate a new message ID.
-2. **Rule 3 — All-or-Nothing Acceptance:** If saving any file fails in `acceptMessage`, return `false`. Never acknowledge or store a partial message.
-3. **Rule 5 — Repeated Acknowledgements:** If `isAccepted(id)` returns `true` (or a stored cryptographic receipt string) for an offered message, UMAI automatically sends `ACK` without re-requesting the message. Ensure your `isAccepted` method checks persistent storage so accepted IDs survive browser restarts.
+2. **Rule 3 — All-or-Nothing Acceptance:** If saving any file fails in `acceptMessage`, return `{ accepted: false }`. Never acknowledge or store a partial message.
+3. **Rule 5 — Repeated Acknowledgements:** If `isAccepted(id)` returns `{ accepted: true, ackReceipt }` for an offered message, UMAI automatically sends `ACK` without re-requesting the message. Ensure your `isAccepted` method checks persistent storage so accepted IDs survive browser restarts.
 
 ---
 

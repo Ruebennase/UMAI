@@ -2,7 +2,9 @@
 
 **User-Mediated Application Interoperability**  
 **Version:** 0.1 (Draft / Experimental Reference Specification)  
-**Date:** November 2026  
+
+### Status of This Document
+This document specifies **UMAI 0.1**, an experimental, vendor-neutral protocol and browser transport binding for user-mediated application interoperability. Key words `MUST`, `MUST NOT`, `SHOULD`, `SHOULD NOT`, and `MAY` in this document are to be interpreted as normative requirements per RFC 2119.
 
 ---
 
@@ -43,8 +45,10 @@ UMAI defines exactly four operations. No additional message types are required f
 
 ### 3.2 Protocol Rules & Invariants
 
-#### Rule 1 — Immutability
+#### Rule 1 — Immutability & Globally Unique Message IDs
 Every message is assigned a globally unique identifier (Message ID) upon creation. Once offered, its payload and attachments MUST NEVER change. Any modification to metadata or attachments constitutes a new message and requires a distinct Message ID.
+- **Normative Message ID Format:** A Message ID MUST be a non-empty ASCII string of `1` to `128` characters restricted to `[a-zA-Z0-9._-]`, and MUST NOT equal `"."` or contain `".."`.
+- **Collision Resistance & Entropy:** Senders MUST generate Message IDs with at least **64 bits of cryptographic randomness** (CSPRNG), such as `msg-<unix_ms>-<16_hex_chars>` (as implemented in `pkg/umaiserver`) or a standard UUIDv4 / UUIDv7 (`36` characters), so that Message IDs are globally unique across sessions, restarts, and tenants without central coordination.
 
 #### Rule 2 — Receiver-Controlled Transfer
 The sender does not push messages uninvited. The sender advertises available message IDs using `OFFER`. The receiver evaluates the offer against its Accepted Set and requests only those IDs it does not possess using `GET`. Conversely, a sender MUST ignore `GET` or `ACK` messages referencing Message IDs that it has not offered, and a receiver MUST ignore unsolicited `PUT` messages that it did not request via `GET`.
@@ -63,8 +67,8 @@ Whenever a sender offers a Message ID that the receiver has already accepted in 
 The receiver MUST NOT send `GET` or accept `PUT` for an already-accepted message.
 *Rationale:* Network disruptions or browser closures may cause an initial `ACK` to be lost. Repeated acknowledgements allow the sender to safely clean up its outbox without risking duplicate imports.
 
-#### Rule 6 — Sender Cleanup
-Upon receiving an `ACK` for a Message ID, the sender MAY remove that message and its attachment snapshots from its outbox. Senders may choose to retain messages longer for auditing purposes.
+#### Rule 6 — Sender Cleanup & Non-Reuse of Acknowledged IDs
+Upon receiving an `ACK` for a Message ID, the sender MAY remove that message and its attachment snapshots from its outbox. Senders may choose to retain messages longer for auditing purposes. Once a Message ID has been acknowledged and removed from the outbox, the sender MUST NEVER reuse that Message ID for any future message (Rule 1).
 
 #### Rule 7 — Reconnection & Reconciliation
 When communication between peers is established or restored, both peers exchange their outstanding outbox offers (`OFFER`). No specialized recovery protocol or vector clock mechanism is required.
@@ -185,8 +189,8 @@ The core `OFFER` / `GET` / `PUT` / `ACK` protocol operates strictly over a dedic
 4. **Port Confirmation:** The peer window verifies `event.origin === peerOrigin` and strictly checks that `expectedSource` (`window.parent` or `window.opener`) is non-null and `event.source === expectedSource`, claims `event.ports[0]`, and sends `INIT_ACK` over the private port.
 5. **Private Point-to-Point Channel:** All subsequent protocol messages (`OFFER`, `GET`, `PUT`, `ACK`) travel exclusively over the dedicated `MessagePort`.
 
-### 5.2 Concurrency & Transfer Ordering
-To prevent browser memory exhaustion, an implementation SHOULD serialize `PUT` transfers, transmitting at most one `PUT` message at a time per direction.
+### 5.2 Concurrency, Transfer Ordering & Recommended Size Bounds
+To prevent browser memory exhaustion, an implementation SHOULD serialize `PUT` transfers, transmitting at most one `PUT` message at a time per direction. Because browser `MessagePort` transfers clone `File`/`Blob` metadata and backend storage adapters typically buffer or stream a single message per HTTP request, implementations SHOULD bound individual messages to a practical interactive envelope (for example, `<= 50 MB` total attachment size and `<= 50` attachments per message, configurable by the deployment).
 
 ---
 
@@ -196,7 +200,9 @@ UMAI does not prescribe internal application schemas or databases, but imposes t
 
 1. **Snapshotting:** Before an outgoing message is offered, any selected documents must be snapshotted into an immutable message directory. Subsequent changes or deletions to local working files must not modify the offered attachment data.
 2. **Crash-Resistant Acceptance:** When accepting a `PUT` message, the receiver must stage incoming files and metadata in a temporary workspace, verify completion and integrity, and atomically commit the files before adding the ID to the durable Accepted Set.
-3. **Accepted ID Durability:** The Accepted Set must survive application restarts and browser closures.
+3. **Accepted ID Durability & Storage Scaling:** The Accepted Set must survive application restarts and browser closures so Rule 5 repeated acknowledgements remain reliable across sessions.
+   - **Compact Storage Footprint:** Because an Accepted Set entry stores only the `umai_message_id` (`<= 128` bytes), creation timestamp, and optional `ack_receipt` (`~128` hex bytes)—not the document attachments themselves—each entry occupies roughly `150–250 bytes`. Even 1,000,000 accepted messages require only `~150–250 MB` in a standard indexed database table (`PRIMARY KEY (umai_message_id)`), providing `O(1)` / `O(log N)` lookups.
+   - **Optional Multi-Year Retention Horizon:** If a deployment wishes to prune Accepted Set entries after a long retention window (e.g., `1–2 years`), both peers SHOULD enforce a shorter maximum outbox lifetime (e.g., unacknowledged outbox messages expire after `90 days`), and the receiver SHOULD verify payload/signature equality if an existing record with the same ID still resides in its long-term archive.
 
 ---
 

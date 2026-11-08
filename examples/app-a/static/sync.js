@@ -118,12 +118,12 @@
 
       async isAccepted(id) {
         const res = await api('/api/accepted/receipts');
-        if (!res.ok) return false;
+        if (!res.ok) return { accepted: false };
         const receiptsMap = await res.json();
         if (receiptsMap && Object.prototype.hasOwnProperty.call(receiptsMap, id)) {
-          return receiptsMap[id] || true;
+          return { accepted: true, ackReceipt: receiptsMap[id] || '' };
         }
-        return false;
+        return { accepted: false };
       },
 
       async acceptMessage(msg) {
@@ -141,9 +141,9 @@
           method: 'POST',
           body: formData
         });
-        if (!res.ok) return false;
+        if (!res.ok) return { accepted: false };
         const data = await res.json();
-        return data.ack_receipt || true;
+        return { accepted: true, ackReceipt: data.ack_receipt || '' };
       },
 
       async onAcknowledged(ids, receipts) {

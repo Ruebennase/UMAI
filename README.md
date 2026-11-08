@@ -62,7 +62,19 @@ In a typical hub-and-spoke ecosystem (demonstrated by our [Minimal Production Vi
 - **Application A (Messaging Platform):** Implements UMAI once by providing a lightweight, self-contained embedded sync endpoint (`/sync.html`) that handles its own session management and Federated IdP login bootstrap.
 - **Application B (Specialty Application):** The user works primarily inside Application B, which embeds Application A's `/sync.html` frame (or opens it as a companion window) and implements the tiny 5-method storage adapter against its existing database.
 - **Strict Separation of Concerns:** Application B remains completely unaware of Application A's authentication internals (OIDC, SAML, MFA, government eID), and UMAI's technical delivery (`ACK`) simply places verified incoming items into Application B's durable **Incoming Tray** so the user can classify or assign them to a business case afterward.
-- **Low Integration Cost:** Because the protocol engine (`js/umai.js`) is used verbatim and existing database tables can back the 5-method adapter directly, a typical specialty application can integrate UMAI in **~4–7 developer-days**.
+- **Low Integration Cost:** Because the protocol engine (`js/umai.js`) is used verbatim and existing database tables can back the 5-method adapter directly, a typical specialty application can integrate UMAI in **a matter of days rather than weeks or months** (see the detailed engineering breakdown in [`INTEGRATION_GUIDE.md`](INTEGRATION_GUIDE.md#8-integration-economics--effort-estimate)).
+
+### When UMAI Is (and Isn't) the Right Fit
+
+Because UMAI relies on an active browser session to ferry messages between applications (Rule 8), it is important to match the protocol to the right operational profile:
+
+- **Where UMAI Excels:**
+  - **Human-in-the-Loop Workflows:** Case management, legal/medical/public-sector correspondence, invoice review, and document filing where a human user already opens Application B during working hours to review, classify, or act on incoming items.
+  - **Long-Tail Vendor Ecosystems:** Connecting a central platform to dozens of specialized or legacy applications where bespoke VPNs, mTLS gateways, and service-account orchestration are economically prohibitive.
+  - **Standard Document & Record Bundles:** Structured JSON payloads accompanied by typical business attachments (e.g., PDFs, XML/JSON records, spreadsheets, and images up to tens of megabytes per message).
+- **When to Use Conventional Server-to-Server APIs Instead:**
+  - **Unattended 24/7 Real-Time Alerting or Sub-Second SLAs:** Because **no messages move while no authorized browser session bridges the two applications**, workflows that require guaranteed middle-of-the-night delivery or sub-second machine-to-machine RPC without a human online must use direct server-to-server webhooks or message queues.
+  - **High-Throughput Bulk Database Migrations or Multi-Gigabyte Media Streams:** Because `js/umai.js` serializes `PUT` transfers one at a time in browser memory, multi-terabyte backfills or continuous high-frequency telemetry streams belong on dedicated backend pipelines.
 
 ### Conceptual Lineage: Browsers as Zero-Install Store-Carry-Forward Couriers
 
@@ -88,9 +100,9 @@ Because UMAI leaves backend storage and queuing policy to the implementer, appli
      - *Server-Side Next-Best Message Selection (Bandwidth-Optimization Lease):* As a best-practice example in `pkg/umaiserver`, fetching an outbox message (`GET /api/outbox/{id}`) places a 15-second soft in-flight lease on it and rotates the unclaimed queue per session. Rather than acting as a hard mutual-exclusion lock, this soft priority hint steers concurrent browsers toward unclaimed messages first to save bandwidth—and if a browser tab closes mid-transfer, the soft lease expires after 15 seconds so another online browser seamlessly takes over.
      - *Server-Side Signing & Optional Encryption:* Combining our reference server's `Ed25519` signing with optional asymmetric encryption ensures a mediating user's browser cannot modify—or even inspect—another user's message while ferrying it.
 
-### Beyond Bilateral: Multi-Server Application Meshes ($N \ge 3$)
+### Beyond Bilateral: Multi-Server Application Meshes (N ≥ 3)
 
-While the code in this repository demonstrates a bilateral exchange (App A $\leftrightarrow$ App B), the UMAI principle is not limited to two systems. Because modern browsers place no logical limit on the number of isolated `<iframe>` contexts or `MessagePort` channels in a tab, a single host application can orchestrate a **multi-server application mesh** connecting 3, 4, or more completely independent backends:
+While the code in this repository demonstrates a bilateral exchange (App A ↔ App B), the UMAI principle is not limited to two systems. Because modern browsers place no logical limit on the number of isolated `<iframe>` contexts or `MessagePort` channels in a tab, a single host application can orchestrate a **multi-server application mesh** connecting 3, 4, or more completely independent backends:
 
 ```mermaid
 graph TD
@@ -107,15 +119,15 @@ graph TD
     end
 ```
 
-Two distinct multi-server patterns are possible:
+Two distinct multi-server patterns are possible, both built out of standard pairwise (`1:1`) `UmaiSession` links:
 
 1. **Hub-and-Spoke Mesh (Store-and-Forward via Host):**
-   - The host application embeds several lightweight sync frames (e.g. CRM, DMS, Billing).
-   - The host backend or client orchestrator maintains separate UMAI sessions with each spoke. Messages from App A destined for App C can be accepted by the host and placed in its outbox for App C.
-   - Combining this with **Tier 2 Ed25519 signing** and **Tier 3 Asymmetric Encryption** allows the host to act as a **blind relay**: App A encrypts the payload directly to App C's public key, so the intermediate host (and the user) cannot read or tamper with the data in transit.
+   - The host application embeds several lightweight sync frames (e.g. CRM, DMS, Billing) and instantiates one standard `UmaiSession` per spoke.
+   - Messages from App A destined for App C can be accepted by the host on Channel 1 (`sender: A, receiver: Host`) and queued in the host's outbox for App C on Channel 2 (`sender: Host, receiver: C`).
+   - Combining this with **Tier 2 Ed25519 signing** and **Tier 3 Asymmetric Encryption** allows the host to act as a **blind relay**: App A signs an inner end-to-end envelope binding `sender: A, receiver: C` and encrypts it to App C's public key, while the host transfers that opaque ciphertext over its pairwise hop to App C.
 2. **Direct Peer-to-Peer Port Handoff:**
    - Because `MessagePort` instances are *transferable objects*, the host can create a `MessageChannel` and transfer `port1` to App A and `port2` to App C via `postMessage`.
-   - Once transferred, App A and App C communicate directly across that dedicated point-to-point port in browser memory, with zero host interception.
+   - Once transferred, App A and App C communicate directly across that dedicated pairwise (`A ↔ C`) point-to-point port in browser memory, with `UMAI-PUT-V1` binding `sender: A, receiver: C` directly and zero host interception.
 
 In both patterns, each application continues to communicate strictly with its own same-origin backend (`connect-src 'self'`), preserving the zero-CORS, zero-backend-tunnel security boundary across the entire mesh.
 
