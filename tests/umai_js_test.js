@@ -6,6 +6,14 @@
 const assert = require('assert');
 const { UmaiSession, PROTOCOL_NAME, PROTOCOL_VERSION, isValidUmaiMessage, isValidMessageId } = require('../js/umai.js');
 
+let allTestsCompleted = false;
+process.on('exit', (code) => {
+  if (code === 0 && !allTestsCompleted) {
+    console.error('FATAL: JavaScript test suite exited prematurely with unresolved async work!');
+    process.exitCode = 1;
+  }
+});
+
 console.log('--- Running UMAI JavaScript Tests ---');
 
 // Test 1: Message & ID Validation (C4 & D2)
@@ -2067,11 +2075,295 @@ function makeBatchAcceptance(fn) {
   }
   console.log('✓ Test 12: Failed lookup under full pending lookup queue reserves retry capacity and never invents GET passed');
 
+  // Test 13: Shared-reference DAG bomb protection, inter-continuation stop() guard, and generation-scoped reservation cleanup
+  {
+    // --- 13a: Shared-reference DAG payload over real Node MessageChannel + pre-stringify byte budget ---
+    const realMc = new MessageChannel();
+    try {
+      let dagAccepted = false;
+      let dagRejectedCount = 0;
+      const dagRec64 = new UmaiSession({
+        peerOrigin: 'http://host.example',
+        role: 'embedded',
+        maxMessageBytes: 64,
+        storage: {
+          getOutboxIds: async () => [],
+          getMessage: async () => null,
+          getAcceptance: makeBatchAcceptance(() => ({ accepted: false })),
+          acceptMessage: async () => {
+            dagAccepted = true;
+            return true;
+          },
+          onAcknowledged: async () => {}
+        },
+        onError: () => {
+          dagRejectedCount++;
+        }
+      });
+
+      dagRec64.port = realMc.port2;
+      dagRec64.state = 'connected';
+      const gen64 = dagRec64._generation;
+      realMc.port2.onmessage = (ev) => dagRec64._handlePortMessage(ev, gen64, realMc.port2);
+
+      let dagPayload = true;
+      for (let i = 0; i < 30; i++) {
+        dagPayload = { a: dagPayload, b: dagPayload };
+      }
+
+      dagRec64._inFlightGets.set('msg-dag-64', Date.now());
+      const t0 = Date.now();
+      realMc.port1.postMessage({
+        protocol: PROTOCOL_NAME,
+        version: PROTOCOL_VERSION,
+        type: 'PUT',
+        id: 'msg-dag-64',
+        payload: dagPayload,
+        attachments: []
+      });
+
+      // Wait briefly for real MessagePort delivery and synchronous validation
+      const waitStart = Date.now();
+      while (dagRejectedCount === 0 && Date.now() - waitStart < 250) {
+        await new Promise(r => setTimeout(r, 5));
+      }
+      const elapsed64 = Date.now() - t0;
+
+      assert.strictEqual(dagAccepted, false, 'Shared-reference DAG payload must NEVER reach acceptMessage');
+      assert.strictEqual(dagRejectedCount, 1, 'Shared-reference DAG payload over real MessageChannel must be rejected');
+      assert.strictEqual(dagRec64._failedAttempts.get('msg-dag-64'), 1, 'Rejected DAG PUT must record failed attempt');
+      assert.strictEqual(elapsed64 < 200, true, `30-level DAG validation must complete immediately without hanging (took ${elapsed64}ms)`);
+
+      // Also verify 30-level DAG is rejected in <50ms even with default 50MB maxMessageBytes,
+      // and oversized non-shared trees abort BEFORE JSON.stringify is ever invoked.
+      const dagChan50 = createMockChannel();
+      const dagRec50 = new UmaiSession({
+        peerOrigin: 'http://host.example',
+        role: 'embedded',
+        storage: {
+          getOutboxIds: async () => [],
+          getMessage: async () => null,
+          getAcceptance: makeBatchAcceptance(() => ({ accepted: false })),
+          acceptMessage: async () => {
+            dagAccepted = true;
+            return true;
+          },
+          onAcknowledged: async () => {}
+        }
+      });
+      dagRec50.port = dagChan50.port1;
+      dagChan50.port1.onmessage = dagRec50._portListener;
+      dagRec50.state = 'connected';
+      dagRec50._inFlightGets.set('msg-dag-50mb', Date.now());
+
+      const t50 = Date.now();
+      await dagRec50._handlePut({
+        protocol: PROTOCOL_NAME,
+        version: PROTOCOL_VERSION,
+        type: 'PUT',
+        id: 'msg-dag-50mb',
+        payload: dagPayload,
+        attachments: []
+      });
+      const elapsed50 = Date.now() - t50;
+      assert.strictEqual(dagAccepted, false, 'Shared-reference DAG must be rejected even under 50MB maxMessageBytes');
+      assert.strictEqual(dagRec50._failedAttempts.get('msg-dag-50mb'), 1, 'Rejected 50MB DAG PUT must record failed attempt');
+      assert.strictEqual(elapsed50 < 50, true, `50MB DAG rejection must run in O(distinct objects) (<50ms, took ${elapsed50}ms)`);
+
+      // Verify oversized distinct tree aborts during traversal before JSON.stringify runs
+      const origStringify = JSON.stringify;
+      let stringifyCalledOnOversized = false;
+      JSON.stringify = function (...args) {
+        stringifyCalledOnOversized = true;
+        return origStringify.apply(this, args);
+      };
+      try {
+        dagRec64._inFlightGets.set('msg-oversized-tree', Date.now());
+        const distinctOversizedTree = { items: Array.from({ length: 100 }, (_, i) => ({ idx: i })) };
+        await dagRec64._handlePut({
+          protocol: PROTOCOL_NAME,
+          version: PROTOCOL_VERSION,
+          type: 'PUT',
+          id: 'msg-oversized-tree',
+          payload: distinctOversizedTree,
+          attachments: []
+        });
+      } finally {
+        JSON.stringify = origStringify;
+      }
+      assert.strictEqual(stringifyCalledOnOversized, false, 'Oversized tree must abort pre-serialization before JSON.stringify()');
+
+      dagRec50.stop();
+      dagRec64.stop();
+    } finally {
+      realMc.port1.close();
+      realMc.port2.close();
+    }
+
+    // --- 13b: Deterministic session.stop() between _queryValidatedAcceptance resolution and caller continuation ---
+    let acceptCalledAfterStop13b = false;
+    let resolveLookup13b = null;
+    let lookupPromise13b = null;
+    const chan13b = createMockChannel();
+
+    const rec13b = new UmaiSession({
+      peerOrigin: 'http://host.example',
+      role: 'embedded',
+      storage: {
+        getOutboxIds: async () => [],
+        getMessage: async () => null,
+        getAcceptance: () => {
+          lookupPromise13b = new Promise((resolve) => {
+            resolveLookup13b = resolve;
+          });
+          return lookupPromise13b;
+        },
+        acceptMessage: async () => {
+          acceptCalledAfterStop13b = true;
+          return { accepted: true };
+        },
+        onAcknowledged: async () => {}
+      }
+    });
+    rec13b.port = chan13b.port1;
+    chan13b.port1.onmessage = rec13b._portListener;
+    rec13b.state = 'connected';
+    rec13b._inFlightGets.set('msg-interleave-stop', Date.now());
+
+    const putPromise13b = rec13b._handlePut({
+      protocol: PROTOCOL_NAME,
+      version: PROTOCOL_VERSION,
+      type: 'PUT',
+      id: 'msg-interleave-stop',
+      payload: { ok: true },
+      attachments: []
+    });
+    await new Promise(r => setTimeout(r, 5));
+    assert.strictEqual(typeof resolveLookup13b, 'function', 'PUT duplicate lookup must be awaiting lookupPromise13b');
+
+    // Attach a .then() reaction on lookupPromise13b AFTER _queryValidatedAcceptance's internal `await`:
+    // Microtask 1 runs _queryValidatedAcceptance's post-await (while session is still connected!) and resolves outer helper promise;
+    // Microtask 2 runs rec13b.stop() BEFORE Microtask 3 resumes _processIncomingPutQueue!
+    lookupPromise13b.then(() => {
+      rec13b.stop();
+    });
+    resolveLookup13b({ 'msg-interleave-stop': { accepted: false } });
+    await putPromise13b;
+    await new Promise(r => setTimeout(r, 15));
+
+    assert.strictEqual(rec13b.state, 'disconnected', 'Session must be disconnected');
+    assert.strictEqual(
+      acceptCalledAfterStop13b,
+      false,
+      'storage.acceptMessage() must NEVER start when stop() fires between lookup helper return and caller continuation'
+    );
+
+    // --- 13c: Stale Generation A lookup completion (resolve & reject) must NOT erase Generation B reservations ---
+    for (const mode of ['resolve', 'reject']) {
+      let lookupCall13c = 0;
+      let settleGenA13c = null;
+      let resolveGenB13c = null;
+      const chanGenA = createMockChannel();
+      const chanGenB = createMockChannel();
+
+      const rec13c = new UmaiSession({
+        peerOrigin: 'http://host.example',
+        role: 'embedded',
+        lookupMinIntervalMs: 5,
+        storage: {
+          getOutboxIds: async () => [],
+          getMessage: async () => null,
+          getAcceptance: async (ids) => {
+            lookupCall13c++;
+            if (lookupCall13c === 1) {
+              return await new Promise((resolve, reject) => {
+                settleGenA13c = mode === 'resolve' ? resolve : reject;
+              });
+            }
+            if (lookupCall13c === 2) {
+              return await new Promise((resolve) => {
+                resolveGenB13c = resolve;
+              });
+            }
+            const out = Object.create(null);
+            for (const id of ids) out[id] = { accepted: true };
+            return out;
+          },
+          acceptMessage: async () => true,
+          onAcknowledged: async () => {}
+        }
+      });
+
+      // Generation A starts lookup for 'shared-res-id'
+      rec13c.port = chanGenA.port1;
+      chanGenA.port1.onmessage = rec13c._portListener;
+      rec13c.state = 'connected';
+      const genAOffer = rec13c._handleOffer({
+        protocol: PROTOCOL_NAME,
+        version: PROTOCOL_VERSION,
+        type: 'OFFER',
+        ids: ['shared-res-id']
+      });
+      await new Promise(r => setTimeout(r, 5));
+      assert.strictEqual(rec13c._inFlightLookupIds.has('shared-res-id'), true, 'Gen A must reserve shared-res-id');
+
+      // Reset into Generation B and start lookup for the same 'shared-res-id'
+      rec13c._resetChannelState();
+      rec13c.port = chanGenB.port1;
+      chanGenB.port1.onmessage = rec13c._portListener;
+      rec13c.state = 'connected';
+      const genBOffer = rec13c._handleOffer({
+        protocol: PROTOCOL_NAME,
+        version: PROTOCOL_VERSION,
+        type: 'OFFER',
+        ids: ['shared-res-id']
+      });
+      await new Promise(r => setTimeout(r, 5));
+      assert.strictEqual(lookupCall13c, 2, 'Gen B lookup must be running');
+      assert.strictEqual(rec13c._inFlightLookupIds.has('shared-res-id'), true, 'Gen B must reserve shared-res-id');
+
+      // Settle obsolete Generation A's lookup while Generation B's lookup is still pending
+      if (mode === 'resolve') {
+        settleGenA13c({ 'shared-res-id': { accepted: false } });
+      } else {
+        settleGenA13c(new Error('obsolete Gen A lookup error'));
+      }
+      await genAOffer;
+      await new Promise(r => setTimeout(r, 5));
+
+      assert.strictEqual(
+        rec13c._inFlightLookupIds.has('shared-res-id'),
+        true,
+        `Obsolete Gen A lookup (${mode}) must NEVER erase Gen B's active reservation`
+      );
+
+      // Verify Gen B's reserved retry slot still caps a 1,000-ID OFFER flood at 999 admitted IDs
+      const flood13c = Array.from({ length: 1000 }, (_, i) => `f13c-${mode}-${String(i + 1).padStart(4, '0')}`);
+      await rec13c._handleOffer({
+        protocol: PROTOCOL_NAME,
+        version: PROTOCOL_VERSION,
+        type: 'OFFER',
+        ids: flood13c
+      });
+      assert.strictEqual(
+        rec13c._pendingOfferIds.size,
+        999,
+        `Gen B reservation (${mode}) must keep 1 retry slot reserved during 1,000-ID flood (got ${rec13c._pendingOfferIds.size})`
+      );
+
+      resolveGenB13c({ 'shared-res-id': { accepted: true } });
+      await genBOffer;
+      rec13c.stop();
+    }
+  }
+  console.log('✓ Test 13: Shared-reference DAG bomb rejection, inter-continuation stop() guard, and generation-scoped reservation cleanup passed');
+
   senderPoison.stop();
   receiverPoison.stop();
   secSession.stop();
   sessionA.stop();
   sessionB.stop();
 
+  allTestsCompleted = true;
   console.log('--- All JavaScript Tests Passed ---');
 })();

@@ -109,32 +109,59 @@
   }
 
   /**
-   * Recursively verifies that a value contains strictly JSON-representable data
-   * (null, boolean, finite number, string, plain Array, or plain Object up to MAX_JSON_DEPTH),
-   * rejecting structured-clone non-JSON types such as Blob, File, ArrayBuffer, TypedArray,
-   * Date, RegExp, Map, Set, accessor properties, or deep/circular graphs.
+   * Recursively verifies that a value is a strict, tree-shaped JSON-representable value
+   * (null, boolean, finite number, string, plain Array, or plain Object up to MAX_JSON_DEPTH):
+   * - Rejects structured-clone non-JSON types (Blob, File, ArrayBuffer, TypedArray, Date, RegExp,
+   *   Map, Set), accessor properties, circular references, and shared object/array references (DAGs).
+   * - Accumulates a strict lower bound on UTF-8 JSON byte length (`budget.bytes <= budget.maxBytes`)
+   *   so oversized payloads abort during traversal before `JSON.stringify()` allocates large strings.
    */
-  function isStrictJsonValue(val, depth = 0) {
-    if (depth > MAX_JSON_DEPTH) {
+  function isStrictJsonValue(
+    val,
+    depth = 0,
+    seenObjects = new Set(),
+    budget = { bytes: 0, maxBytes: MAX_MESSAGE_BYTES, steps: 0, maxSteps: MAX_MESSAGE_BYTES + 1024 }
+  ) {
+    if (depth > MAX_JSON_DEPTH || ++budget.steps > budget.maxSteps) {
       return false;
     }
     if (val === null) {
-      return true;
+      budget.bytes += 4;
+      return budget.bytes <= budget.maxBytes;
     }
     const t = typeof val;
-    if (t === 'boolean' || t === 'string') {
-      return true;
+    if (t === 'boolean') {
+      budget.bytes += val ? 4 : 5;
+      return budget.bytes <= budget.maxBytes;
+    }
+    if (t === 'string') {
+      budget.bytes += val.length + 2;
+      return budget.bytes <= budget.maxBytes;
     }
     if (t === 'number') {
-      return Number.isFinite(val);
+      if (!Number.isFinite(val)) {
+        return false;
+      }
+      budget.bytes += String(val).length;
+      return budget.bytes <= budget.maxBytes;
     }
     if (t !== 'object') {
       return false;
     }
 
+    // Reject both circular references and shared-reference DAG amplification
+    if (seenObjects.has(val)) {
+      return false;
+    }
+    seenObjects.add(val);
+
     if (Array.isArray(val)) {
       const keys = Object.keys(val);
       if (keys.length !== val.length) {
+        return false;
+      }
+      budget.bytes += 2 + (val.length > 1 ? val.length - 1 : 0);
+      if (budget.bytes > budget.maxBytes) {
         return false;
       }
       for (let i = 0; i < val.length; i++) {
@@ -142,7 +169,7 @@
         if (!desc || !Object.prototype.hasOwnProperty.call(desc, 'value')) {
           return false;
         }
-        if (!isStrictJsonValue(desc.value, depth + 1)) {
+        if (!isStrictJsonValue(desc.value, depth + 1, seenObjects, budget)) {
           return false;
         }
       }
@@ -154,8 +181,17 @@
       return false;
     }
 
+    budget.bytes += 2;
+    if (budget.bytes > budget.maxBytes) {
+      return false;
+    }
+
     const keys = Object.keys(val);
+    let emittedProps = 0;
     for (let i = 0; i < keys.length; i++) {
+      if (++budget.steps > budget.maxSteps) {
+        return false;
+      }
       const k = keys[i];
       const desc = Object.getOwnPropertyDescriptor(val, k);
       if (!desc || !Object.prototype.hasOwnProperty.call(desc, 'value')) {
@@ -164,7 +200,12 @@
       if (desc.value === undefined) {
         continue;
       }
-      if (!isStrictJsonValue(desc.value, depth + 1)) {
+      budget.bytes += (emittedProps > 0 ? 1 : 0) + k.length + 3;
+      if (budget.bytes > budget.maxBytes) {
+        return false;
+      }
+      emittedProps++;
+      if (!isStrictJsonValue(desc.value, depth + 1, seenObjects, budget)) {
         return false;
       }
     }
@@ -185,14 +226,37 @@
   }
 
   /**
-   * Validates strict JSON payload types, normalizes the payload via JSON round-trip so the exact
-   * measured JSON representation is forwarded, and validates payload + attachment sizes/counts
+   * Validates strict tree-shaped JSON payload types, normalizes the payload via JSON round-trip so the
+   * exact measured JSON representation is forwarded, and validates payload + attachment sizes/counts
    * against maxAttachments and maxMessageBytes.
    * Returns { totalBytes, normalizedPayload } or null if invalid or exceeding bounds.
    */
   function normalizeAndValidateMessage(payload, attachments, maxAttachments, maxMessageBytes) {
+    if (!Array.isArray(attachments) || attachments.length > maxAttachments) {
+      return null;
+    }
+
+    let attachmentBytes = 0;
+    for (let i = 0; i < attachments.length; i++) {
+      const att = attachments[i];
+      if (!isValidAttachment(att)) {
+        return null;
+      }
+      attachmentBytes += att.size;
+      if (attachmentBytes > maxMessageBytes) {
+        return null;
+      }
+    }
+
+    const maxPayloadBytes = maxMessageBytes - attachmentBytes;
     const candidate = (payload !== undefined && payload !== null) ? payload : {};
-    if (!isStrictJsonValue(candidate, 0)) {
+    const budget = {
+      bytes: 0,
+      maxBytes: maxPayloadBytes,
+      steps: 0,
+      maxSteps: maxPayloadBytes + 1024
+    };
+    if (!isStrictJsonValue(candidate, 0, new Set(), budget)) {
       return null;
     }
 
@@ -207,25 +271,11 @@
     }
 
     const payloadBytes = utf8ByteLength(jsonStr);
-    if (payloadBytes < 0 || payloadBytes > maxMessageBytes) {
+    if (payloadBytes < 0 || payloadBytes > maxPayloadBytes) {
       return null;
     }
 
-    if (!Array.isArray(attachments) || attachments.length > maxAttachments) {
-      return null;
-    }
-
-    let totalBytes = payloadBytes;
-    for (let i = 0; i < attachments.length; i++) {
-      const att = attachments[i];
-      if (!isValidAttachment(att)) {
-        return null;
-      }
-      totalBytes += att.size;
-      if (totalBytes > maxMessageBytes) {
-        return null;
-      }
-    }
+    const totalBytes = attachmentBytes + payloadBytes;
 
     let normalizedPayload;
     try {
@@ -1286,6 +1336,9 @@
         }
       }
       const releaseReserved = () => {
+        if (!this._isGenerationActive(gen, port)) {
+          return;
+        }
         for (const id of reservedIds) {
           this._inFlightLookupIds.delete(id);
         }
@@ -1295,7 +1348,6 @@
       try {
         const batchRes = await this.storage.getAcceptance(queryIds.slice());
         if (!this._isGenerationActive(gen, port)) {
-          releaseReserved();
           return null;
         }
         const validated = validateBatchAcceptance(batchRes, queryIds);
@@ -1307,8 +1359,8 @@
         this._nextLookupAllowedAt = 0;
         return validated;
       } catch (err) {
-        releaseReserved();
         if (this._isGenerationActive(gen, port)) {
+          releaseReserved();
           if (typeof onBeforeFailure === 'function') {
             onBeforeFailure();
           }
@@ -1512,8 +1564,10 @@
           }
 
           const validatedBatch = await this._queryValidatedAcceptance(queryIds, gen, port);
+          if (!this._isGenerationActive(gen, port)) {
+            return;
+          }
           if (!validatedBatch) {
-            if (!this._isGenerationActive(gen, port)) return;
             break;
           }
 
@@ -1926,7 +1980,7 @@
           port,
           () => { this._acceptingIds.delete(id); }
         );
-        if (!validatedLookup) {
+        if (!validatedLookup || !this._isGenerationActive(gen, port)) {
           return;
         }
 
