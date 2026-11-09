@@ -425,8 +425,9 @@
       this._reconcilePromise = null;
       this._ackedDuringOutboxRead = new Set();
 
-      // Coalesced incoming OFFER queue, deferred unaccepted overflow, lookup pacing, and single-worker state
+      // Coalesced incoming OFFER queue, in-flight lookup reservation, deferred unaccepted overflow, and single-worker state
       this._pendingOfferIds = new Set();
+      this._inFlightLookupIds = new Set();
       this._deferredOfferIds = new Set();
       this._processingOffers = false;
       this._lastLookupStartedAt = 0;
@@ -597,6 +598,7 @@
       this._reconcilePromise = null;
       this._ackedDuringOutboxRead.clear();
       this._pendingOfferIds.clear();
+      this._inFlightLookupIds.clear();
       this._deferredOfferIds.clear();
       this._processingOffers = false;
       this._lastLookupStartedAt = 0;
@@ -1216,7 +1218,9 @@
     }
 
     /**
-     * Re-queues an unresolved incoming message ID into bounded pending/deferred structures without losing it.
+     * Re-queues an unresolved incoming message ID back into bounded _pendingOfferIds for acceptance lookup retry.
+     * Never places an unresolved ID into _pendingGetQueue or _deferredOfferIds, which strictly hold IDs
+     * already confirmed unaccepted (`accepted: false`) by a completed lookup.
      */
     _requeueUnresolvedId(id) {
       if (this._shouldSkipOfferLookup(id)) {
@@ -1224,16 +1228,6 @@
       }
       if (this._pendingOfferIds.size < MAX_BATCH_IDS) {
         this._pendingOfferIds.add(id);
-        return;
-      }
-      const totalOutstanding =
-        this._pendingGetQueue.length +
-        this._inFlightGets.size +
-        this._acceptingIds.size;
-      if (totalOutstanding < MAX_BATCH_IDS) {
-        this._pendingGetQueue.push(id);
-      } else if (!this._deferredOfferIds.has(id) && this._deferredOfferIds.size < MAX_BATCH_IDS) {
-        this._deferredOfferIds.add(id);
       }
     }
 
@@ -1284,20 +1278,36 @@
       if (!this._isGenerationActive(gen, port) || !Array.isArray(queryIds) || queryIds.length === 0) {
         return null;
       }
+      const reservedIds = [];
+      for (const id of queryIds) {
+        if (!this._acceptingIds.has(id) && !this._inFlightLookupIds.has(id)) {
+          this._inFlightLookupIds.add(id);
+          reservedIds.push(id);
+        }
+      }
+      const releaseReserved = () => {
+        for (const id of reservedIds) {
+          this._inFlightLookupIds.delete(id);
+        }
+      };
+
       this._lastLookupStartedAt = Date.now();
       try {
         const batchRes = await this.storage.getAcceptance(queryIds.slice());
         if (!this._isGenerationActive(gen, port)) {
+          releaseReserved();
           return null;
         }
         const validated = validateBatchAcceptance(batchRes, queryIds);
         if (!validated) {
           throw new Error(`Invalid or incomplete getAcceptance batch response (${queryIds.length} ID(s) requested)`);
         }
+        releaseReserved();
         this._lookupFailureCount = 0;
         this._nextLookupAllowedAt = 0;
         return validated;
       } catch (err) {
+        releaseReserved();
         if (this._isGenerationActive(gen, port)) {
           if (typeof onBeforeFailure === 'function') {
             onBeforeFailure();
@@ -1360,6 +1370,7 @@
      */
     _shouldSkipOfferLookup(id) {
       if (
+        this._inFlightLookupIds.has(id) ||
         this._inFlightGets.has(id) ||
         this._acceptingIds.has(id) ||
         this._pendingGetQueue.includes(id)
@@ -1411,7 +1422,11 @@
       if (offeredIds.length === 0) return;
 
       for (const id of offeredIds) {
-        if (this._pendingOfferIds.size >= MAX_BATCH_IDS) {
+        if (
+          this._pendingOfferIds.size +
+          this._inFlightLookupIds.size +
+          this._acceptingIds.size >= MAX_BATCH_IDS
+        ) {
           break;
         }
         if (this._shouldSkipOfferLookup(id)) {

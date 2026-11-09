@@ -1946,6 +1946,127 @@ function makeBatchAcceptance(fn) {
   }
   console.log('✓ Test 11: Bidirectional reconnect churn (6 READY/INIT generations) + flaky adapter stress test passed');
 
+  // Test 12: Failed lookup while pending lookup queue is full must NEVER invent accepted:false or emit premature GET
+  {
+    const chan12 = createMockChannel();
+    let lookupAttempt12 = 0;
+    let rejectFirstLookup12 = null;
+    let resolveSecondLookup12 = null;
+    let secondLookupRequestedIds12 = null;
+
+    const rec12 = new UmaiSession({
+      peerOrigin: 'http://host.example',
+      role: 'embedded',
+      maxConcurrency: 4,
+      lookupMinIntervalMs: 5,
+      lookupRetryBaseMs: 50,
+      lookupRetryMaxMs: 120,
+      storage: {
+        getOutboxIds: async () => [],
+        getMessage: async () => null,
+        getAcceptance: async (ids) => {
+          lookupAttempt12++;
+          if (lookupAttempt12 === 1) {
+            return await new Promise((_, reject) => {
+              rejectFirstLookup12 = reject;
+            });
+          }
+          secondLookupRequestedIds12 = ids.slice();
+          return await new Promise((resolve) => {
+            resolveSecondLookup12 = resolve;
+          });
+        },
+        acceptMessage: async () => true,
+        onAcknowledged: async () => {}
+      }
+    });
+
+    rec12.port = chan12.port1;
+    chan12.port1.onmessage = rec12._portListener;
+    rec12.state = 'connected';
+
+    // 1. Start initial lookup for ['msg-already-acc', 'msg-needs-get'] (suspended in flight)
+    const offer1Promise = rec12._handleOffer({
+      protocol: PROTOCOL_NAME,
+      version: PROTOCOL_VERSION,
+      type: 'OFFER',
+      ids: ['msg-already-acc', 'msg-needs-get']
+    });
+    await new Promise(r => setTimeout(r, 10));
+    assert.strictEqual(typeof rejectFirstLookup12, 'function', 'Initial lookup must be in flight');
+    assert.strictEqual(rec12._inFlightLookupIds.size, 2, 'Both in-flight lookup IDs must reserve retry capacity');
+
+    // 2. While first lookup is pending, flood _handleOffer with 1,000 different IDs
+    const floodIds12 = Array.from({ length: 1000 }, (_, i) => `flood-12-${String(i + 1).padStart(4, '0')}`);
+    await rec12._handleOffer({
+      protocol: PROTOCOL_NAME,
+      version: PROTOCOL_VERSION,
+      type: 'OFFER',
+      ids: floodIds12
+    });
+    assert.strictEqual(
+      rec12._pendingOfferIds.size,
+      998,
+      `Offer admission must reserve 2 slots for in-flight lookup IDs (expected 998, got ${rec12._pendingOfferIds.size})`
+    );
+
+    // 3. Fail the first lookup while the lookup queue is full
+    rejectFirstLookup12(new Error('transient lookup failure under full queue'));
+    await offer1Promise;
+
+    assert.strictEqual(rec12._pendingGetQueue.length, 0, 'Failed lookup under full queue must NEVER push unresolved IDs into _pendingGetQueue');
+    assert.strictEqual(rec12._deferredOfferIds.size, 0, 'Failed lookup under full queue must NEVER push unresolved IDs into _deferredOfferIds');
+    assert.strictEqual(rec12._pendingOfferIds.has('msg-already-acc'), true, 'msg-already-acc must be re-queued into reserved _pendingOfferIds slot');
+    assert.strictEqual(rec12._pendingOfferIds.has('msg-needs-get'), true, 'msg-needs-get must be re-queued into reserved _pendingOfferIds slot');
+    assert.strictEqual(chan12.port1.sent.some(m => m.type === 'GET'), false, 'Zero GET frames may be sent after failed lookup');
+
+    // 4. Wait for backoff to expire so retry lookup #2 starts (and hold it before resolving)
+    await new Promise(r => setTimeout(r, 75));
+    assert.strictEqual(lookupAttempt12, 2, 'Retry lookup #2 must start after backoff');
+    assert.strictEqual(
+      chan12.port1.sent.some(m => m.type === 'GET'),
+      false,
+      'Zero GET frames may be sent before retry lookup #2 explicitly resolves'
+    );
+    assert.strictEqual(secondLookupRequestedIds12.includes('msg-already-acc'), true, 'Retry lookup must re-query msg-already-acc');
+    assert.strictEqual(secondLookupRequestedIds12.includes('msg-needs-get'), true, 'Retry lookup must re-query msg-needs-get');
+
+    // 5. Resolve retry lookup #2: msg-already-acc -> accepted:true, msg-needs-get -> accepted:false, flood -> accepted:true
+    const retryResponse12 = Object.create(null);
+    for (const id of secondLookupRequestedIds12) {
+      if (id === 'msg-already-acc') {
+        retryResponse12[id] = { accepted: true, ackReceipt: 'sig-already-acc' };
+      } else if (id === 'msg-needs-get') {
+        retryResponse12[id] = { accepted: false };
+      } else {
+        retryResponse12[id] = { accepted: true };
+      }
+    }
+    resolveSecondLookup12(retryResponse12);
+    await new Promise(r => setTimeout(r, 25));
+
+    const sentGets12 = chan12.port1.sent.filter(m => m.type === 'GET');
+    const sentAcks12 = chan12.port1.sent.filter(m => m.type === 'ACK');
+
+    assert.strictEqual(
+      sentGets12.some(m => m.ids.includes('msg-already-acc')),
+      false,
+      'Already-accepted ID must NEVER receive a GET'
+    );
+    assert.strictEqual(
+      sentAcks12.some(m => m.ids.includes('msg-already-acc') && m.receipts && m.receipts['msg-already-acc'] === 'sig-already-acc'),
+      true,
+      'Already-accepted ID must emit repeated ACK with stored receipt once retry lookup succeeds'
+    );
+    assert.strictEqual(
+      sentGets12.some(m => m.ids.includes('msg-needs-get')),
+      true,
+      'Unaccepted ID must receive GET once retry lookup explicitly returns accepted:false'
+    );
+    rec12.stop();
+  }
+  console.log('✓ Test 12: Failed lookup under full pending lookup queue reserves retry capacity and never invents GET passed');
+
   senderPoison.stop();
   receiverPoison.stop();
   secSession.stop();
