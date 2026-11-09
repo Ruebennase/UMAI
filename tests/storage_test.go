@@ -395,18 +395,15 @@ func TestStorage_IndexWriteFailure_CommitRecovery_And_HotFolderDeletion(t *testi
 		AckReceipt: "rec-crash-1",
 	})
 	_ = os.WriteFile(filepath.Join(commPath, "message.json"), crashMsgBytes, 0600)
-	// Also test legacy migration: write legacy []string accepted.json + legacy accepted_receipts.json (with an archived receipt!)
-	legacyIDs, _ := json.Marshal([]string{msgID, crashID, "msg-legacy-archived"})
-	_ = os.WriteFile(filepath.Join(tmpDir, "accepted.json"), legacyIDs, 0600)
-	legacyRecs, _ := json.Marshal(map[string]string{
-		msgID:                 acceptedMsg.AckReceipt,
-		"msg-legacy-archived": "legacy-archived-receipt-hex",
+	consolidatedBytes, _ := json.Marshal(map[string]string{
+		msgID:   acceptedMsg.AckReceipt,
+		crashID: "rec-crash-1",
 	})
-	_ = os.WriteFile(filepath.Join(tmpDir, "accepted_receipts.json"), legacyRecs, 0600)
+	_ = os.WriteFile(filepath.Join(tmpDir, "accepted.json"), consolidatedBytes, 0600)
 
 	storeRecovered, err := umaiserver.NewStorage(tmpDir, 10*1024*1024)
 	if err != nil {
-		t.Fatalf("Restart for .committing recovery & legacy migration: %v", err)
+		t.Fatalf("Restart for .committing recovery: %v", err)
 	}
 	if !storeRecovered.IsAccepted(crashID) {
 		t.Fatalf("Expected %s to remain accepted", crashID)
@@ -414,11 +411,106 @@ func TestStorage_IndexWriteFailure_CommitRecovery_And_HotFolderDeletion(t *testi
 	if _, err := storeRecovered.GetInboxMessage(crashID); err != nil {
 		t.Fatalf("Expected %s in .committing/ to be promoted to inbox/ on startup, got: %v", crashID, err)
 	}
-	if got := storeRecovered.ListAcceptedReceipts()["msg-legacy-archived"]; got != "legacy-archived-receipt-hex" {
-		t.Fatalf("Expected archived legacy receipt to be preserved during migration, got %q", got)
+	if got := storeRecovered.ListAcceptedReceipts()[crashID]; got != "rec-crash-1" {
+		t.Fatalf("Expected preserved receipt rec-crash-1 after .committing recovery, got %q", got)
 	}
-	if _, err := os.Stat(filepath.Join(tmpDir, "accepted_receipts.json")); !os.IsNotExist(err) {
-		t.Errorf("Expected obsolete accepted_receipts.json to be removed after consolidation into accepted.json")
+}
+
+func TestStorage_FailedDataDirSync_KeepsMessageUnconfirmedAndOutOfInbox(t *testing.T) {
+	tmpDir := t.TempDir()
+	absTmpDir, err := filepath.Abs(tmpDir)
+	if err != nil {
+		t.Fatalf("filepath.Abs: %v", err)
+	}
+	pubA, privA := umaiserver.DeriveDemoKeyPair("app-a")
+	pubB, privB := umaiserver.DeriveDemoKeyPair("app-b")
+
+	store, err := umaiserver.NewStorage(absTmpDir, 10*1024*1024)
+	if err != nil {
+		t.Fatalf("NewStorage: %v", err)
+	}
+	store.SetKeys("app-b", pubB, privB, pubA)
+
+	msgID := "msg-sync-fault-1"
+	payload := map[string]string{"case": "durability-flush"}
+	attBytes := []byte("important binary content")
+	attHash := sha256.Sum256(attBytes)
+	sigHex, err := umaiserver.SignPutMessage(privA, "app-a", "app-b", msgID, payload, []umaiserver.AttachmentInfo{
+		{Name: "evidence.bin", Size: int64(len(attBytes)), SHA256: hex.EncodeToString(attHash[:])},
+	})
+	if err != nil {
+		t.Fatalf("SignPutMessage: %v", err)
+	}
+
+	// Inject a synchronization failure specifically on dataDir (right after accepted.json rename succeeds).
+	store.SetSyncDirForTesting(func(dirPath string) error {
+		if dirPath == absTmpDir {
+			return errors.New("injected dataDir fsync error")
+		}
+		return nil
+	})
+
+	// 1. Initial acceptance must return the injected synchronization error.
+	_, err = store.AcceptSignedMessage(msgID, payload, []umaiserver.AttachmentReader{
+		{Name: "evidence.bin", Reader: bytes.NewReader(attBytes)},
+	}, sigHex)
+	if err == nil {
+		t.Fatalf("Expected AcceptSignedMessage to fail when dataDir synchronization fails")
+	}
+
+	// 2. Consumer-visible inbox/ MUST remain empty while the staged recovery copy stays in .committing/.
+	inboxEntries, err := os.ReadDir(filepath.Join(absTmpDir, "inbox"))
+	if err != nil || len(inboxEntries) != 0 {
+		t.Fatalf("Expected 0 visible inbox/ directories after failed dataDir sync, got %d (err=%v)", len(inboxEntries), err)
+	}
+	dirKey, _ := umaiserver.StorageDirKey(msgID)
+	if _, err := os.Stat(filepath.Join(absTmpDir, ".committing", dirKey, "message.json")); err != nil {
+		t.Fatalf("Expected recovery copy to remain preserved in .committing/%s, got: %v", dirKey, err)
+	}
+
+	// 3. Acceptance MUST NOT be reported as confirmed while the durability failure remains active.
+	if store.IsAccepted(msgID) {
+		t.Fatalf("IsAccepted(%s) must remain false while dataDir sync is unresolved", msgID)
+	}
+	if _, err := store.GetInboxMessage(msgID); !errors.Is(err, umaiserver.ErrNotFound) {
+		t.Fatalf("GetInboxMessage(%s) must return ErrNotFound while unconfirmed, got: %v", msgID, err)
+	}
+	if _, err := store.GetAcceptance([]string{msgID}); err == nil {
+		t.Fatalf("GetAcceptance([%s]) must fail (not return accepted:true) while dataDir sync failure remains active", msgID)
+	}
+
+	// 4. Duplicate acceptance MUST also fail while the synchronization failure remains active (and reject forged signatures).
+	if _, err := store.AcceptSignedMessage(msgID, payload, []umaiserver.AttachmentReader{
+		{Name: "evidence.bin", Reader: bytes.NewReader(attBytes)},
+	}, sigHex); err == nil {
+		t.Fatalf("Duplicate AcceptSignedMessage must fail while dataDir sync failure remains active")
+	}
+	if _, err := store.AcceptSignedMessage(msgID, payload, nil, "deadbeef"); !errors.Is(err, umaiserver.ErrInvalidSignature) {
+		t.Fatalf("Expected ErrInvalidSignature on forged duplicate PUT during pending commit, got: %v", err)
+	}
+
+	// 5. Clear the injected synchronization fault: GetAcceptance (or retry AcceptSignedMessage) must finalize cleanly,
+	//    exposing inbox/m-<sha256(id)> and returning confirmed acceptance with a valid signed receipt.
+	store.SetSyncDirForTesting(nil)
+	accMap, err := store.GetAcceptance([]string{msgID})
+	if err != nil {
+		t.Fatalf("Expected GetAcceptance to finalize pending commit once syncDir succeeds, got: %v", err)
+	}
+	status := accMap[msgID]
+	if !status.Accepted || status.AckReceipt == "" {
+		t.Fatalf("Expected confirmed acceptance with non-empty receipt after finalization, got: %+v", status)
+	}
+	if err := umaiserver.VerifyAckReceipt(pubB, "app-b", msgID, sigHex, status.AckReceipt); err != nil {
+		t.Fatalf("Expected valid Ed25519 AckReceipt after finalization: %v", err)
+	}
+	if !store.IsAccepted(msgID) {
+		t.Fatalf("Expected IsAccepted(%s) == true after finalization", msgID)
+	}
+	if _, err := store.GetInboxMessage(msgID); err != nil {
+		t.Fatalf("Expected message to be visible via GetInboxMessage after finalization, got: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(absTmpDir, ".committing", dirKey)); !os.IsNotExist(err) {
+		t.Fatalf("Expected .committing/%s to be moved into inbox/ after finalization", dirKey)
 	}
 }
 

@@ -423,6 +423,7 @@
       this._reconcilePending = false;
       this._reconcileForcePending = false;
       this._reconcilePromise = null;
+      this._ackedDuringOutboxRead = new Set();
 
       // Coalesced incoming OFFER queue, deferred unaccepted overflow, lookup pacing, and single-worker state
       this._pendingOfferIds = new Set();
@@ -594,6 +595,7 @@
       this._reconcilePending = false;
       this._reconcileForcePending = false;
       this._reconcilePromise = null;
+      this._ackedDuringOutboxRead.clear();
       this._pendingOfferIds.clear();
       this._deferredOfferIds.clear();
       this._processingOffers = false;
@@ -1083,35 +1085,39 @@
         while (this._isGenerationActive(gen, port)) {
           this._reconcilePending = false;
           this._reconcileForcePending = false;
+          this._ackedDuringOutboxRead.clear();
           if (nextForce) {
             this._failedAttempts.clear();
             this._timedOutGets.clear();
             this._lookupFailureCount = 0;
             this._nextLookupAllowedAt = 0;
             this._lastLookupStartedAt = 0;
+            if (this._lookupTimer) {
+              clearTimeout(this._lookupTimer);
+              this._lookupTimer = null;
+            }
             if (this._pendingOfferIds.size > 0) {
               this._drainPendingOffers(gen, port);
+            } else if (this._pendingGetQueue.length > 0 || this._deferredOfferIds.size > 0) {
+              this._dispatchNextGets(gen, port);
             }
           }
 
           const outboxIds = await this.storage.getOutboxIds();
           if (!this._isGenerationActive(gen, port)) return;
 
-          // If a newer reconcile() was requested while getOutboxIds() was pending, fetch the fresher snapshot
-          if (this._reconcilePending) {
-            nextForce = nextForce || this._reconcileForcePending;
-            continue;
-          }
-
-          // 1. Build complete validated outbox snapshot (deduplicated while preserving adapter priority order)
+          // 1. Always process the completed serialized outbox snapshot before servicing a coalesced
+          //    _reconcilePending request so periodic heartbeats faster than getOutboxIds() never starve OFFERs.
+          //    Exclude any IDs whose ACK completed while getOutboxIds() was in flight.
           const rawList = Array.isArray(outboxIds) ? outboxIds : [];
           const fullOutboxSet = new Set();
           for (let i = 0; i < rawList.length; i++) {
             const id = rawList[i];
-            if (isValidMessageId(id)) {
+            if (isValidMessageId(id) && !this._ackedDuringOutboxRead.has(id)) {
               fullOutboxSet.add(id);
             }
           }
+          this._ackedDuringOutboxRead.clear();
 
           // 2. Retire stale _offeredIds that are no longer present in the complete outbox
           //    and have no active outgoing PUT or pending ACK work.
@@ -1198,10 +1204,43 @@
     }
 
     /**
-     * Schedules a generation-scoped timer to drain _pendingOfferIds after lookup pacing or backoff delay.
+     * Returns true while an acceptance-lookup outage backoff window is currently active.
+     */
+    _isLookupBackoffActive() {
+      return this._lookupFailureCount > 0 && Date.now() < this._nextLookupAllowedAt;
+    }
+
+    /**
+     * Re-queues an unresolved incoming message ID into bounded pending/deferred structures without losing it.
+     */
+    _requeueUnresolvedId(id) {
+      if (this._shouldSkipOfferLookup(id)) {
+        return;
+      }
+      if (this._pendingOfferIds.size < MAX_BATCH_IDS) {
+        this._pendingOfferIds.add(id);
+        return;
+      }
+      const totalOutstanding =
+        this._pendingGetQueue.length +
+        this._inFlightGets.size +
+        this._acceptingIds.size;
+      if (totalOutstanding < MAX_BATCH_IDS) {
+        this._pendingGetQueue.push(id);
+      } else if (!this._deferredOfferIds.has(id) && this._deferredOfferIds.size < MAX_BATCH_IDS) {
+        this._deferredOfferIds.add(id);
+      }
+    }
+
+    /**
+     * Schedules a generation-scoped timer to resume offer lookups and/or held GET transfers
+     * once lookup pacing or outage backoff elapses.
      */
     _schedulePendingOfferDrain(delayMs, gen = this._generation, port = this.port) {
-      if (!this._isGenerationActive(gen, port) || this._pendingOfferIds.size === 0) {
+      if (
+        !this._isGenerationActive(gen, port) ||
+        (this._pendingOfferIds.size === 0 && this._pendingGetQueue.length === 0 && this._deferredOfferIds.size === 0)
+      ) {
         return;
       }
       if (this._lookupTimer) {
@@ -1214,7 +1253,13 @@
         if (!this._isGenerationActive(gen, port)) {
           return;
         }
-        this._drainPendingOffers(gen, port);
+        if (this._pendingOfferIds.size > 0) {
+          this._drainPendingOffers(gen, port);
+        } else if (!this._isLookupBackoffActive()) {
+          this._dispatchNextGets(gen, port);
+        } else {
+          this._schedulePendingOfferDrain(this._nextLookupAllowedAt - Date.now(), gen, port);
+        }
       }, waitMs);
       if (timer && typeof timer.unref === 'function') {
         timer.unref();
@@ -1224,17 +1269,12 @@
 
     /**
      * Records a transient or malformed getAcceptance() failure without burning per-message acceptance retries:
-     * re-queues unresolved IDs into bounded _pendingOfferIds and schedules an automatic retry with capped exponential backoff.
+     * re-queues unresolved IDs and schedules an automatic retry with capped exponential backoff.
      */
     _recordLookupFailure(failedIds, err, gen = this._generation, port = this.port) {
       if (!this._isGenerationActive(gen, port)) return;
       for (const id of failedIds) {
-        if (this._pendingOfferIds.size >= MAX_BATCH_IDS) {
-          break;
-        }
-        if (!this._shouldSkipOfferLookup(id)) {
-          this._pendingOfferIds.add(id);
-        }
+        this._requeueUnresolvedId(id);
       }
       this._lookupFailureCount++;
       const shift = Math.min(this._lookupFailureCount - 1, 16);
@@ -1518,10 +1558,21 @@
     /**
      * Dispatches GET requests from _pendingGetQueue up to the configured maxConcurrency window,
      * first promoting any deferred unaccepted IDs if queue capacity has opened up.
+     * Pauses new GET dispatches while an acceptance-lookup outage backoff is active so queued payloads
+     * are not transferred unnecessarily during a backend lookup outage.
      */
     _dispatchNextGets(gen = this._generation, port = this.port) {
       if (!this._isGenerationActive(gen, port)) return;
       this._pruneExpiredGets();
+
+      if (this._isLookupBackoffActive()) {
+        this._scheduleGetExpiryTimer(gen, port);
+        if (!this._lookupTimer) {
+          this._schedulePendingOfferDrain(this._nextLookupAllowedAt - Date.now(), gen, port);
+        }
+        return;
+      }
+
       this._promoteDeferredOffers(gen, port);
 
       const activeReceives = this._inFlightGets.size + this._acceptingIds.size;
@@ -1807,9 +1858,19 @@
           return;
         }
 
-        // Duplicate check: if already accepted, send ACK again and do not import twice
+        // Duplicate check: respect active lookup outage backoff before calling getAcceptance([id])
+        if (this._isLookupBackoffActive()) {
+          this._acceptingIds.delete(id);
+          this._requeueUnresolvedId(id);
+          if (!this._lookupTimer) {
+            this._schedulePendingOfferDrain(this._nextLookupAllowedAt - Date.now(), gen, port);
+          }
+          return;
+        }
+
         let validatedLookup = null;
         try {
+          this._lastLookupStartedAt = Date.now();
           const lookupRes = await this.storage.getAcceptance([id]);
           if (!this._isGenerationActive(gen, port)) {
             return;
@@ -2006,6 +2067,9 @@
               this._activeAckBatchSet.delete(id);
               this._offeredIds.delete(id);
               this._pendingAcks.delete(id);
+              if (this._reconciling) {
+                this._ackedDuringOutboxRead.add(id);
+              }
             }
             this.log('info', `Removed acknowledged message(s) from outbox:`, batchIds);
           } catch (err) {

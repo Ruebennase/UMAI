@@ -64,30 +64,32 @@ type Message struct {
 // Authoritative Inbox Commit & Hot-Folder Visibility Model:
 //  1. Incoming files and message.json are written and fsynced in `.staging/`.
 //  2. The staged directory is atomically renamed to `.committing/m-<sha256(id)>/` (invisible to `inbox/` consumers).
-//  3. `accepted.json` (single consolidated map of `id -> ackReceipt`) is atomically updated and fsynced.
-//     This rename onto `accepted.json` is the single authoritative acceptance commit point.
-//  4. Only AFTER `accepted.json` is durable on disk is `.committing/m-<sha256(id)>/` renamed into `inbox/m-<sha256(id)>/`.
-//     Consequently, an external hot-folder consumer polling `inbox/` can safely archive or delete any directory
-//     appearing in `inbox/` without risking loss of the durable acceptance record or signed ACK receipt.
+//  3. `accepted.json` (single consolidated map of `id -> ackReceipt`) is atomically updated and its parent
+//     directory (`dataDir`) is fsynced.
+//  4. Only AFTER both `accepted.json` and `dataDir` are durable on disk is `.committing/m-<sha256(id)>/` renamed
+//     into `inbox/m-<sha256(id)>/` and `inboxDir` fsynced, promoting the ID from `pendingCommits` to `acceptedIDs`.
+//     If directory synchronization fails after `accepted.json` rename, the staged copy remains in `.committing/`
+//     (hidden from `inbox/` consumers) and acceptance remains unconfirmed until synchronization succeeds.
 type Storage struct {
-	mu                 sync.RWMutex
-	dataDir            string
-	stagingDir         string
-	committingDir      string
-	docsDir            string
-	outboxDir          string
-	inboxDir           string
-	acceptedFile       string
-	legacyReceiptsFile string
-	maxUploadSize      int64
-	acceptedIDs        map[string]bool
-	acceptedReceipts   map[string]string
-	inFlightUntil      map[string]time.Time
-	role               string
-	peerRole           string
-	ownPubKey          ed25519.PublicKey
-	ownPrivKey         ed25519.PrivateKey
-	peerPubKey         ed25519.PublicKey
+	mu               sync.RWMutex
+	dataDir          string
+	stagingDir       string
+	committingDir    string
+	docsDir          string
+	outboxDir        string
+	inboxDir         string
+	acceptedFile     string
+	maxUploadSize    int64
+	acceptedIDs      map[string]bool
+	acceptedReceipts map[string]string
+	pendingCommits   map[string]*Message
+	inFlightUntil    map[string]time.Time
+	syncDirFn        func(string) error
+	role             string
+	peerRole         string
+	ownPubKey        ed25519.PublicKey
+	ownPrivKey       ed25519.PrivateKey
+	peerPubKey       ed25519.PublicKey
 }
 
 // NewStorage initializes storage directories and loads accepted message IDs.
@@ -103,7 +105,6 @@ func NewStorage(dataDir string, maxUploadSize int64) (*Storage, error) {
 	outboxDir := filepath.Join(absDataDir, "outbox")
 	inboxDir := filepath.Join(absDataDir, "inbox")
 	acceptedFile := filepath.Join(absDataDir, "accepted.json")
-	legacyReceiptsFile := filepath.Join(absDataDir, "accepted_receipts.json")
 
 	for _, dir := range []string{absDataDir, stagingDir, committingDir, docsDir, outboxDir, inboxDir} {
 		if err := os.MkdirAll(dir, 0700); err != nil {
@@ -112,18 +113,19 @@ func NewStorage(dataDir string, maxUploadSize int64) (*Storage, error) {
 	}
 
 	s := &Storage{
-		dataDir:            absDataDir,
-		stagingDir:         stagingDir,
-		committingDir:      committingDir,
-		docsDir:            docsDir,
-		outboxDir:          outboxDir,
-		inboxDir:           inboxDir,
-		acceptedFile:       acceptedFile,
-		legacyReceiptsFile: legacyReceiptsFile,
-		maxUploadSize:      maxUploadSize,
-		acceptedIDs:        make(map[string]bool),
-		acceptedReceipts:   make(map[string]string),
-		inFlightUntil:      make(map[string]time.Time),
+		dataDir:          absDataDir,
+		stagingDir:       stagingDir,
+		committingDir:    committingDir,
+		docsDir:          docsDir,
+		outboxDir:        outboxDir,
+		inboxDir:         inboxDir,
+		acceptedFile:     acceptedFile,
+		maxUploadSize:    maxUploadSize,
+		acceptedIDs:      make(map[string]bool),
+		acceptedReceipts: make(map[string]string),
+		pendingCommits:   make(map[string]*Message),
+		inFlightUntil:    make(map[string]time.Time),
+		syncDirFn:        syncDir,
 	}
 
 	if err := s.loadAcceptedIDs(); err != nil {
@@ -131,6 +133,24 @@ func NewStorage(dataDir string, maxUploadSize int64) (*Storage, error) {
 	}
 
 	return s, nil
+}
+
+// SetSyncDirForTesting overrides the directory-synchronization function (pass nil to restore default os.File.Sync).
+func (s *Storage) SetSyncDirForTesting(fn func(string) error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if fn == nil {
+		s.syncDirFn = syncDir
+	} else {
+		s.syncDirFn = fn
+	}
+}
+
+func (s *Storage) syncDirLocked(dirPath string) error {
+	if s.syncDirFn != nil {
+		return s.syncDirFn(dirPath)
+	}
+	return syncDir(dirPath)
 }
 
 // StorageDirKey returns the collision-resistant internal directory key ("m-<sha256_hex>")
@@ -249,9 +269,8 @@ func readMessageJSON(dirPath string) (*Message, error) {
 	return &msg, nil
 }
 
-// resolveOutboxDirLocked resolves an outbox message directory by checking the primary
-// collision-resistant key ("m-<sha256(id)>") first and falling back to a legacy "<id>" path
-// only if its stored message.json has an exact case-sensitive ID match.
+// resolveOutboxDirLocked resolves an outbox message directory using its collision-resistant
+// directory key ("m-<sha256(id)>") and verifies an exact case-sensitive ID match in message.json.
 func (s *Storage) resolveOutboxDirLocked(cleanID string) (string, *Message, error) {
 	dirKey := storageDirKey(cleanID)
 	primaryDir := filepath.Join(s.outboxDir, dirKey)
@@ -268,29 +287,11 @@ func (s *Storage) resolveOutboxDirLocked(cleanID string) (string, *Message, erro
 		return primaryDir, nil, err
 	}
 
-	if cleanID != dirKey {
-		legacyDir := filepath.Join(s.outboxDir, cleanID)
-		if fi, err := os.Stat(legacyDir); err == nil && fi.IsDir() {
-			msg, readErr := readMessageJSON(legacyDir)
-			if readErr != nil {
-				return legacyDir, nil, readErr
-			}
-			if msg.ID != cleanID {
-				// Belongs to a different case-variant legacy directory on a case-insensitive filesystem
-				return "", nil, ErrNotFound
-			}
-			return legacyDir, msg, nil
-		} else if err != nil && !os.IsNotExist(err) {
-			return legacyDir, nil, err
-		}
-	}
-
 	return "", nil, ErrNotFound
 }
 
-// resolveInboxDirLocked resolves an inbox message directory by checking the primary
-// collision-resistant key ("m-<sha256(id)>") first, then `.committing/m-<sha256(id)>` (if already
-// committed in acceptedIDs), and finally a legacy "<id>" path with exact ID verification.
+// resolveInboxDirLocked resolves a committed inbox message directory using its collision-resistant
+// directory key ("m-<sha256(id)>") and verifies an exact case-sensitive ID match in message.json.
 func (s *Storage) resolveInboxDirLocked(cleanID string) (string, *Message, error) {
 	dirKey := storageDirKey(cleanID)
 	primaryDir := filepath.Join(s.inboxDir, dirKey)
@@ -305,36 +306,6 @@ func (s *Storage) resolveInboxDirLocked(cleanID string) (string, *Message, error
 		return primaryDir, msg, nil
 	} else if err != nil && !os.IsNotExist(err) {
 		return primaryDir, nil, err
-	}
-
-	if s.acceptedIDs[cleanID] {
-		committingPath := filepath.Join(s.committingDir, dirKey)
-		if fi, err := os.Stat(committingPath); err == nil && fi.IsDir() {
-			msg, readErr := readMessageJSON(committingPath)
-			if readErr != nil {
-				return committingPath, nil, readErr
-			}
-			if msg.ID != cleanID {
-				return committingPath, nil, ErrStorageCollision
-			}
-			return committingPath, msg, nil
-		}
-	}
-
-	if cleanID != dirKey {
-		legacyDir := filepath.Join(s.inboxDir, cleanID)
-		if fi, err := os.Stat(legacyDir); err == nil && fi.IsDir() {
-			msg, readErr := readMessageJSON(legacyDir)
-			if readErr != nil {
-				return legacyDir, nil, readErr
-			}
-			if msg.ID != cleanID {
-				return "", nil, ErrNotFound
-			}
-			return legacyDir, msg, nil
-		} else if err != nil && !os.IsNotExist(err) {
-			return legacyDir, nil, err
-		}
 	}
 
 	return "", nil, ErrNotFound
@@ -417,7 +388,7 @@ func (s *Storage) SaveDocument(filename string, r io.Reader) (*DocumentInfo, err
 		_ = os.Remove(tmpPath)
 		return nil, err
 	}
-	if err := syncDir(s.stagingDir); err != nil {
+	if err := s.syncDirLocked(s.stagingDir); err != nil {
 		_ = os.Remove(tmpPath)
 		return nil, err
 	}
@@ -426,7 +397,7 @@ func (s *Storage) SaveDocument(filename string, r io.Reader) (*DocumentInfo, err
 		_ = os.Remove(tmpPath)
 		return nil, err
 	}
-	if err := syncDir(s.docsDir); err != nil {
+	if err := s.syncDirLocked(s.docsDir); err != nil {
 		return nil, err
 	}
 
@@ -577,7 +548,7 @@ func (s *Storage) CreateOutboxMessage(payload any, docNames []string) (*Message,
 			SHA256: hex.EncodeToString(hasher.Sum(nil)),
 		})
 	}
-	if err := syncDir(attachmentsDir); err != nil {
+	if err := s.syncDirLocked(attachmentsDir); err != nil {
 		_ = os.RemoveAll(tmpDir)
 		return nil, err
 	}
@@ -600,11 +571,11 @@ func (s *Storage) CreateOutboxMessage(payload any, docNames []string) (*Message,
 		_ = os.RemoveAll(tmpDir)
 		return nil, err
 	}
-	if err := syncDir(tmpDir); err != nil {
+	if err := s.syncDirLocked(tmpDir); err != nil {
 		_ = os.RemoveAll(tmpDir)
 		return nil, err
 	}
-	if err := syncDir(s.stagingDir); err != nil {
+	if err := s.syncDirLocked(s.stagingDir); err != nil {
 		_ = os.RemoveAll(tmpDir)
 		return nil, err
 	}
@@ -613,7 +584,7 @@ func (s *Storage) CreateOutboxMessage(payload any, docNames []string) (*Message,
 		_ = os.RemoveAll(tmpDir)
 		return nil, err
 	}
-	if err := syncDir(s.outboxDir); err != nil {
+	if err := s.syncDirLocked(s.outboxDir); err != nil {
 		return nil, err
 	}
 
@@ -653,9 +624,8 @@ func (s *Storage) ListOutboxForSession(sessionKey string) ([]*Message, error) {
 		if err != nil {
 			continue
 		}
-		// Accept both collision-resistant internal keys ("m-<sha256(id)>") and legacy/external "<id>" directories
-		// whose message.json matches the directory name.
-		if dirName != storageDirKey(msg.ID) && !strings.EqualFold(dirName, msg.ID) {
+		// Enforce collision-resistant internal directory key ("m-<sha256(id)>") matching message.json.
+		if dirName != storageDirKey(msg.ID) {
 			continue
 		}
 		if seenIDs[msg.ID] {
@@ -832,7 +802,7 @@ func (s *Storage) AcknowledgeMessagesVerified(ids []string, receipts map[string]
 		}
 	}
 	if removedAny {
-		if err := syncDir(s.outboxDir); err != nil {
+		if err := s.syncDirLocked(s.outboxDir); err != nil {
 			return err
 		}
 	}
@@ -860,8 +830,9 @@ func (s *Storage) IsAccepted(id string) bool {
 	return s.acceptedIDs[cleanID]
 }
 
-// GetAcceptance checks a bounded batch of message IDs in a single lock acquisition
-// and returns an explicit AcceptanceStatus for every requested ID.
+// GetAcceptance checks a bounded batch of message IDs and returns an explicit AcceptanceStatus
+// for every requested ID. If any requested ID has an unresolved durability flush (`pendingCommits`),
+// GetAcceptance attempts to finalize the flush first and returns a storage error if synchronization still fails.
 func (s *Storage) GetAcceptance(ids []string) (map[string]AcceptanceStatus, error) {
 	if len(ids) > MaxBatchIDs {
 		return nil, ErrTooManyIDs
@@ -877,8 +848,33 @@ func (s *Storage) GetAcceptance(ids []string) (map[string]AcceptanceStatus, erro
 	}
 
 	s.mu.RLock()
-	defer s.mu.RUnlock()
+	hasPending := false
+	for _, id := range cleanIDs {
+		if _, ok := s.pendingCommits[id]; ok {
+			hasPending = true
+			break
+		}
+	}
+	if !hasPending {
+		results := s.buildAcceptanceMapLocked(cleanIDs)
+		s.mu.RUnlock()
+		return results, nil
+	}
+	s.mu.RUnlock()
 
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, id := range cleanIDs {
+		if _, ok := s.pendingCommits[id]; ok {
+			if _, err := s.finalizePendingCommitLocked(id); err != nil {
+				return nil, err
+			}
+		}
+	}
+	return s.buildAcceptanceMapLocked(cleanIDs), nil
+}
+
+func (s *Storage) buildAcceptanceMapLocked(cleanIDs []string) map[string]AcceptanceStatus {
 	results := make(map[string]AcceptanceStatus, len(cleanIDs))
 	for _, id := range cleanIDs {
 		if _, exists := results[id]; exists {
@@ -899,10 +895,10 @@ func (s *Storage) GetAcceptance(ids []string) (map[string]AcceptanceStatus, erro
 			AckReceipt: receipt,
 		}
 	}
-	return results, nil
+	return results
 }
 
-// ListAccepted returns all accepted message IDs.
+// ListAccepted returns all confirmed accepted message IDs.
 func (s *Storage) ListAccepted() []string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -914,7 +910,7 @@ func (s *Storage) ListAccepted() []string {
 	return ids
 }
 
-// ListAcceptedReceipts returns a map of accepted message ID -> cryptographic ACK receipt from the authoritative index.
+// ListAcceptedReceipts returns a map of confirmed accepted message ID -> cryptographic ACK receipt from the authoritative index.
 func (s *Storage) ListAcceptedReceipts() map[string]string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -934,7 +930,7 @@ func (s *Storage) ListAcceptedReceipts() map[string]string {
 	return receipts
 }
 
-// ListInbox returns all accepted messages currently stored in inbox.
+// ListInbox returns all confirmed accepted messages currently stored in inbox.
 func (s *Storage) ListInbox() ([]*Message, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -955,7 +951,7 @@ func (s *Storage) ListInbox() ([]*Message, error) {
 		if err != nil {
 			continue
 		}
-		if dirName != storageDirKey(msg.ID) && !strings.EqualFold(dirName, msg.ID) {
+		if dirName != storageDirKey(msg.ID) {
 			continue
 		}
 		if !s.acceptedIDs[msg.ID] || seenIDs[msg.ID] {
@@ -963,24 +959,6 @@ func (s *Storage) ListInbox() ([]*Message, error) {
 		}
 		seenIDs[msg.ID] = true
 		msgs = append(msgs, msg)
-	}
-
-	// Include any committed message still awaiting final move from .committing/
-	if commEntries, err := os.ReadDir(s.committingDir); err == nil {
-		for _, entry := range commEntries {
-			if !entry.IsDir() {
-				continue
-			}
-			dirName := entry.Name()
-			msg, err := readMessageJSON(filepath.Join(s.committingDir, dirName))
-			if err != nil {
-				continue
-			}
-			if dirName == storageDirKey(msg.ID) && s.acceptedIDs[msg.ID] && !seenIDs[msg.ID] {
-				seenIDs[msg.ID] = true
-				msgs = append(msgs, msg)
-			}
-		}
 	}
 
 	return msgs, nil
@@ -1073,23 +1051,25 @@ func (s *Storage) acceptMessageInternal(id string, payload any, attachments []At
 	committingPath := filepath.Join(s.committingDir, dirKey)
 	targetDir := filepath.Join(s.inboxDir, dirKey)
 
-	// 1. Duplicate check: if already accepted in the authoritative index, verify signature match (when required)
+	// 0. Unresolved durability check: if accepted.json was previously renamed on disk for this ID
+	//    but directory synchronization or inbox exposure failed, verify signature match and retry finalization.
+	if pendingMsg, isPending := s.pendingCommits[cleanID]; isPending {
+		if (requireSignature || sigHex != "") && len(s.peerPubKey) > 0 {
+			if pendingMsg.Signature == "" || !strings.EqualFold(strings.TrimSpace(pendingMsg.Signature), strings.TrimSpace(sigHex)) {
+				return nil, ErrInvalidSignature
+			}
+		}
+		return s.finalizePendingCommitLocked(cleanID)
+	}
+
+	// 1. Confirmed duplicate check: if already durably accepted, verify signature match (when required)
 	//    and return the stored message / receipt without re-importing or overwriting anything.
 	if s.acceptedIDs[cleanID] {
-		msgDir, existing, resolveErr := s.resolveInboxDirLocked(cleanID)
+		_, existing, resolveErr := s.resolveInboxDirLocked(cleanID)
 		if resolveErr == nil && existing != nil {
 			if (requireSignature || sigHex != "") && len(s.peerPubKey) > 0 {
 				if existing.Signature == "" || !strings.EqualFold(strings.TrimSpace(existing.Signature), strings.TrimSpace(sigHex)) {
 					return nil, ErrInvalidSignature
-				}
-			}
-			// If the message was still sitting in .committing/ after an interrupted final move, finish moving it now
-			if msgDir == committingPath {
-				if _, statErr := os.Stat(targetDir); os.IsNotExist(statErr) {
-					if renErr := os.Rename(committingPath, targetDir); renErr == nil {
-						_ = syncDir(s.inboxDir)
-						_ = syncDir(s.committingDir)
-					}
 				}
 			}
 			return existing, nil
@@ -1126,16 +1106,15 @@ func (s *Storage) acceptMessageInternal(id string, payload any, attachments []At
 				return nil, ErrInvalidSignature
 			}
 		}
-		s.acceptedIDs[cleanID] = true
-		s.acceptedReceipts[cleanID] = existing.AckReceipt
-		if committed, pErr := s.persistAcceptedIDsLocked(); pErr != nil {
-			if !committed {
-				delete(s.acceptedIDs, cleanID)
-				delete(s.acceptedReceipts, cleanID)
+		renamedOnDisk, pErr := s.persistAcceptedIDsWithCandidateLocked(cleanID, existing.AckReceipt)
+		if pErr != nil {
+			if renamedOnDisk {
+				s.pendingCommits[cleanID] = existing
 			}
 			return nil, fmt.Errorf("persisting accepted ID: %w", pErr)
 		}
-		return existing, nil
+		s.pendingCommits[cleanID] = existing
+		return s.finalizePendingCommitLocked(cleanID)
 	} else if !os.IsNotExist(statErr) {
 		return nil, statErr
 	}
@@ -1145,7 +1124,7 @@ func (s *Storage) acceptMessageInternal(id string, payload any, attachments []At
 		if readErr == nil && existing.ID != cleanID {
 			return nil, ErrStorageCollision
 		}
-		// Only remove an uncommitted .committing directory if it does NOT belong to a different ID
+		// Only remove an uncommitted .committing directory if it does NOT belong to a different ID or pending commit
 		if err := os.RemoveAll(committingPath); err != nil {
 			return nil, err
 		}
@@ -1218,7 +1197,7 @@ func (s *Storage) acceptMessageInternal(id string, payload any, attachments []At
 			SHA256: hex.EncodeToString(hasher.Sum(nil)),
 		})
 	}
-	if err := syncDir(tmpAttachmentsDir); err != nil {
+	if err := s.syncDirLocked(tmpAttachmentsDir); err != nil {
 		_ = os.RemoveAll(tmpDir)
 		return nil, err
 	}
@@ -1249,55 +1228,80 @@ func (s *Storage) acceptMessageInternal(id string, payload any, attachments []At
 		_ = os.RemoveAll(tmpDir)
 		return nil, err
 	}
-	if err := syncDir(tmpDir); err != nil {
+	if err := s.syncDirLocked(tmpDir); err != nil {
 		_ = os.RemoveAll(tmpDir)
 		return nil, err
 	}
-	if err := syncDir(s.stagingDir); err != nil {
+	if err := s.syncDirLocked(s.stagingDir); err != nil {
 		_ = os.RemoveAll(tmpDir)
 		return nil, err
 	}
 
-	// 4. Move staged message to .committing/m-<sha256(id)> (not yet visible in inbox/ to external consumers).
+	// 4. Move staged message to .committing/m-<sha256(id)> (invisible to external inbox/ consumers).
 	if err := os.Rename(tmpDir, committingPath); err != nil {
 		_ = os.RemoveAll(tmpDir)
 		return nil, err
 	}
-	if err := syncDir(s.committingDir); err != nil {
+	if err := s.syncDirLocked(s.committingDir); err != nil {
 		_ = os.RemoveAll(committingPath)
 		return nil, err
 	}
 
-	// 5. Authoritative Commit Point: atomically persist consolidated accepted.json (id -> ackReceipt)
-	//    BEFORE exposing the directory inside inbox/.
-	s.acceptedIDs[cleanID] = true
-	s.acceptedReceipts[cleanID] = ackReceipt
-	committedOnDisk, err := s.persistAcceptedIDsLocked()
+	// 5. Persist consolidated accepted.json (id -> ackReceipt) and synchronize dataDir BEFORE exposing inbox/
+	//    or marking acceptedIDs[cleanID] = true.
+	renamedOnDisk, err := s.persistAcceptedIDsWithCandidateLocked(cleanID, ackReceipt)
 	if err != nil {
-		if !committedOnDisk {
+		if !renamedOnDisk {
 			// accepted.json on disk was NOT modified; roll back cleanly so state stays 100% unaccepted
-			delete(s.acceptedIDs, cleanID)
-			delete(s.acceptedReceipts, cleanID)
 			_ = os.RemoveAll(committingPath)
-			_ = syncDir(s.committingDir)
+			_ = s.syncDirLocked(s.committingDir)
 			return nil, fmt.Errorf("persisting accepted ID: %w", err)
 		}
-		// accepted.json rename succeeded on disk (only parent dir sync failed): NEVER delete the committed message.
-		_ = os.Rename(committingPath, targetDir)
+		// accepted.json rename succeeded on disk, but parent dir flush failed:
+		// Keep .committing/m-<sha256(id)> intact (do NOT move to inbox/, do NOT confirm acceptedIDs[cleanID]!)
+		s.pendingCommits[cleanID] = msg
 		return nil, fmt.Errorf("syncing accepted ID index: %w", err)
 	}
 
-	// 6. Expose committed message in inbox/m-<sha256(id)> now that accepted.json is durable on disk.
-	//    Never delete committingPath or revoke acceptedIDs if this post-commit step encounters an error.
-	if err := os.Rename(committingPath, targetDir); err != nil {
-		return nil, fmt.Errorf("moving committed message into inbox: %w", err)
-	}
-	if err := syncDir(s.inboxDir); err != nil {
-		return nil, err
-	}
-	_ = syncDir(s.committingDir)
+	// 6. Finalize inbox exposure + directory synchronization before confirming acceptedIDs[cleanID] = true.
+	s.pendingCommits[cleanID] = msg
+	return s.finalizePendingCommitLocked(cleanID)
+}
 
-	return msg, nil
+func (s *Storage) finalizePendingCommitLocked(cleanID string) (*Message, error) {
+	pendingMsg, ok := s.pendingCommits[cleanID]
+	if !ok {
+		return nil, ErrNotFound
+	}
+
+	if err := s.syncDirLocked(s.dataDir); err != nil {
+		return nil, fmt.Errorf("syncing accepted ID index: %w", err)
+	}
+
+	dirKey := storageDirKey(cleanID)
+	committingPath := filepath.Join(s.committingDir, dirKey)
+	targetDir := filepath.Join(s.inboxDir, dirKey)
+	if _, statErr := os.Stat(committingPath); statErr == nil {
+		if _, dstErr := os.Stat(targetDir); os.IsNotExist(dstErr) {
+			if err := os.Rename(committingPath, targetDir); err != nil {
+				return nil, fmt.Errorf("moving committed message into inbox: %w", err)
+			}
+		} else if dstErr != nil {
+			return nil, dstErr
+		}
+	} else if !os.IsNotExist(statErr) {
+		return nil, statErr
+	}
+
+	if err := s.syncDirLocked(s.inboxDir); err != nil {
+		return nil, fmt.Errorf("syncing inbox directory: %w", err)
+	}
+	_ = s.syncDirLocked(s.committingDir)
+
+	s.acceptedIDs[cleanID] = true
+	s.acceptedReceipts[cleanID] = pendingMsg.AckReceipt
+	delete(s.pendingCommits, cleanID)
+	return pendingMsg, nil
 }
 
 // -----------------------------------------------------------------------------
@@ -1312,62 +1316,41 @@ func (s *Storage) loadAcceptedIDs() error {
 	}
 
 	needsPersist := false
-	removeLegacyReceipts := false
+	loadedIndexFile := false
 
-	// 2. Load consolidated accepted.json (map[string]string of id -> ackReceipt),
-	//    supporting legacy []string format transparently.
+	// 2. Load consolidated accepted.json (map[string]string of id -> ackReceipt).
 	data, err := os.ReadFile(s.acceptedFile)
 	if err != nil && !os.IsNotExist(err) {
 		return err
 	}
 	if err == nil {
+		loadedIndexFile = true
 		var mapFormat map[string]string
-		if err := json.Unmarshal(data, &mapFormat); err == nil && mapFormat != nil {
-			for id, receipt := range mapFormat {
-				if clean, err := sanitizeID(id); err == nil {
-					s.acceptedIDs[clean] = true
-					if receipt != "" {
-						s.acceptedReceipts[clean] = receipt
-					}
-				}
-			}
-		} else {
-			var legacyList []string
-			if err := json.Unmarshal(data, &legacyList); err != nil {
+		if err := json.Unmarshal(data, &mapFormat); err != nil || mapFormat == nil {
+			if err != nil {
 				return err
 			}
-			for _, id := range legacyList {
-				if clean, err := sanitizeID(id); err == nil {
-					s.acceptedIDs[clean] = true
-				}
-			}
-			needsPersist = true
+			return errors.New("invalid accepted.json format")
 		}
-	}
-
-	// 3. Merge legacy accepted_receipts.json if present (preserving receipts even for messages
-	//    whose inbox directories were already archived/deleted by external consumers).
-	if rData, err := os.ReadFile(s.legacyReceiptsFile); err == nil {
-		var rMap map[string]string
-		if err := json.Unmarshal(rData, &rMap); err != nil {
-			return err
-		}
-		for id, receipt := range rMap {
+		for id, receipt := range mapFormat {
 			if clean, err := sanitizeID(id); err == nil {
 				s.acceptedIDs[clean] = true
-				if receipt != "" && s.acceptedReceipts[clean] == "" {
+				if receipt != "" {
 					s.acceptedReceipts[clean] = receipt
 				}
 			}
 		}
-		needsPersist = true
-		removeLegacyReceipts = true
-	} else if !os.IsNotExist(err) {
-		return err
 	}
 
-	// 4. Reconcile .committing/:
-	//    - If msg.ID is in acceptedIDs (crash happened AFTER accepted.json commit, BEFORE inbox rename),
+	// Ensure dataDir is synchronized before exposing any .committing/ recovery entries in inbox/.
+	if loadedIndexFile {
+		if err := s.syncDirLocked(s.dataDir); err != nil {
+			return err
+		}
+	}
+
+	// 3. Reconcile .committing/:
+	//    - If msg.ID is in acceptedIDs (crash happened AFTER accepted.json rename, BEFORE inbox exposure),
 	//      complete the move into inbox/m-<sha256(id)>.
 	//    - Otherwise (crash happened BEFORE accepted.json commit; never acknowledged or exposed),
 	//      remove the uncommitted directory.
@@ -1404,19 +1387,18 @@ func (s *Storage) loadAcceptedIDs() error {
 			}
 		}
 		if inboxChanged {
-			if err := syncDir(s.inboxDir); err != nil {
+			if err := s.syncDirLocked(s.inboxDir); err != nil {
 				return err
 			}
 		}
 		if commChanged {
-			if err := syncDir(s.committingDir); err != nil {
+			if err := s.syncDirLocked(s.committingDir); err != nil {
 				return err
 			}
 		}
 	}
 
-	// 5. Reconcile committed inbox/ directories (both "m-<sha256(id)>" and legacy "<id>" directories)
-	//    into acceptedIDs and acceptedReceipts.
+	// 4. Reconcile committed inbox/m-<sha256(id)> directories into acceptedIDs and acceptedReceipts.
 	if entries, err := os.ReadDir(s.inboxDir); err == nil {
 		for _, entry := range entries {
 			if !entry.IsDir() {
@@ -1427,7 +1409,7 @@ func (s *Storage) loadAcceptedIDs() error {
 			if readErr != nil {
 				continue
 			}
-			if dirName != storageDirKey(msg.ID) && !strings.EqualFold(dirName, msg.ID) {
+			if dirName != storageDirKey(msg.ID) {
 				continue
 			}
 			if msg.AckReceipt != "" && s.acceptedReceipts[msg.ID] == "" {
@@ -1442,21 +1424,23 @@ func (s *Storage) loadAcceptedIDs() error {
 	}
 
 	if needsPersist {
-		if _, err := s.persistAcceptedIDsLocked(); err != nil {
+		if _, err := s.persistAcceptedIDsWithCandidateLocked("", ""); err != nil {
 			return err
 		}
-	}
-	if removeLegacyReceipts {
-		_ = os.Remove(s.legacyReceiptsFile)
-		_ = syncDir(s.dataDir)
 	}
 	return nil
 }
 
-func (s *Storage) persistAcceptedIDsLocked() (bool, error) {
-	consolidated := make(map[string]string, len(s.acceptedIDs))
+func (s *Storage) persistAcceptedIDsWithCandidateLocked(candidateID string, candidateReceipt string) (bool, error) {
+	consolidated := make(map[string]string, len(s.acceptedIDs)+len(s.pendingCommits)+1)
 	for id := range s.acceptedIDs {
 		consolidated[id] = s.acceptedReceipts[id]
+	}
+	for id, pending := range s.pendingCommits {
+		consolidated[id] = pending.AckReceipt
+	}
+	if candidateID != "" {
+		consolidated[candidateID] = candidateReceipt
 	}
 	return s.writeAtomicJSONWithCommitState(s.acceptedFile, consolidated)
 }
@@ -1489,7 +1473,7 @@ func (s *Storage) writeAtomicJSONWithCommitState(targetPath string, v any) (bool
 		_ = os.Remove(tmpPath)
 		return false, err
 	}
-	if err := syncDir(s.stagingDir); err != nil {
+	if err := s.syncDirLocked(s.stagingDir); err != nil {
 		_ = os.Remove(tmpPath)
 		return false, err
 	}
@@ -1498,7 +1482,7 @@ func (s *Storage) writeAtomicJSONWithCommitState(targetPath string, v any) (bool
 		_ = os.Remove(tmpPath)
 		return false, err
 	}
-	if err := syncDir(filepath.Dir(targetPath)); err != nil {
+	if err := s.syncDirLocked(filepath.Dir(targetPath)); err != nil {
 		return true, err
 	}
 	return true, nil

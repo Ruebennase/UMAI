@@ -1349,6 +1349,157 @@ function makeBatchAcceptance(fn) {
   }
   console.log('✓ Test 9: Batch getAcceptance(ids) full-queue ACK independence, outage backoff recovery, whole-batch validation, and bounded maps passed');
 
+  // Test 10: Reviewer Progress & Outage-Backoff Completeness Regressions:
+  //   10a) Slow getOutboxIds() overlapped by faster periodic reconcile(false) heartbeats still emits OFFERs (no starvation)
+  //        and excludes IDs acknowledged while getOutboxIds() was in flight
+  //   10b) Incoming PUT duplicate checks respect lookup outage backoff (20 offered messages do NOT trigger 20 lookups or 20 payload transfers during outage)
+  {
+    // --- 10a: Slow getOutboxIds() overlapped by faster reconcile(false) heartbeats ---
+    let slowReadCount = 0;
+    const outbox10a = ['msg-slow-outbox-1', 'msg-concurrent-ack'];
+    const chan10a = createMockChannel();
+    const sender10a = new UmaiSession({
+      peerOrigin: 'http://peer.example',
+      role: 'host',
+      storage: {
+        getOutboxIds: async () => {
+          slowReadCount++;
+          const snapshot = outbox10a.slice();
+          await new Promise(r => setTimeout(r, 110));
+          return snapshot;
+        },
+        getMessage: async () => null,
+        getAcceptance: makeBatchAcceptance(() => ({ accepted: false })),
+        acceptMessage: async () => true,
+        onAcknowledged: async (ids) => {
+          for (const id of ids) {
+            const idx = outbox10a.indexOf(id);
+            if (idx !== -1) outbox10a.splice(idx, 1);
+          }
+        }
+      }
+    });
+    sender10a.port = chan10a.port1;
+    chan10a.port1.onmessage = sender10a._portListener;
+    sender10a.state = 'connected';
+    sender10a._offeredIds.add('msg-concurrent-ack');
+
+    // Start initial reconcile(true) (110ms read), overlap with 35ms heartbeats (faster than 110ms read!),
+    // AND deliver an ACK for 'msg-concurrent-ack' while read #1 is in flight!
+    const pInit = sender10a.reconcile(true);
+    await new Promise(r => setTimeout(r, 20));
+    await sender10a._handleAck({
+      protocol: PROTOCOL_NAME,
+      version: PROTOCOL_VERSION,
+      type: 'ACK',
+      ids: ['msg-concurrent-ack']
+    });
+    const hbTimer = setInterval(() => {
+      sender10a.reconcile(false);
+    }, 35);
+    await new Promise(r => setTimeout(r, 260));
+    clearInterval(hbTimer);
+    await pInit;
+
+    const offers10a = chan10a.port1.sent.filter(m => m.type === 'OFFER');
+    assert.strictEqual(offers10a.length >= 2, true, `Slow getOutboxIds() overlapped by faster heartbeats must still emit OFFERs (got ${offers10a.length} after ${slowReadCount} reads)`);
+    assert.deepStrictEqual(
+      offers10a[0].ids,
+      ['msg-slow-outbox-1'],
+      'First completed outbox snapshot must emit OFFER immediately while excluding ID acknowledged mid-read'
+    );
+    sender10a.stop();
+
+    // --- 10b: Incoming PUT duplicate checks respect lookup outage backoff (20-message reproduction) ---
+    const ids20 = Array.from({ length: 20 }, (_, i) => `msg-cascade-${i + 1}`);
+    let lookupCalls10b = 0;
+    let backendOutage10b = false;
+    let putSentCount10b = 0;
+    const accepted10b = new Set();
+    const chan10b = createMockChannel();
+
+    const sender10b = new UmaiSession({
+      peerOrigin: 'http://peer.example',
+      role: 'host',
+      storage: {
+        getOutboxIds: async () => ids20.filter(id => !accepted10b.has(id)),
+        getMessage: async (id) => {
+          putSentCount10b++;
+          return { id, payload: { seq: id }, attachments: [] };
+        },
+        getAcceptance: makeBatchAcceptance(() => ({ accepted: false })),
+        acceptMessage: async () => true,
+        onAcknowledged: async () => {}
+      }
+    });
+
+    const rec10b = new UmaiSession({
+      peerOrigin: 'http://host.example',
+      role: 'embedded',
+      maxConcurrency: 1,
+      lookupMinIntervalMs: 0,
+      lookupRetryBaseMs: 180,
+      lookupRetryMaxMs: 360,
+      storage: {
+        getOutboxIds: async () => [],
+        getMessage: async () => null,
+        getAcceptance: async (ids) => {
+          lookupCalls10b++;
+          if (backendOutage10b) {
+            throw new Error('HTTP 503 Lookup Outage During PUT');
+          }
+          const out = Object.create(null);
+          for (const id of ids) {
+            out[id] = { accepted: accepted10b.has(id) };
+          }
+          // Flip backend into outage right after the initial 20-ID OFFER batch lookup succeeds!
+          if (lookupCalls10b === 1) {
+            backendOutage10b = true;
+          }
+          return out;
+        },
+        acceptMessage: async (msg) => {
+          accepted10b.add(msg.id);
+          return { accepted: true, ackReceipt: `rec-${msg.id}` };
+        },
+        onAcknowledged: async () => {}
+      }
+    });
+
+    sender10b.port = chan10b.port1;
+    chan10b.port1.onmessage = sender10b._portListener;
+    sender10b.state = 'connected';
+    rec10b.port = chan10b.port2;
+    chan10b.port2.onmessage = rec10b._portListener;
+    rec10b.state = 'connected';
+
+    await sender10b.reconcile(true);
+    // Wait 60ms (well inside the 180ms lookupRetryBaseMs window)
+    await new Promise(r => setTimeout(r, 60));
+
+    assert.strictEqual(
+      lookupCalls10b,
+      2,
+      `Expected only 1 initial OFFER batch lookup + 1 PUT duplicate lookup before backoff holds the queue, got ${lookupCalls10b}`
+    );
+    assert.strictEqual(
+      putSentCount10b,
+      1,
+      `Expected only 1 message payload transferred before lookup backoff pauses remaining 19 queued GETs, got ${putSentCount10b}`
+    );
+    assert.strictEqual(accepted10b.size, 0, 'Zero messages should be accepted while lookup outage is active');
+
+    // Heal lookup backend before the 180ms backoff timer fires and verify all 20 messages complete automatically
+    backendOutage10b = false;
+    await new Promise(r => setTimeout(r, 260));
+
+    assert.strictEqual(accepted10b.size, 20, `All 20 messages must recover and be accepted automatically once lookup heals (got ${accepted10b.size})`);
+    assert.strictEqual(rec10b.getSyncStatus().isSyncing, false, 'Receiver must return to in-sync state after all 20 messages complete');
+    sender10b.stop();
+    rec10b.stop();
+  }
+  console.log('✓ Test 10: Slow outbox non-starvation under heartbeat and PUT lookup-backoff cascade prevention passed');
+
   senderPoison.stop();
   receiverPoison.stop();
   secSession.stop();
