@@ -451,57 +451,143 @@
       const isChildContext = typeof window !== 'undefined' && ((window.parent && window.parent !== window) || !!window.opener);
       this.role = options.role || (isChildContext && !this.iframe && !this.peerWindow ? 'embedded' : 'host');
 
-      this.port = null;
-      this._generation = 0;
+      this._conn = null;
+      this._lifecycleSeq = 0;
       this._stopped = false;
       this.state = 'disconnected'; // 'disconnected' | 'handshaking' | 'connected'
       this._windowListener = this._handleWindowMessage.bind(this);
-      this._portListener = (event) => this._handlePortMessage(event, this._generation, this.port);
+      this._windowListenerRegistered = false;
+      this._syncInterval = null;
+      this._readyInterval = null;
+    }
 
-      // Outgoing PUT queue and active worker tracking
-      this._putQueue = [];
-      this._activePuttingIds = new Set();
-      this._activeSendCount = 0;
+    /**
+     * Active MessagePort for the current connection, or null when not attached.
+     * Assigning a port attaches a fresh isolated connection object; assigning null closes any active connection.
+     */
+    get port() {
+      return this._conn ? this._conn.port : null;
+    }
 
-      // Coalesced incoming ACK queue and single-worker tracking
-      this._pendingAcks = new Map();
-      this._activeAckBatchSet = new Set();
-      this._processingAcks = false;
+    set port(newPort) {
+      if (newPort) {
+        this._attachConnection(newPort);
+      } else {
+        this._resetChannelState();
+      }
+    }
 
-      // Serialized outbox reconciliation state
-      this._reconciling = false;
-      this._reconcilePending = false;
-      this._reconcileForcePending = false;
-      this._reconcilePromise = null;
-      this._ackedDuringOutboxRead = new Set();
+    /**
+     * Connection-pinned MessagePort listener for the currently attached connection.
+     */
+    get _portListener() {
+      return this._conn ? this._conn.portListener : (() => {});
+    }
 
-      // Coalesced incoming OFFER queue, in-flight lookup reservation, deferred unaccepted overflow, and single-worker state
-      this._pendingOfferIds = new Set();
-      this._inFlightLookupIds = new Set();
-      this._deferredOfferIds = new Set();
-      this._processingOffers = false;
-      this._lastLookupStartedAt = 0;
-      this._lookupFailureCount = 0;
-      this._nextLookupAllowedAt = 0;
-      this._lookupTimer = null;
+    /**
+     * Creates an isolated per-connection state record owning all mutable channel queues,
+     * reservations, retry counters, worker flags, and timers for a single MessagePort.
+     */
+    _createConnection(port) {
+      const conn = {
+        closed: false,
+        port: port,
+        portListener: null,
+        peerOfferedOnce: false,
 
-      // Receiver GET windowing queue, active reservations, and bounded expired reservation history
-      this._pendingGetQueue = [];
-      this._inFlightGets = new Map();
-      this._expiredGets = new Set();
-      this._timedOutGets = new Map();
-      this._getExpiryTimer = null;
+        // Outgoing PUT queue and active worker tracking
+        putQueue: [],
+        activePuttingIds: new Set(),
+        activeSendCount: 0,
 
-      // Track message IDs currently being committed in acceptMessage() and queue incoming PUTs up to maxConcurrency
-      this._acceptingIds = new Set();
-      this._incomingPutQueue = [];
-      this._activeAcceptCount = 0;
+        // Coalesced incoming ACK queue and single-worker tracking
+        pendingAcks: new Map(),
+        activeAckBatchSet: new Set(),
+        processingAcks: false,
 
-      // Track message IDs offered to the peer (bounded to MAX_BATCH_IDS)
-      this._offeredIds = new Set();
+        // Serialized outbox reconciliation state
+        reconciling: false,
+        reconcilePending: false,
+        reconcileForcePending: false,
+        reconcilePromise: null,
+        ackedDuringOutboxRead: new Set(),
 
-      // Bounded per-ID session retry cutoff counter for rejected/corrupt PUT messages (<= MAX_BATCH_IDS)
-      this._failedAttempts = new Map();
+        // Coalesced incoming OFFER queue, in-flight lookup reservation, deferred unaccepted overflow, and single-worker state
+        pendingOfferIds: new Set(),
+        inFlightLookupIds: new Set(),
+        deferredOfferIds: new Set(),
+        processingOffers: false,
+        lastLookupStartedAt: 0,
+        lookupFailureCount: 0,
+        nextLookupAllowedAt: 0,
+        lookupTimer: null,
+
+        // Receiver GET windowing queue, active reservations, and bounded expired reservation history
+        pendingGetQueue: [],
+        inFlightGets: new Map(),
+        expiredGets: new Set(),
+        timedOutGets: new Map(),
+        getExpiryTimer: null,
+
+        // Track message IDs currently being committed in acceptMessage() and queue incoming PUTs up to maxConcurrency
+        acceptingIds: new Set(),
+        incomingPutQueue: [],
+        activeAcceptCount: 0,
+
+        // Track message IDs offered to the peer (bounded to MAX_BATCH_IDS)
+        offeredIds: new Set(),
+
+        // Bounded per-ID connection retry cutoff counter for rejected/corrupt PUT messages (<= MAX_BATCH_IDS)
+        failedAttempts: new Map()
+      };
+      conn.portListener = (event) => this._handlePortMessage(event, conn);
+      return conn;
+    }
+
+    /**
+     * Closes any prior connection and attaches a fresh connection object for `port`.
+     */
+    _attachConnection(port) {
+      if (this._conn) {
+        this._closeConnection(this._conn);
+        this._conn = null;
+      }
+      const conn = this._createConnection(port);
+      this._conn = conn;
+      port.onmessage = conn.portListener;
+      return conn;
+    }
+
+    /**
+     * Explicitly marks `conn` closed, cancels its timers, and detaches/closes its MessagePort
+     * so no further frames, callbacks, timers, or storage work can proceed on `conn`.
+     */
+    _closeConnection(conn) {
+      if (!conn) {
+        return;
+      }
+      conn.closed = true;
+      if (conn.getExpiryTimer) {
+        clearTimeout(conn.getExpiryTimer);
+        conn.getExpiryTimer = null;
+      }
+      if (conn.lookupTimer) {
+        clearTimeout(conn.lookupTimer);
+        conn.lookupTimer = null;
+      }
+      if (conn.port) {
+        const port = conn.port;
+        conn.port = null;
+        try {
+          port.onmessage = null;
+          port.close();
+        } catch (e) {
+          // ignore close errors
+        }
+      }
+      if (this._conn === conn) {
+        this._conn = null;
+      }
     }
 
     /**
@@ -537,28 +623,34 @@
       const wasActive = this.state !== 'disconnected';
       this._resetChannelState();
       if (wasActive) {
-        const gen = this._generation;
+        const seq = this._lifecycleSeq;
         this._setState('handshaking', this.peerWindow ? 'Switching to companion window' : 'Switching to embedded iframe');
-        if (!this._isSameGeneration(gen)) return;
+        if (!this._isSameLifecycle(seq)) return;
         if (this.role === 'host' && this._getTargetWindow()) {
-          this._initiateHostHandshake(null, gen);
+          this._initiateHostHandshake(null, seq);
         }
       }
     }
 
     /**
-     * Returns true if the session is still in the same non-stopped lifecycle generation
-     * (used across startup/handshaking callbacks before a port is connected).
+     * Returns true if the session is still in the same non-stopped pre-connection lifecycle sequence
+     * (used across startup/handshaking callbacks before a connection object is established).
      */
-    _isSameGeneration(gen) {
-      return this._generation === gen && this.state !== 'disconnected';
+    _isSameLifecycle(seq) {
+      return this._lifecycleSeq === seq && !this._stopped && this.state !== 'disconnected';
     }
 
     /**
-     * Returns true if the given generation and MessagePort are still the active connected channel.
+     * Returns true if `conn` is still the active, unclosed connected channel for this session.
      */
-    _isGenerationActive(gen, port) {
-      return this.state === 'connected' && this._generation === gen && this.port === port && port !== null;
+    _isActiveConn(conn) {
+      return Boolean(
+        conn &&
+        !conn.closed &&
+        this._conn === conn &&
+        this.state === 'connected' &&
+        conn.port !== null
+      );
     }
 
     /**
@@ -613,132 +705,97 @@
     }
 
     /**
-     * Closes the current MessagePort (if any), increments the connection generation to invalidate
-     * any in-flight async work from the prior channel, and clears per-channel state.
+     * Advances the pre-connection lifecycle sequence and explicitly closes the active connection (if any),
+     * cancelling its timers and closing its MessagePort while leaving its private containers isolated from future connections.
      */
     _resetChannelState() {
-      this._generation++;
-      if (this._getExpiryTimer) {
-        clearTimeout(this._getExpiryTimer);
-        this._getExpiryTimer = null;
+      this._lifecycleSeq++;
+      if (this._conn) {
+        this._closeConnection(this._conn);
+        this._conn = null;
       }
-      if (this._lookupTimer) {
-        clearTimeout(this._lookupTimer);
-        this._lookupTimer = null;
-      }
-      if (this.port) {
-        try {
-          this.port.onmessage = null;
-          this.port.close();
-        } catch (e) {
-          // ignore close errors
-        }
-        this.port = null;
-      }
-      this._peerOfferedOnce = false;
-      this._putQueue = [];
-      this._activePuttingIds.clear();
-      this._activeSendCount = 0;
-      this._pendingAcks.clear();
-      this._activeAckBatchSet.clear();
-      this._processingAcks = false;
-      this._reconciling = false;
-      this._reconcilePending = false;
-      this._reconcileForcePending = false;
-      this._reconcilePromise = null;
-      this._ackedDuringOutboxRead.clear();
-      this._pendingOfferIds.clear();
-      this._inFlightLookupIds.clear();
-      this._deferredOfferIds.clear();
-      this._processingOffers = false;
-      this._lastLookupStartedAt = 0;
-      this._lookupFailureCount = 0;
-      this._nextLookupAllowedAt = 0;
-      this._pendingGetQueue = [];
-      this._inFlightGets.clear();
-      this._expiredGets.clear();
-      this._timedOutGets.clear();
-      this._failedAttempts.clear();
-      this._acceptingIds.clear();
-      this._incomingPutQueue = [];
-      this._activeAcceptCount = 0;
-      this._offeredIds.clear();
     }
 
     /**
-     * Schedules a wakeup timer for the earliest expiring active GET reservation so stalled slots
+     * Schedules a wakeup timer for the earliest expiring active GET reservation on `conn` so stalled slots
      * are freed promptly for other waiting messages even when idle.
      */
-    _scheduleGetExpiryTimer(gen = this._generation, port = this.port) {
-      if (this._getExpiryTimer) {
-        clearTimeout(this._getExpiryTimer);
-        this._getExpiryTimer = null;
+    _scheduleGetExpiryTimer(conn = this._conn) {
+      if (!conn) {
+        return;
       }
-      if (!this._isGenerationActive(gen, port) || this._inFlightGets.size === 0) {
+      if (conn.getExpiryTimer) {
+        clearTimeout(conn.getExpiryTimer);
+        conn.getExpiryTimer = null;
+      }
+      if (!this._isActiveConn(conn) || conn.inFlightGets.size === 0) {
         return;
       }
 
       let earliestTs = Infinity;
-      for (const ts of this._inFlightGets.values()) {
+      for (const ts of conn.inFlightGets.values()) {
         if (ts < earliestTs) {
           earliestTs = ts;
         }
       }
       const delayMs = Math.max(5, (earliestTs + this.getTimeoutMs) - Date.now() + 2);
       const timer = setTimeout(() => {
-        this._getExpiryTimer = null;
-        if (!this._isGenerationActive(gen, port)) {
+        conn.getExpiryTimer = null;
+        if (!this._isActiveConn(conn)) {
           return;
         }
-        const freed = this._pruneExpiredGets();
+        const freed = this._pruneExpiredGets(conn);
         if (freed > 0) {
           this._notifySyncStatus();
-          this._dispatchNextGets(gen, port);
+          this._dispatchNextGets(conn);
         }
-        this._scheduleGetExpiryTimer(gen, port);
+        this._scheduleGetExpiryTimer(conn);
       }, delayMs);
       if (timer && typeof timer.unref === 'function') {
         timer.unref();
       }
-      this._getExpiryTimer = timer;
+      conn.getExpiryTimer = timer;
     }
 
     /**
-     * Demotes expired active GET reservations from _inFlightGets so they no longer occupy
+     * Demotes expired active GET reservations from conn.inFlightGets so they no longer occupy
      * an active concurrency slot:
-     *   - Moves the ID into bounded _expiredGets (<= MAX_BATCH_IDS) so a slow legitimate PUT
+     *   - Moves the ID into bounded conn.expiredGets (<= MAX_BATCH_IDS) so a slow legitimate PUT
      *     that arrives later can still be accepted if a concurrency slot is free.
-     *   - Appends the ID to the tail of _pendingGetQueue (behind other waiting messages, up to
+     *   - Appends the ID to the tail of conn.pendingGetQueue (behind other waiting messages, up to
      *     MAX_AUTO_RETRIES timeouts) so a permanently unresponsive ID never blocks progress.
      */
-    _pruneExpiredGets() {
+    _pruneExpiredGets(conn = this._conn) {
+      if (!conn || conn.closed) {
+        return 0;
+      }
       const now = Date.now();
       let freed = 0;
-      for (const [id, ts] of Array.from(this._inFlightGets.entries())) {
+      for (const [id, ts] of Array.from(conn.inFlightGets.entries())) {
         if (now - ts >= this.getTimeoutMs) {
-          this._inFlightGets.delete(id);
+          conn.inFlightGets.delete(id);
           freed++;
 
-          if (!this._expiredGets.has(id)) {
-            if (this._expiredGets.size >= MAX_BATCH_IDS) {
-              const oldest = this._expiredGets.values().next().value;
-              this._expiredGets.delete(oldest);
+          if (!conn.expiredGets.has(id)) {
+            if (conn.expiredGets.size >= MAX_BATCH_IDS) {
+              const oldest = conn.expiredGets.values().next().value;
+              conn.expiredGets.delete(oldest);
             }
-            this._expiredGets.add(id);
+            conn.expiredGets.add(id);
           }
 
-          const timeouts = (this._timedOutGets.get(id) || 0) + 1;
-          this._setBoundedMap(this._timedOutGets, id, timeouts);
+          const timeouts = (conn.timedOutGets.get(id) || 0) + 1;
+          this._setBoundedMap(conn.timedOutGets, id, timeouts);
 
-          const totalOutstanding = this._pendingGetQueue.length + this._inFlightGets.size + this._acceptingIds.size;
+          const totalOutstanding = conn.pendingGetQueue.length + conn.inFlightGets.size + conn.acceptingIds.size;
           if (
             timeouts < MAX_AUTO_RETRIES &&
-            (this._failedAttempts.get(id) || 0) < MAX_AUTO_RETRIES &&
-            !this._acceptingIds.has(id) &&
-            !this._pendingGetQueue.includes(id) &&
+            (conn.failedAttempts.get(id) || 0) < MAX_AUTO_RETRIES &&
+            !conn.acceptingIds.has(id) &&
+            !conn.pendingGetQueue.includes(id) &&
             totalOutstanding < MAX_BATCH_IDS
           ) {
-            this._pendingGetQueue.push(id);
+            conn.pendingGetQueue.push(id);
           }
         }
       }
@@ -767,19 +824,31 @@
     }
 
     /**
+     * Computes outgoing and incoming pending work counts for the active connection (or zero when unattached).
+     */
+    _computeSyncCounts() {
+      const conn = this._conn;
+      if (!conn || conn.closed) {
+        return { pendingOutgoing: 0, pendingIncoming: 0 };
+      }
+      this._pruneExpiredGets(conn);
+      const ackPending = conn.pendingAcks.size + conn.activeAckBatchSet.size;
+      const pendingOutgoing = conn.putQueue.length + conn.activeSendCount + ackPending;
+      const pendingIncoming =
+        conn.pendingOfferIds.size +
+        conn.deferredOfferIds.size +
+        (conn.processingOffers ? 1 : 0) +
+        conn.pendingGetQueue.length +
+        conn.inFlightGets.size +
+        conn.acceptingIds.size;
+      return { pendingOutgoing, pendingIncoming };
+    }
+
+    /**
      * Broadcast real-time synchronization status (transfers ongoing vs complete sync).
      */
     _notifySyncStatus(detail = '') {
-      this._pruneExpiredGets();
-      const ackPending = this._pendingAcks.size + this._activeAckBatchSet.size;
-      const pendingOutgoing = this._putQueue.length + this._activeSendCount + ackPending;
-      const pendingIncoming =
-        this._pendingOfferIds.size +
-        this._deferredOfferIds.size +
-        (this._processingOffers ? 1 : 0) +
-        this._pendingGetQueue.length +
-        this._inFlightGets.size +
-        this._acceptingIds.size;
+      const { pendingOutgoing, pendingIncoming } = this._computeSyncCounts();
       const isSyncing = pendingOutgoing > 0 || pendingIncoming > 0;
       const info = {
         isSyncing: isSyncing,
@@ -795,16 +864,7 @@
      * Get snapshot of current synchronization status.
      */
     getSyncStatus() {
-      this._pruneExpiredGets();
-      const ackPending = this._pendingAcks.size + this._activeAckBatchSet.size;
-      const pendingOutgoing = this._putQueue.length + this._activeSendCount + ackPending;
-      const pendingIncoming =
-        this._pendingOfferIds.size +
-        this._deferredOfferIds.size +
-        (this._processingOffers ? 1 : 0) +
-        this._pendingGetQueue.length +
-        this._inFlightGets.size +
-        this._acceptingIds.size;
+      const { pendingOutgoing, pendingIncoming } = this._computeSyncCounts();
       const isSyncing = pendingOutgoing > 0 || pendingIncoming > 0;
       return {
         isSyncing: isSyncing,
@@ -822,9 +882,9 @@
       if (this.state === 'connected' || this.state === 'handshaking') return;
 
       this._stopped = false;
-      const gen = this._generation;
+      const seq = this._lifecycleSeq;
       this._setState('handshaking', `Starting as ${this.role}`);
-      if (!this._isSameGeneration(gen)) {
+      if (!this._isSameLifecycle(seq)) {
         return;
       }
 
@@ -865,13 +925,13 @@
       } else {
         // Host role: if target window (iframe or popup) is already available, we can initiate
         if (this._getTargetWindow()) {
-          this._initiateHostHandshake(null, gen);
+          this._initiateHostHandshake(null, seq);
         }
       }
     }
 
     /**
-     * Stop and cleanup session, invalidating any in-flight async operations.
+     * Stop and cleanup session, explicitly closing the active connection and invalidating in-flight operations.
      */
     stop() {
       this._stopped = true;
@@ -888,7 +948,6 @@
         this._windowListenerRegistered = false;
       }
       this._resetChannelState();
-      this._failedAttempts.clear();
       this._setState('disconnected');
     }
 
@@ -912,8 +971,8 @@
     /**
      * Host initializes MessageChannel and posts port2 to peer window (iframe or popup).
      */
-    _initiateHostHandshake(targetOrigin = null, expectedGen = null) {
-      if (expectedGen !== null && !this._isSameGeneration(expectedGen)) {
+    _initiateHostHandshake(targetOrigin = null, expectedSeq = null) {
+      if (expectedSeq !== null && !this._isSameLifecycle(expectedSeq)) {
         return;
       }
       const targetWin = this._getTargetWindow();
@@ -930,11 +989,8 @@
 
       try {
         this._resetChannelState();
-        const gen = this._generation;
         const channel = new MessageChannel();
-        const port = channel.port1;
-        this.port = port;
-        port.onmessage = (event) => this._handlePortMessage(event, gen, port);
+        this._attachConnection(channel.port1);
 
         targetWin.postMessage(
           { protocol: PROTOCOL_NAME, version: PROTOCOL_VERSION, type: 'INIT' },
@@ -977,16 +1033,16 @@
 
       if (this.role === 'host') {
         if (data.type === 'READY') {
-          const preGen = this._generation;
+          const preSeq = this._lifecycleSeq;
           this.log('info', 'Received READY from peer');
-          if (this._generation !== preGen || this._stopped) return;
+          if (this._lifecycleSeq !== preSeq || this._stopped) return;
 
           this._resetChannelState();
-          const gen = this._generation;
+          const seq = this._lifecycleSeq;
           this._setState('handshaking', 'Peer sent READY; re-establishing channel');
-          if (!this._isSameGeneration(gen)) return;
+          if (!this._isSameLifecycle(seq)) return;
 
-          this._initiateHostHandshake(event.origin, gen);
+          this._initiateHostHandshake(event.origin, seq);
         }
       } else if (this.role === 'embedded') {
         if (data.type === 'INIT' && event.ports && event.ports.length > 0) {
@@ -995,14 +1051,11 @@
             this._readyInterval = null;
           }
           this._resetChannelState();
-          const gen = this._generation;
-          const port = event.ports[0];
-          this.port = port;
-          port.onmessage = (ev) => this._handlePortMessage(ev, gen, port);
+          const conn = this._attachConnection(event.ports[0]);
           this.log('info', 'Received MessagePort from host application');
-          if (this._generation !== gen || this._stopped || this.port !== port) return;
+          if (conn.closed || this._conn !== conn || this._stopped) return;
 
-          this._onEstablished(gen, port, true);
+          this._onEstablished(conn, true);
         }
       }
     }
@@ -1010,9 +1063,12 @@
     /**
      * Called once the point-to-point MessagePort is established.
      */
-    _onEstablished(gen = this._generation, port = this.port, sendInitAck = false) {
+    _onEstablished(conn = this._conn, sendInitAck = false) {
+      if (!conn || conn.closed || this._conn !== conn || !conn.port || this._stopped) {
+        return;
+      }
       this._setState('connected', `Connected to ${this.peerOrigin}`);
-      if (!this._isGenerationActive(gen, port)) {
+      if (!this._isActiveConn(conn)) {
         return;
       }
       if (sendInitAck) {
@@ -1020,20 +1076,20 @@
           protocol: PROTOCOL_NAME,
           version: PROTOCOL_VERSION,
           type: 'INIT_ACK'
-        }, gen, port);
+        }, conn);
       }
-      if (!this._isGenerationActive(gen, port)) {
+      if (!this._isActiveConn(conn)) {
         return;
       }
       // Rule 7: Reconnection - both sides exchange outstanding offers
-      this.reconcile(true, gen, port);
+      this.reconcile(true, conn);
     }
 
     /**
-     * Dedicated MessagePort event handler for all protocol messages.
+     * Dedicated MessagePort event handler for all protocol messages on `conn`.
      */
-    async _handlePortMessage(event, gen = this._generation, port = this.port) {
-      if (gen !== this._generation || port !== this.port || !port) {
+    async _handlePortMessage(event, conn = this._conn) {
+      if (!conn || conn.closed || this._conn !== conn || !conn.port || this._stopped) {
         return;
       }
 
@@ -1047,26 +1103,26 @@
         switch (data.type) {
           case 'INIT_ACK':
             if (this.role === 'host' && this.state !== 'connected') {
-              this._onEstablished(gen, port, false);
+              this._onEstablished(conn, false);
             }
             break;
 
           case 'OFFER':
-            if (this._isGenerationActive(gen, port)) {
-              await this._handleOffer(data, gen, port);
+            if (this._isActiveConn(conn)) {
+              await this._handleOffer(data, conn);
             }
             break;
 
           case 'GET':
-            if (this._isGenerationActive(gen, port)) {
-              await this._handleGet(data, gen, port);
+            if (this._isActiveConn(conn)) {
+              await this._handleGet(data, conn);
             }
             break;
 
           case 'PUT':
-            if (this._isGenerationActive(gen, port)) {
-              this._handlePut(data, gen, port).catch((err) => {
-                if (this._isGenerationActive(gen, port)) {
+            if (this._isActiveConn(conn)) {
+              this._handlePut(data, conn).catch((err) => {
+                if (this._isActiveConn(conn)) {
                   this.log('error', 'Error handling PUT message', err.message);
                   this._emitError(err);
                 }
@@ -1075,8 +1131,8 @@
             break;
 
           case 'ACK':
-            if (this._isGenerationActive(gen, port)) {
-              await this._handleAck(data, gen, port);
+            if (this._isActiveConn(conn)) {
+              await this._handleAck(data, conn);
             }
             break;
 
@@ -1084,7 +1140,7 @@
             this.log('warn', `Unknown message type received: ${data.type}`);
         }
       } catch (err) {
-        if (this._isGenerationActive(gen, port)) {
+        if (this._isActiveConn(conn)) {
           this.log('error', `Error handling ${data.type} message`, err.message);
           this._emitError(err);
         }
@@ -1092,23 +1148,23 @@
     }
 
     /**
-     * Sends a raw message object over the established MessagePort if the generation is still active.
+     * Sends a raw message object over `conn`'s MessagePort if `conn` is still the active connection.
      */
-    _sendToPort(msg, gen = this._generation, port = this.port, transferList = []) {
-      if (!this._isGenerationActive(gen, port)) {
+    _sendToPort(msg, conn = this._conn, transferList = []) {
+      if (!this._isActiveConn(conn)) {
         return false;
       }
-      port.postMessage(msg, transferList);
+      conn.port.postMessage(msg, transferList);
       return true;
     }
 
     /**
-     * Trigger reconciliation: serializes getOutboxIds() reads so older snapshots never overwrite newer ones,
-     * retires stale _offeredIds against the complete outbox, and announces only tracked IDs via OFFER.
+     * Trigger reconciliation: serializes getOutboxIds() reads on `conn` so older snapshots never overwrite newer ones,
+     * retires stale conn.offeredIds against the complete outbox, and announces only tracked IDs via OFFER.
      * @param {boolean} [force=true] If false, skips sending OFFER when outbox is empty
      */
-    reconcile(force = true, gen = this._generation, port = this.port) {
-      if (!this._isGenerationActive(gen, port)) {
+    reconcile(force = true, conn = this._conn) {
+      if (!this._isActiveConn(conn)) {
         if (force) {
           this.log('warn', 'Reconciliation requested while disconnected; ignoring');
         }
@@ -1116,88 +1172,88 @@
       }
 
       if (force) {
-        this._failedAttempts.clear();
-        this._timedOutGets.clear();
-        this._lookupFailureCount = 0;
-        this._nextLookupAllowedAt = 0;
-        this._lastLookupStartedAt = 0;
+        conn.failedAttempts.clear();
+        conn.timedOutGets.clear();
+        conn.lookupFailureCount = 0;
+        conn.nextLookupAllowedAt = 0;
+        conn.lastLookupStartedAt = 0;
       }
 
-      if (this._reconciling && this._reconcilePromise) {
-        this._reconcilePending = true;
+      if (conn.reconciling && conn.reconcilePromise) {
+        conn.reconcilePending = true;
         if (force) {
-          this._reconcileForcePending = true;
+          conn.reconcileForcePending = true;
         }
-        return this._reconcilePromise;
+        return conn.reconcilePromise;
       }
 
-      this._reconciling = true;
-      this._reconcilePromise = this._runReconcileLoop(force, gen, port);
-      return this._reconcilePromise;
+      conn.reconciling = true;
+      conn.reconcilePromise = this._runReconcileLoop(force, conn);
+      return conn.reconcilePromise;
     }
 
-    async _runReconcileLoop(initialForce, gen, port) {
+    async _runReconcileLoop(initialForce, conn) {
       let nextForce = initialForce;
       try {
-        while (this._isGenerationActive(gen, port)) {
-          this._reconcilePending = false;
-          this._reconcileForcePending = false;
-          this._ackedDuringOutboxRead.clear();
+        while (this._isActiveConn(conn)) {
+          conn.reconcilePending = false;
+          conn.reconcileForcePending = false;
+          conn.ackedDuringOutboxRead.clear();
           if (nextForce) {
-            this._failedAttempts.clear();
-            this._timedOutGets.clear();
-            this._lookupFailureCount = 0;
-            this._nextLookupAllowedAt = 0;
-            this._lastLookupStartedAt = 0;
-            if (this._lookupTimer) {
-              clearTimeout(this._lookupTimer);
-              this._lookupTimer = null;
+            conn.failedAttempts.clear();
+            conn.timedOutGets.clear();
+            conn.lookupFailureCount = 0;
+            conn.nextLookupAllowedAt = 0;
+            conn.lastLookupStartedAt = 0;
+            if (conn.lookupTimer) {
+              clearTimeout(conn.lookupTimer);
+              conn.lookupTimer = null;
             }
-            if (this._pendingOfferIds.size > 0) {
-              this._drainPendingOffers(gen, port);
-            } else if (this._pendingGetQueue.length > 0 || this._deferredOfferIds.size > 0) {
-              this._dispatchNextGets(gen, port);
+            if (conn.pendingOfferIds.size > 0) {
+              this._drainPendingOffers(conn);
+            } else if (conn.pendingGetQueue.length > 0 || conn.deferredOfferIds.size > 0) {
+              this._dispatchNextGets(conn);
             }
           }
 
           const outboxIds = await this.storage.getOutboxIds();
-          if (!this._isGenerationActive(gen, port)) return;
+          if (!this._isActiveConn(conn)) return;
 
           // 1. Always process the completed serialized outbox snapshot before servicing a coalesced
-          //    _reconcilePending request so periodic heartbeats faster than getOutboxIds() never starve OFFERs.
+          //    conn.reconcilePending request so periodic heartbeats faster than getOutboxIds() never starve OFFERs.
           //    Exclude any IDs whose ACK completed while getOutboxIds() was in flight.
           const rawList = Array.isArray(outboxIds) ? outboxIds : [];
           const fullOutboxSet = new Set();
           for (let i = 0; i < rawList.length; i++) {
             const id = rawList[i];
-            if (isValidMessageId(id) && !this._ackedDuringOutboxRead.has(id)) {
+            if (isValidMessageId(id) && !conn.ackedDuringOutboxRead.has(id)) {
               fullOutboxSet.add(id);
             }
           }
-          this._ackedDuringOutboxRead.clear();
+          conn.ackedDuringOutboxRead.clear();
 
-          // 2. Retire stale _offeredIds that are no longer present in the complete outbox
+          // 2. Retire stale conn.offeredIds that are no longer present in the complete outbox
           //    and have no active outgoing PUT or pending ACK work.
-          const activeProtected = new Set(this._putQueue);
-          for (const id of this._activePuttingIds) activeProtected.add(id);
-          for (const id of this._pendingAcks.keys()) activeProtected.add(id);
-          for (const id of this._activeAckBatchSet) activeProtected.add(id);
+          const activeProtected = new Set(conn.putQueue);
+          for (const id of conn.activePuttingIds) activeProtected.add(id);
+          for (const id of conn.pendingAcks.keys()) activeProtected.add(id);
+          for (const id of conn.activeAckBatchSet) activeProtected.add(id);
 
-          for (const trackedId of Array.from(this._offeredIds)) {
+          for (const trackedId of Array.from(conn.offeredIds)) {
             if (!fullOutboxSet.has(trackedId) && !activeProtected.has(trackedId)) {
-              this._offeredIds.delete(trackedId);
+              conn.offeredIds.delete(trackedId);
             }
           }
 
           // 3. Also drain any pending receiver GET window if slots are open
-          this._dispatchNextGets(gen, port);
-          if (!this._isGenerationActive(gen, port)) return;
+          this._dispatchNextGets(conn);
+          if (!this._isActiveConn(conn)) return;
 
-          // 4. Select up to MAX_BATCH_IDS to advertise, advertising strictly IDs that are tracked in _offeredIds.
+          // 4. Select up to MAX_BATCH_IDS to advertise, advertising strictly IDs that are tracked in conn.offeredIds.
           const candidateIds = Array.from(fullOutboxSet).slice(0, MAX_BATCH_IDS);
           if (!nextForce && candidateIds.length === 0) {
-            if (this._reconcilePending) {
-              nextForce = this._reconcileForcePending;
+            if (conn.reconcilePending) {
+              nextForce = conn.reconcileForcePending;
               continue;
             }
             return;
@@ -1207,27 +1263,27 @@
           const advertisedIds = [];
           for (let i = 0; i < candidateIds.length; i++) {
             const id = candidateIds[i];
-            if (this._offeredIds.has(id)) {
+            if (conn.offeredIds.has(id)) {
               advertisedIds.push(id);
               continue;
             }
-            if (this._offeredIds.size >= MAX_BATCH_IDS) {
+            if (conn.offeredIds.size >= MAX_BATCH_IDS) {
               // Evict an idle offered ID from an earlier window of a >1,000-entry outbox
-              for (const oldId of this._offeredIds) {
+              for (const oldId of conn.offeredIds) {
                 if (!candidateSet.has(oldId) && !activeProtected.has(oldId)) {
-                  this._offeredIds.delete(oldId);
+                  conn.offeredIds.delete(oldId);
                   break;
                 }
               }
             }
-            if (this._offeredIds.size < MAX_BATCH_IDS) {
-              this._offeredIds.add(id);
+            if (conn.offeredIds.size < MAX_BATCH_IDS) {
+              conn.offeredIds.add(id);
               advertisedIds.push(id);
             }
           }
 
           this.log('info', `Reconciling: offering ${advertisedIds.length} outbox message(s)`, advertisedIds);
-          if (!this._isGenerationActive(gen, port)) return;
+          if (!this._isActiveConn(conn)) return;
 
           const offerMsg = {
             protocol: PROTOCOL_NAME,
@@ -1236,117 +1292,113 @@
             ids: advertisedIds
           };
 
-          if (this._sendToPort(offerMsg, gen, port)) {
+          if (this._sendToPort(offerMsg, conn)) {
             this._emitTransfer({ direction: 'outgoing', type: 'OFFER', ids: offerMsg.ids });
-            if (!this._isGenerationActive(gen, port)) return;
+            if (!this._isActiveConn(conn)) return;
           }
 
-          if (this._reconcilePending) {
-            nextForce = this._reconcileForcePending;
+          if (conn.reconcilePending) {
+            nextForce = conn.reconcileForcePending;
             continue;
           }
           break;
         }
       } catch (err) {
-        if (this._isGenerationActive(gen, port)) {
+        if (this._isActiveConn(conn)) {
           this.log('error', 'Failed to retrieve outbox for OFFER', err.message);
           this._emitError(err);
         }
       } finally {
-        if (this._isGenerationActive(gen, port)) {
-          this._reconciling = false;
-          this._reconcilePromise = null;
-        }
+        conn.reconciling = false;
+        conn.reconcilePromise = null;
       }
     }
 
     /**
-     * Returns true while an acceptance-lookup outage backoff window is currently active.
+     * Returns true while an acceptance-lookup outage backoff window is currently active on `conn`.
      */
-    _isLookupBackoffActive() {
-      return this._lookupFailureCount > 0 && Date.now() < this._nextLookupAllowedAt;
+    _isLookupBackoffActive(conn = this._conn) {
+      return Boolean(conn && !conn.closed && conn.lookupFailureCount > 0 && Date.now() < conn.nextLookupAllowedAt);
     }
 
     /**
-     * Re-queues an unresolved incoming message ID back into bounded _pendingOfferIds for acceptance lookup retry.
-     * Never places an unresolved ID into _pendingGetQueue or _deferredOfferIds, which strictly hold IDs
+     * Re-queues an unresolved incoming message ID back into bounded conn.pendingOfferIds for acceptance lookup retry.
+     * Never places an unresolved ID into conn.pendingGetQueue or conn.deferredOfferIds, which strictly hold IDs
      * already confirmed unaccepted (`accepted: false`) by a completed lookup.
      */
-    _requeueUnresolvedId(id) {
-      if (this._shouldSkipOfferLookup(id)) {
+    _requeueUnresolvedId(id, conn = this._conn) {
+      if (!this._isActiveConn(conn) || this._shouldSkipOfferLookup(id, conn)) {
         return;
       }
-      if (this._pendingOfferIds.size < MAX_BATCH_IDS) {
-        this._pendingOfferIds.add(id);
+      if (conn.pendingOfferIds.size < MAX_BATCH_IDS) {
+        conn.pendingOfferIds.add(id);
       }
     }
 
     /**
-     * Schedules a generation-scoped timer to resume offer lookups and/or held GET transfers
+     * Schedules a connection-scoped timer on `conn` to resume offer lookups and/or held GET transfers
      * once lookup pacing or outage backoff elapses.
      */
-    _schedulePendingOfferDrain(delayMs, gen = this._generation, port = this.port) {
+    _schedulePendingOfferDrain(delayMs, conn = this._conn) {
       if (
-        !this._isGenerationActive(gen, port) ||
-        (this._pendingOfferIds.size === 0 && this._pendingGetQueue.length === 0 && this._deferredOfferIds.size === 0)
+        !this._isActiveConn(conn) ||
+        (conn.pendingOfferIds.size === 0 && conn.pendingGetQueue.length === 0 && conn.deferredOfferIds.size === 0)
       ) {
         return;
       }
-      if (this._lookupTimer) {
-        clearTimeout(this._lookupTimer);
-        this._lookupTimer = null;
+      if (conn.lookupTimer) {
+        clearTimeout(conn.lookupTimer);
+        conn.lookupTimer = null;
       }
       const waitMs = Math.max(1, Math.ceil(delayMs));
       const timer = setTimeout(() => {
-        this._lookupTimer = null;
-        if (!this._isGenerationActive(gen, port)) {
+        conn.lookupTimer = null;
+        if (!this._isActiveConn(conn)) {
           return;
         }
-        if (this._pendingOfferIds.size > 0) {
-          this._drainPendingOffers(gen, port);
-        } else if (!this._isLookupBackoffActive()) {
-          this._dispatchNextGets(gen, port);
+        if (conn.pendingOfferIds.size > 0) {
+          this._drainPendingOffers(conn);
+        } else if (!this._isLookupBackoffActive(conn)) {
+          this._dispatchNextGets(conn);
         } else {
-          this._schedulePendingOfferDrain(this._nextLookupAllowedAt - Date.now(), gen, port);
+          this._schedulePendingOfferDrain(conn.nextLookupAllowedAt - Date.now(), conn);
         }
       }, waitMs);
       if (timer && typeof timer.unref === 'function') {
         timer.unref();
       }
-      this._lookupTimer = timer;
+      conn.lookupTimer = timer;
     }
 
     /**
-     * Fail-closed OFFER batch acceptance lookup helper:
-     * - Records lookup start timestamp (`_lastLookupStartedAt`) for lookup rate pacing.
+     * Fail-closed OFFER batch acceptance lookup helper on `conn`:
+     * - Records lookup start timestamp (`conn.lastLookupStartedAt`) for lookup rate pacing.
      * - Invokes `storage.getAcceptance(ids)` with a defensive copy and validates the complete
      *   batch via `validateBatchAcceptance` (failing closed if any requested ID is missing or malformed).
      * - Resets lookup outage backoff counters on success, or delegates to `_recordLookupFailure` on error.
      */
-    async _queryValidatedAcceptance(queryIds, gen = this._generation, port = this.port) {
-      if (!this._isGenerationActive(gen, port) || !Array.isArray(queryIds) || queryIds.length === 0) {
+    async _queryValidatedAcceptance(queryIds, conn = this._conn) {
+      if (!this._isActiveConn(conn) || !Array.isArray(queryIds) || queryIds.length === 0) {
         return null;
       }
       const reservedIds = [];
       for (const id of queryIds) {
-        if (!this._acceptingIds.has(id) && !this._inFlightLookupIds.has(id)) {
-          this._inFlightLookupIds.add(id);
+        if (!conn.acceptingIds.has(id) && !conn.inFlightLookupIds.has(id)) {
+          conn.inFlightLookupIds.add(id);
           reservedIds.push(id);
         }
       }
       const releaseReserved = () => {
-        if (!this._isGenerationActive(gen, port)) {
-          return;
-        }
         for (const id of reservedIds) {
-          this._inFlightLookupIds.delete(id);
+          conn.inFlightLookupIds.delete(id);
         }
       };
 
-      this._lastLookupStartedAt = Date.now();
+      conn.lastLookupStartedAt = Date.now();
       try {
         const batchRes = await this.storage.getAcceptance(queryIds.slice());
-        if (!this._isGenerationActive(gen, port)) {
+        if (!this._isActiveConn(conn)) {
+          releaseReserved();
           return null;
         }
         const validated = validateBatchAcceptance(batchRes, queryIds);
@@ -1354,79 +1406,82 @@
           throw new Error(`Invalid or incomplete getAcceptance batch response (${queryIds.length} ID(s) requested)`);
         }
         releaseReserved();
-        this._lookupFailureCount = 0;
-        this._nextLookupAllowedAt = 0;
+        conn.lookupFailureCount = 0;
+        conn.nextLookupAllowedAt = 0;
         return validated;
       } catch (err) {
-        if (this._isGenerationActive(gen, port)) {
-          releaseReserved();
-          this._recordLookupFailure(queryIds, err, gen, port);
+        releaseReserved();
+        if (this._isActiveConn(conn)) {
+          this._recordLookupFailure(queryIds, err, conn);
         }
         return null;
       }
     }
 
     /**
-     * Records a transient or malformed getAcceptance() failure without burning per-message acceptance retries:
+     * Records a transient or malformed getAcceptance() failure on `conn` without burning per-message acceptance retries:
      * re-queues unresolved IDs and schedules an automatic retry with capped exponential backoff.
      */
-    _recordLookupFailure(failedIds, err, gen = this._generation, port = this.port) {
-      if (!this._isGenerationActive(gen, port)) return;
+    _recordLookupFailure(failedIds, err, conn = this._conn) {
+      if (!this._isActiveConn(conn)) return;
       for (const id of failedIds) {
-        this._requeueUnresolvedId(id);
+        this._requeueUnresolvedId(id, conn);
       }
-      this._lookupFailureCount++;
-      const shift = Math.min(this._lookupFailureCount - 1, 16);
+      conn.lookupFailureCount++;
+      const shift = Math.min(conn.lookupFailureCount - 1, 16);
       const backoffMs = Math.min(this.lookupRetryMaxMs, this.lookupRetryBaseMs * Math.pow(2, shift));
-      this._nextLookupAllowedAt = Date.now() + backoffMs;
+      conn.nextLookupAllowedAt = Date.now() + backoffMs;
 
       this.log(
         'error',
-        `Acceptance lookup failed (attempt ${this._lookupFailureCount}, retrying in ${backoffMs}ms): ${err.message}`
+        `Acceptance lookup failed (attempt ${conn.lookupFailureCount}, retrying in ${backoffMs}ms): ${err.message}`
       );
       this._emitError(err);
-      if (!this._isGenerationActive(gen, port)) return;
-      this._schedulePendingOfferDrain(backoffMs, gen, port);
+      if (!this._isActiveConn(conn)) return;
+      this._schedulePendingOfferDrain(backoffMs, conn);
     }
 
     /**
-     * Promotes previously verified unaccepted IDs from bounded _deferredOfferIds into _pendingGetQueue
+     * Promotes previously verified unaccepted IDs from bounded conn.deferredOfferIds into conn.pendingGetQueue
      * whenever incoming transfer capacity (< MAX_BATCH_IDS) opens up.
      */
-    _promoteDeferredOffers(gen = this._generation, port = this.port) {
-      if (!this._isGenerationActive(gen, port) || this._deferredOfferIds.size === 0) {
+    _promoteDeferredOffers(conn = this._conn) {
+      if (!this._isActiveConn(conn) || conn.deferredOfferIds.size === 0) {
         return;
       }
-      for (const id of Array.from(this._deferredOfferIds)) {
+      for (const id of Array.from(conn.deferredOfferIds)) {
         const totalOutstanding =
-          this._pendingGetQueue.length +
-          this._inFlightGets.size +
-          this._acceptingIds.size;
+          conn.pendingGetQueue.length +
+          conn.inFlightGets.size +
+          conn.acceptingIds.size;
         if (totalOutstanding >= MAX_BATCH_IDS) {
           break;
         }
-        this._deferredOfferIds.delete(id);
-        if (!this._shouldSkipOfferLookup(id)) {
-          this._pendingGetQueue.push(id);
+        conn.deferredOfferIds.delete(id);
+        if (!this._shouldSkipOfferLookup(id, conn)) {
+          conn.pendingGetQueue.push(id);
         }
       }
     }
 
     /**
-     * Returns true if `id` is already queued for GET, currently requested, currently being accepted,
-     * or has reached the per-message session retry cutoff (`_failedAttempts` / `_timedOutGets`).
+     * Returns true if `id` on `conn` is already queued for GET, currently requested, currently being accepted,
+     * or has reached the per-message connection retry cutoff (`conn.failedAttempts` / `conn.timedOutGets`).
      */
-    _shouldSkipOfferLookup(id) {
+    _shouldSkipOfferLookup(id, conn = this._conn) {
+      if (!conn || conn.closed) {
+        return true;
+      }
       if (
-        this._inFlightLookupIds.has(id) ||
-        this._inFlightGets.has(id) ||
-        this._acceptingIds.has(id) ||
-        this._pendingGetQueue.includes(id)
+        conn.inFlightLookupIds.has(id) ||
+        conn.inFlightGets.has(id) ||
+        conn.acceptingIds.has(id) ||
+        conn.pendingGetQueue.includes(id)
       ) {
         return true;
       }
-      const failCount = this._failedAttempts.get(id) || 0;
-      const timeoutCount = this._timedOutGets.get(id) || 0;
+      const failCount = conn.failedAttempts.get(id) || 0;
+      const timeoutCount = conn.timedOutGets.get(id) || 0;
       if (failCount >= MAX_AUTO_RETRIES || timeoutCount >= MAX_AUTO_RETRIES) {
         this.log(
           'warn',
@@ -1438,31 +1493,31 @@
     }
 
     /**
-     * Handles incoming OFFER:
-     * - Coalesces eligible offered IDs into a bounded set (_pendingOfferIds) so repeated OFFER frames
+     * Handles incoming OFFER on `conn`:
+     * - Coalesces eligible offered IDs into a bounded set (conn.pendingOfferIds) so repeated OFFER frames
      *   never spawn unbounded parallel getAcceptance() calls.
      * - Skips IDs already queued for GET, currently requested, or currently being accepted before lookup.
      */
-    async _handleOffer(offer, gen = this._generation, port = this.port) {
-      if (!this._isGenerationActive(gen, port) || !offer || !Array.isArray(offer.ids)) {
+    async _handleOffer(offer, conn = this._conn) {
+      if (!this._isActiveConn(conn) || !offer || !Array.isArray(offer.ids)) {
         return;
       }
-      this._pruneExpiredGets();
+      this._pruneExpiredGets(conn);
 
       const offeredIds = offer.ids
         .filter(isValidMessageId)
         .slice(0, MAX_BATCH_IDS);
       this.log('info', `Received OFFER with ${offeredIds.length} message(s)`, offeredIds);
       this._emitTransfer({ direction: 'incoming', type: 'OFFER', ids: offeredIds });
-      if (!this._isGenerationActive(gen, port)) {
+      if (!this._isActiveConn(conn)) {
         return;
       }
 
       // Symmetrical reconciliation: ensure our own outbox is offered in return
-      if (!this._peerOfferedOnce) {
-        this._peerOfferedOnce = true;
-        this.reconcile(false, gen, port);
-        if (!this._isGenerationActive(gen, port)) {
+      if (!conn.peerOfferedOnce) {
+        conn.peerOfferedOnce = true;
+        this.reconcile(false, conn);
+        if (!this._isActiveConn(conn)) {
           return;
         }
       }
@@ -1471,74 +1526,74 @@
 
       for (const id of offeredIds) {
         if (
-          this._pendingOfferIds.size +
-          this._inFlightLookupIds.size +
-          this._acceptingIds.size >= MAX_BATCH_IDS
+          conn.pendingOfferIds.size +
+          conn.inFlightLookupIds.size +
+          conn.acceptingIds.size >= MAX_BATCH_IDS
         ) {
           break;
         }
-        if (this._shouldSkipOfferLookup(id)) {
+        if (this._shouldSkipOfferLookup(id, conn)) {
           continue;
         }
-        this._pendingOfferIds.add(id);
+        conn.pendingOfferIds.add(id);
       }
 
       // Dispatch any already-ready GET work before starting a new acceptance lookup batch
-      this._dispatchNextGets(gen, port);
-      if (!this._isGenerationActive(gen, port)) {
+      this._dispatchNextGets(conn);
+      if (!this._isActiveConn(conn)) {
         return;
       }
 
-      await this._drainPendingOffers(gen, port);
+      await this._drainPendingOffers(conn);
     }
 
     /**
-     * Single-worker loop per generation that drains coalesced _pendingOfferIds independently of GET capacity:
+     * Single-worker loop per connection that drains coalesced conn.pendingOfferIds independently of GET capacity:
      * - Enforces lookup rate pacing (`lookupMinIntervalMs`) and capped exponential backoff on lookup outages.
      * - Immediately emits batched repeated ACKs for already-accepted IDs (Rule 5) even if the GET queue is full.
-     * - Enqueues unaccepted IDs into _pendingGetQueue when capacity permits, or retains overflow in bounded _deferredOfferIds.
+     * - Enqueues unaccepted IDs into conn.pendingGetQueue when capacity permits, or retains overflow in bounded conn.deferredOfferIds.
      */
-    async _drainPendingOffers(gen = this._generation, port = this.port) {
-      if (!this._isGenerationActive(gen, port) || this._processingOffers || this._pendingOfferIds.size === 0) {
+    async _drainPendingOffers(conn = this._conn) {
+      if (!this._isActiveConn(conn) || conn.processingOffers || conn.pendingOfferIds.size === 0) {
         return;
       }
 
       const now = Date.now();
-      const earliestByPacing = this._lastLookupStartedAt > 0
-        ? (this._lastLookupStartedAt + this.lookupMinIntervalMs)
+      const earliestByPacing = conn.lastLookupStartedAt > 0
+        ? (conn.lastLookupStartedAt + this.lookupMinIntervalMs)
         : 0;
-      const allowedAt = Math.max(this._nextLookupAllowedAt, earliestByPacing);
+      const allowedAt = Math.max(conn.nextLookupAllowedAt, earliestByPacing);
       if (now < allowedAt) {
-        this._schedulePendingOfferDrain(allowedAt - now, gen, port);
+        this._schedulePendingOfferDrain(allowedAt - now, conn);
         return;
       }
 
-      if (this._lookupTimer) {
-        clearTimeout(this._lookupTimer);
-        this._lookupTimer = null;
+      if (conn.lookupTimer) {
+        clearTimeout(conn.lookupTimer);
+        conn.lookupTimer = null;
       }
 
-      this._processingOffers = true;
+      conn.processingOffers = true;
       try {
-        while (this._isGenerationActive(gen, port) && this._pendingOfferIds.size > 0) {
+        while (this._isActiveConn(conn) && conn.pendingOfferIds.size > 0) {
           const loopNow = Date.now();
-          const loopEarliest = this._lastLookupStartedAt > 0
-            ? (this._lastLookupStartedAt + this.lookupMinIntervalMs)
+          const loopEarliest = conn.lastLookupStartedAt > 0
+            ? (conn.lastLookupStartedAt + this.lookupMinIntervalMs)
             : 0;
-          const loopAllowedAt = Math.max(this._nextLookupAllowedAt, loopEarliest);
+          const loopAllowedAt = Math.max(conn.nextLookupAllowedAt, loopEarliest);
           if (loopNow < loopAllowedAt) {
-            this._schedulePendingOfferDrain(loopAllowedAt - loopNow, gen, port);
+            this._schedulePendingOfferDrain(loopAllowedAt - loopNow, conn);
             break;
           }
 
-          this._pruneExpiredGets();
+          this._pruneExpiredGets(conn);
           // Ensure any already-queued GETs are not held behind a batch lookup
-          this._dispatchNextGets(gen, port);
-          if (!this._isGenerationActive(gen, port)) return;
+          this._dispatchNextGets(conn);
+          if (!this._isActiveConn(conn)) return;
 
-          const rawBatch = Array.from(this._pendingOfferIds).slice(0, MAX_BATCH_IDS);
+          const rawBatch = Array.from(conn.pendingOfferIds).slice(0, MAX_BATCH_IDS);
           for (const id of rawBatch) {
-            this._pendingOfferIds.delete(id);
+            conn.pendingOfferIds.delete(id);
           }
 
           const queryIds = [];
@@ -1548,19 +1603,19 @@
               continue;
             }
             seen.add(id);
-            if (this._shouldSkipOfferLookup(id)) {
+            if (this._shouldSkipOfferLookup(id, conn)) {
               continue;
             }
             queryIds.push(id);
           }
 
           if (queryIds.length === 0) {
-            this._dispatchNextGets(gen, port);
+            this._dispatchNextGets(conn);
             continue;
           }
 
-          const validatedBatch = await this._queryValidatedAcceptance(queryIds, gen, port);
-          if (!this._isGenerationActive(gen, port)) {
+          const validatedBatch = await this._queryValidatedAcceptance(queryIds, conn);
+          if (!this._isActiveConn(conn)) {
             return;
           }
           if (!validatedBatch) {
@@ -1571,50 +1626,50 @@
           const repeatedReceipts = Object.create(null);
 
           for (const id of queryIds) {
-            if (!this._isGenerationActive(gen, port)) return;
+            if (!this._isActiveConn(conn)) return;
             if (
-              this._inFlightGets.has(id) ||
-              this._acceptingIds.has(id) ||
-              this._pendingGetQueue.includes(id)
+              conn.inFlightGets.has(id) ||
+              conn.acceptingIds.has(id) ||
+              conn.pendingGetQueue.includes(id)
             ) {
               continue;
             }
 
             const entry = validatedBatch[id];
             if (entry.accepted) {
-              this._failedAttempts.delete(id);
-              this._timedOutGets.delete(id);
-              this._expiredGets.delete(id);
-              this._deferredOfferIds.delete(id);
+              conn.failedAttempts.delete(id);
+              conn.timedOutGets.delete(id);
+              conn.expiredGets.delete(id);
+              conn.deferredOfferIds.delete(id);
               alreadyAccepted.push(id);
               if (entry.ackReceipt) {
                 repeatedReceipts[id] = entry.ackReceipt;
               }
             } else {
-              const failCount = this._failedAttempts.get(id) || 0;
-              const timeoutCount = this._timedOutGets.get(id) || 0;
+              const failCount = conn.failedAttempts.get(id) || 0;
+              const timeoutCount = conn.timedOutGets.get(id) || 0;
               if (failCount >= MAX_AUTO_RETRIES || timeoutCount >= MAX_AUTO_RETRIES) {
                 continue;
               }
               const totalOutstanding =
-                this._pendingGetQueue.length +
-                this._inFlightGets.size +
-                this._acceptingIds.size;
+                conn.pendingGetQueue.length +
+                conn.inFlightGets.size +
+                conn.acceptingIds.size;
               if (totalOutstanding < MAX_BATCH_IDS) {
-                this._deferredOfferIds.delete(id);
-                this._pendingGetQueue.push(id);
-              } else if (!this._deferredOfferIds.has(id) && this._deferredOfferIds.size < MAX_BATCH_IDS) {
-                this._deferredOfferIds.add(id);
+                conn.deferredOfferIds.delete(id);
+                conn.pendingGetQueue.push(id);
+              } else if (!conn.deferredOfferIds.has(id) && conn.deferredOfferIds.size < MAX_BATCH_IDS) {
+                conn.deferredOfferIds.add(id);
               }
             }
           }
 
-          if (!this._isGenerationActive(gen, port)) return;
+          if (!this._isActiveConn(conn)) return;
 
           // Rule 5: Repeated acknowledgements (never gated on GET transfer capacity)
           if (alreadyAccepted.length > 0) {
             this.log('info', `Rule 5: Sending repeated ACK for already accepted ID(s)`, alreadyAccepted);
-            if (!this._isGenerationActive(gen, port)) return;
+            if (!this._isActiveConn(conn)) return;
 
             const ackMsg = {
               protocol: PROTOCOL_NAME,
@@ -1623,25 +1678,25 @@
               ids: alreadyAccepted,
               receipts: repeatedReceipts
             };
-            if (this._sendToPort(ackMsg, gen, port)) {
+            if (this._sendToPort(ackMsg, conn)) {
               this._emitTransfer({ direction: 'outgoing', type: 'ACK', ids: alreadyAccepted, repeated: true });
-              if (!this._isGenerationActive(gen, port)) return;
+              if (!this._isActiveConn(conn)) return;
             }
           }
 
           // Rule 2: Receiver-controlled transfer with bounded GET window (maxConcurrency)
-          this._dispatchNextGets(gen, port);
+          this._dispatchNextGets(conn);
         }
       } finally {
-        if (this._isGenerationActive(gen, port)) {
-          this._processingOffers = false;
-          if (this._pendingOfferIds.size > 0 && !this._lookupTimer) {
+        conn.processingOffers = false;
+        if (this._isActiveConn(conn)) {
+          if (conn.pendingOfferIds.size > 0 && !conn.lookupTimer) {
             const remNow = Date.now();
-            const remEarliest = this._lastLookupStartedAt > 0
-              ? (this._lastLookupStartedAt + this.lookupMinIntervalMs)
+            const remEarliest = conn.lastLookupStartedAt > 0
+              ? (conn.lastLookupStartedAt + this.lookupMinIntervalMs)
               : 0;
-            const remAllowedAt = Math.max(this._nextLookupAllowedAt, remEarliest);
-            this._schedulePendingOfferDrain(Math.max(1, remAllowedAt - remNow), gen, port);
+            const remAllowedAt = Math.max(conn.nextLookupAllowedAt, remEarliest);
+            this._schedulePendingOfferDrain(Math.max(1, remAllowedAt - remNow), conn);
           }
           this._notifySyncStatus();
         }
@@ -1649,36 +1704,36 @@
     }
 
     /**
-     * Dispatches GET requests from _pendingGetQueue up to the configured maxConcurrency window,
+     * Dispatches GET requests from conn.pendingGetQueue up to the configured maxConcurrency window,
      * first promoting any deferred unaccepted IDs if queue capacity has opened up.
      * Pauses new GET dispatches while an acceptance-lookup outage backoff is active so queued payloads
      * are not transferred unnecessarily during a backend lookup outage.
      */
-    _dispatchNextGets(gen = this._generation, port = this.port) {
-      if (!this._isGenerationActive(gen, port)) return;
-      this._pruneExpiredGets();
+    _dispatchNextGets(conn = this._conn) {
+      if (!this._isActiveConn(conn)) return;
+      this._pruneExpiredGets(conn);
 
-      if (this._isLookupBackoffActive()) {
-        this._scheduleGetExpiryTimer(gen, port);
-        if (!this._lookupTimer) {
-          this._schedulePendingOfferDrain(this._nextLookupAllowedAt - Date.now(), gen, port);
+      if (this._isLookupBackoffActive(conn)) {
+        this._scheduleGetExpiryTimer(conn);
+        if (!conn.lookupTimer) {
+          this._schedulePendingOfferDrain(conn.nextLookupAllowedAt - Date.now(), conn);
         }
         return;
       }
 
-      this._promoteDeferredOffers(gen, port);
+      this._promoteDeferredOffers(conn);
 
-      const activeReceives = this._inFlightGets.size + this._acceptingIds.size;
+      const activeReceives = conn.inFlightGets.size + conn.acceptingIds.size;
       const availableSlots = this.maxConcurrency - activeReceives;
-      if (availableSlots <= 0 || this._pendingGetQueue.length === 0) {
-        this._scheduleGetExpiryTimer(gen, port);
+      if (availableSlots <= 0 || conn.pendingGetQueue.length === 0) {
+        this._scheduleGetExpiryTimer(conn);
         return;
       }
 
       const toFetch = [];
-      while (toFetch.length < availableSlots && this._pendingGetQueue.length > 0) {
-        const nextId = this._pendingGetQueue.shift();
-        if (!this._inFlightGets.has(nextId) && !this._acceptingIds.has(nextId)) {
+      while (toFetch.length < availableSlots && conn.pendingGetQueue.length > 0) {
+        const nextId = conn.pendingGetQueue.shift();
+        if (!conn.inFlightGets.has(nextId) && !conn.acceptingIds.has(nextId)) {
           toFetch.push(nextId);
         }
       }
@@ -1686,13 +1741,13 @@
       if (toFetch.length > 0) {
         const now = Date.now();
         for (const id of toFetch) {
-          this._expiredGets.delete(id);
-          this._inFlightGets.set(id, now);
+          conn.expiredGets.delete(id);
+          conn.inFlightGets.set(id, now);
         }
-        this._scheduleGetExpiryTimer(gen, port);
+        this._scheduleGetExpiryTimer(conn);
         this._notifySyncStatus(`Requesting ${toFetch.length} unaccepted message(s)...`);
         this.log('info', `Requesting unaccepted message(s) via GET`, toFetch);
-        if (!this._isGenerationActive(gen, port)) return;
+        if (!this._isActiveConn(conn)) return;
 
         const getMsg = {
           protocol: PROTOCOL_NAME,
@@ -1700,77 +1755,77 @@
           type: 'GET',
           ids: toFetch
         };
-        if (this._sendToPort(getMsg, gen, port)) {
+        if (this._sendToPort(getMsg, conn)) {
           this._emitTransfer({ direction: 'outgoing', type: 'GET', ids: toFetch });
         }
       }
     }
 
     /**
-     * Handles incoming GET:
-     * Queues outgoing PUT messages strictly for IDs that were previously offered by this sender.
+     * Handles incoming GET on `conn`:
+     * Queues outgoing PUT messages strictly for IDs that were previously offered on `conn`.
      */
-    async _handleGet(get, gen = this._generation, port = this.port) {
-      if (!this._isGenerationActive(gen, port) || !get || !Array.isArray(get.ids)) {
+    async _handleGet(get, conn = this._conn) {
+      if (!this._isActiveConn(conn) || !get || !Array.isArray(get.ids)) {
         return;
       }
       const rawIds = get.ids
         .filter(isValidMessageId)
         .slice(0, MAX_BATCH_IDS);
-      const requestedIds = rawIds.filter(id => this._offeredIds.has(id));
+      const requestedIds = rawIds.filter(id => conn.offeredIds.has(id));
       if (requestedIds.length !== rawIds.length) {
-        this.log('warn', `Ignored GET for unoffered ID(s)`, rawIds.filter(id => !this._offeredIds.has(id)));
+        this.log('warn', `Ignored GET for unoffered ID(s)`, rawIds.filter(id => !conn.offeredIds.has(id)));
       }
       this.log('info', `Received GET request for ${requestedIds.length} message(s)`, requestedIds);
       this._emitTransfer({ direction: 'incoming', type: 'GET', ids: requestedIds });
-      if (!this._isGenerationActive(gen, port)) {
+      if (!this._isActiveConn(conn)) {
         return;
       }
 
       for (const id of requestedIds) {
-        this._queuePut(id, gen, port);
+        this._queuePut(id, conn);
       }
     }
 
     /**
-     * Enqueues a message ID to be transferred as a PUT (deduplicating queued/active IDs and capping queue size).
+     * Enqueues a message ID on `conn` to be transferred as a PUT (deduplicating queued/active IDs and capping queue size).
      */
-    _queuePut(id, gen = this._generation, port = this.port) {
-      if (!this._isGenerationActive(gen, port)) return;
-      if (this._putQueue.includes(id) || this._activePuttingIds.has(id) || this._putQueue.length >= MAX_BATCH_IDS) {
+    _queuePut(id, conn = this._conn) {
+      if (!this._isActiveConn(conn)) return;
+      if (conn.putQueue.includes(id) || conn.activePuttingIds.has(id) || conn.putQueue.length >= MAX_BATCH_IDS) {
         return;
       }
-      this._putQueue.push(id);
+      conn.putQueue.push(id);
       this._notifySyncStatus(`Transfer queued for message ${id}`);
-      if (!this._isGenerationActive(gen, port)) return;
-      this._processPutQueue(gen, port);
+      if (!this._isActiveConn(conn)) return;
+      this._processPutQueue(conn);
     }
 
     /**
-     * Bounded outgoing transfer worker: sends up to maxConcurrency PUT transfers at a time per direction.
+     * Bounded outgoing transfer worker on `conn`: sends up to maxConcurrency PUT transfers at a time per direction.
      */
-    async _processPutQueue(gen = this._generation, port = this.port) {
+    async _processPutQueue(conn = this._conn) {
       if (
-        !this._isGenerationActive(gen, port) ||
-        this._activeSendCount >= this.maxConcurrency ||
-        this._putQueue.length === 0
+        !this._isActiveConn(conn) ||
+        conn.activeSendCount >= this.maxConcurrency ||
+        conn.putQueue.length === 0
       ) {
         return;
       }
 
-      const id = this._putQueue.shift();
-      this._activeSendCount++;
-      this._activePuttingIds.add(id);
+      const id = conn.putQueue.shift();
+      conn.activeSendCount++;
+      conn.activePuttingIds.add(id);
 
       try {
         this._notifySyncStatus(`Sending message ${id}...`);
         this.log('info', `Preparing PUT for message ${id}`);
-        if (!this._isGenerationActive(gen, port)) {
+        if (!this._isActiveConn(conn)) {
           return;
         }
 
         const msg = await this.storage.getMessage(id);
-        if (!this._isGenerationActive(gen, port)) {
+        if (!this._isActiveConn(conn)) {
           return;
         }
         if (!msg || typeof msg !== 'object') {
@@ -1803,11 +1858,11 @@
           'info',
           `Sending PUT for message ${id} with ${msg.attachments.length} attachment(s)`
         );
-        if (!this._isGenerationActive(gen, port)) {
+        if (!this._isActiveConn(conn)) {
           return;
         }
 
-        if (this._sendToPort(putMsg, gen, port)) {
+        if (this._sendToPort(putMsg, conn)) {
           this._emitTransfer({
             direction: 'outgoing',
             type: 'PUT',
@@ -1816,44 +1871,44 @@
           });
         }
       } catch (err) {
-        if (this._isGenerationActive(gen, port)) {
+        if (this._isActiveConn(conn)) {
           this.log('error', `Failed to send PUT for message ${id}`, err.message);
           this._emitError(err);
         }
       } finally {
-        if (this._isGenerationActive(gen, port)) {
-          this._activePuttingIds.delete(id);
-          this._activeSendCount = Math.max(0, this._activeSendCount - 1);
+        conn.activePuttingIds.delete(id);
+        conn.activeSendCount = Math.max(0, conn.activeSendCount - 1);
+        if (this._isActiveConn(conn)) {
           this._notifySyncStatus();
           // Process next item in queue if still active
-          this._processPutQueue(gen, port);
+          this._processPutQueue(conn);
         }
       }
     }
 
     /**
-     * Handles incoming PUT:
+     * Handles incoming PUT on `conn`:
      * - Rule 2: Enforces receiver-controlled transfer:
-     *     * Active GETs (_inFlightGets) transition directly into _acceptingIds within maxConcurrency.
-     *     * Late responses for expired GETs (_expiredGets) are admitted ONLY if an acceptance/receive
-     *       slot is currently free ((_inFlightGets.size + _acceptingIds.size) < maxConcurrency), so
+     *     * Active GETs (conn.inFlightGets) transition directly into conn.acceptingIds within maxConcurrency.
+     *     * Late responses for expired GETs (conn.expiredGets) are admitted ONLY if an acceptance/receive
+     *       slot is currently free ((conn.inFlightGets.size + conn.acceptingIds.size) < maxConcurrency), so
      *       an expired slow message never steals a slot already reused by another message.
      * - Rule 3: Complete messages only. Strictly validates JSON payload types + attachments and bounds.
      */
-    async _handlePut(put, gen = this._generation, port = this.port) {
-      if (!this._isGenerationActive(gen, port) || !put || typeof put !== 'object') {
+    async _handlePut(put, conn = this._conn) {
+      if (!this._isActiveConn(conn) || !put || typeof put !== 'object') {
         return;
       }
-      this._pruneExpiredGets();
+      this._pruneExpiredGets(conn);
 
       const id = put.id;
-      if (!isValidMessageId(id) || this._acceptingIds.has(id)) {
+      if (!isValidMessageId(id) || conn.acceptingIds.has(id)) {
         this.log('warn', `Ignored invalid or duplicate in-flight PUT for message ${id}`);
         return;
       }
 
-      const isActiveGet = this._inFlightGets.has(id);
-      const isLateEligible = !isActiveGet && this._expiredGets.has(id);
+      const isActiveGet = conn.inFlightGets.has(id);
+      const isLateEligible = !isActiveGet && conn.expiredGets.has(id);
       if (!isActiveGet && !isLateEligible) {
         this.log('warn', `Ignored unsolicited PUT for message ${id}`);
         return;
@@ -1861,32 +1916,32 @@
 
       if (isActiveGet) {
         if (
-          this._acceptingIds.size >= this.maxConcurrency ||
-          this._incomingPutQueue.length >= this.maxConcurrency
+          conn.acceptingIds.size >= this.maxConcurrency ||
+          conn.incomingPutQueue.length >= this.maxConcurrency
         ) {
           this.log('warn', `Ignored PUT for ${id}: acceptance concurrency full`);
           return;
         }
-        this._inFlightGets.delete(id);
+        conn.inFlightGets.delete(id);
       } else {
         // Late response after slot expiry: only admit if a concurrency slot is currently free.
         // Note: when deferred here, recovery does not depend on a sender heartbeat—_pruneExpiredGets()
-        // already appended `id` to the tail of _pendingGetQueue (for attempts < MAX_AUTO_RETRIES),
+        // already appended `id` to the tail of conn.pendingGetQueue (for attempts < MAX_AUTO_RETRIES),
         // so the receiver automatically dispatches a fresh GET once active slots finish.
         if (
-          (this._inFlightGets.size + this._acceptingIds.size) >= this.maxConcurrency ||
-          this._incomingPutQueue.length >= this.maxConcurrency
+          (conn.inFlightGets.size + conn.acceptingIds.size) >= this.maxConcurrency ||
+          conn.incomingPutQueue.length >= this.maxConcurrency
         ) {
           this.log('info', `Deferred late PUT for ${id}: receive slot currently in use by another transfer`);
           return;
         }
-        this._expiredGets.delete(id);
-        const queuedIdx = this._pendingGetQueue.indexOf(id);
+        conn.expiredGets.delete(id);
+        const queuedIdx = conn.pendingGetQueue.indexOf(id);
         if (queuedIdx !== -1) {
-          this._pendingGetQueue.splice(queuedIdx, 1);
+          conn.pendingGetQueue.splice(queuedIdx, 1);
         }
       }
-      this._scheduleGetExpiryTimer(gen, port);
+      this._scheduleGetExpiryTimer(conn);
 
       // Validate wire format, strict JSON payload, & bounds (Rule 3: reject malformed envelopes before touching storage)
       const sigStr = (put.signature !== undefined && put.signature !== null) ? put.signature : '';
@@ -1896,54 +1951,52 @@
         sigStr.length > MAX_SIGNATURE_LEN ||
         !validated
       ) {
-        const fails = (this._failedAttempts.get(id) || 0) + 1;
-        this._setBoundedMap(this._failedAttempts, id, fails);
+        const fails = (conn.failedAttempts.get(id) || 0) + 1;
+        this._setBoundedMap(conn.failedAttempts, id, fails);
         const err = new Error(`Rejected PUT for message ${id}: invalid JSON payload/attachments or exceeded size/count bounds`);
         this.log('error', err.message);
         this._emitError(err);
-        if (!this._isGenerationActive(gen, port)) {
+        if (!this._isActiveConn(conn)) {
           return;
         }
         this._notifySyncStatus();
-        this._dispatchNextGets(gen, port);
+        this._dispatchNextGets(conn);
         return;
       }
 
-      this._acceptingIds.add(id);
-      this._incomingPutQueue.push({
+      conn.acceptingIds.add(id);
+      conn.incomingPutQueue.push({
         id: id,
         payload: validated.normalizedPayload,
         attachments: put.attachments,
-        signature: sigStr,
-        gen: gen,
-        port: port
+        signature: sigStr
       });
       this._notifySyncStatus(`Receiving message ${id} (${put.attachments.length} attachment(s))...`);
-      if (!this._isGenerationActive(gen, port)) {
+      if (!this._isActiveConn(conn)) {
         return;
       }
-      await this._processIncomingPutQueue(gen, port);
+      await this._processIncomingPutQueue(conn);
     }
 
     /**
-     * Processes queued incoming PUTs up to maxConcurrency at a time.
+     * Processes queued incoming PUTs on `conn` up to maxConcurrency at a time.
      */
-    async _processIncomingPutQueue(gen = this._generation, port = this.port) {
+    async _processIncomingPutQueue(conn = this._conn) {
       if (
-        !this._isGenerationActive(gen, port) ||
-        this._activeAcceptCount >= this.maxConcurrency ||
-        this._incomingPutQueue.length === 0
+        !this._isActiveConn(conn) ||
+        conn.activeAcceptCount >= this.maxConcurrency ||
+        conn.incomingPutQueue.length === 0
       ) {
         return;
       }
 
-      const item = this._incomingPutQueue.shift();
-      if (!item || !this._isGenerationActive(item.gen, item.port)) {
+      const item = conn.incomingPutQueue.shift();
+      if (!item || !this._isActiveConn(conn)) {
         return;
       }
 
       const { id, payload, attachments, signature } = item;
-      this._activeAcceptCount++;
+      conn.activeAcceptCount++;
 
       try {
         this.log(
@@ -1956,7 +2009,7 @@
           id: id,
           attachmentCount: attachments.length
         });
-        if (!this._isGenerationActive(gen, port)) {
+        if (!this._isActiveConn(conn)) {
           return;
         }
 
@@ -1969,17 +2022,17 @@
           signature: signature
         }));
 
-        if (!this._isGenerationActive(gen, port)) {
+        if (!this._isActiveConn(conn)) {
           return;
         }
 
         if (acceptRes.accepted) {
-          this._failedAttempts.delete(id);
-          this._timedOutGets.delete(id);
-          this._expiredGets.delete(id);
-          this._deferredOfferIds.delete(id);
+          conn.failedAttempts.delete(id);
+          conn.timedOutGets.delete(id);
+          conn.expiredGets.delete(id);
+          conn.deferredOfferIds.delete(id);
           this.log('info', `Successfully accepted message ${id}. Sending ACK.`);
-          if (!this._isGenerationActive(gen, port)) {
+          if (!this._isActiveConn(conn)) {
             return;
           }
           const receipts = Object.create(null);
@@ -1993,56 +2046,56 @@
             ids: [id],
             receipts: receipts
           };
-          if (this._sendToPort(ackMsg, gen, port)) {
+          if (this._sendToPort(ackMsg, conn)) {
             this._emitTransfer({ direction: 'outgoing', type: 'ACK', ids: [id] });
           }
         } else {
-          const fails = (this._failedAttempts.get(id) || 0) + 1;
-          this._setBoundedMap(this._failedAttempts, id, fails);
+          const fails = (conn.failedAttempts.get(id) || 0) + 1;
+          this._setBoundedMap(conn.failedAttempts, id, fails);
           this.log('error', `Acceptance rejected by local storage for message ${id} (attempt ${fails}/${MAX_AUTO_RETRIES}); NO ACK sent`);
         }
       } catch (err) {
-        if (this._isGenerationActive(gen, port)) {
+        if (this._isActiveConn(conn)) {
           // Transfer failure or storage error: do not send ACK
-          const fails = (this._failedAttempts.get(id) || 0) + 1;
-          this._setBoundedMap(this._failedAttempts, id, fails);
+          const fails = (conn.failedAttempts.get(id) || 0) + 1;
+          this._setBoundedMap(conn.failedAttempts, id, fails);
           this.log('error', `Failed to accept message ${id} (attempt ${fails}/${MAX_AUTO_RETRIES}): ${err.message}; NO ACK sent`);
           this._emitError(err);
         }
       } finally {
-        if (this._isGenerationActive(gen, port)) {
-          this._acceptingIds.delete(id);
-          this._activeAcceptCount = Math.max(0, this._activeAcceptCount - 1);
+        conn.acceptingIds.delete(id);
+        conn.activeAcceptCount = Math.max(0, conn.activeAcceptCount - 1);
+        if (this._isActiveConn(conn)) {
           this._notifySyncStatus();
-          if (this._isGenerationActive(gen, port)) {
+          if (this._isActiveConn(conn)) {
             // Request next window of GETs and process any queued PUTs
-            this._dispatchNextGets(gen, port);
-            this._processIncomingPutQueue(gen, port);
+            this._dispatchNextGets(conn);
+            this._processIncomingPutQueue(conn);
           }
         }
       }
     }
 
     /**
-     * Handles incoming ACK:
+     * Handles incoming ACK on `conn`:
      * - Rule 6: Sender cleanup upon receiving ACK.
-     * - Only acknowledges IDs that were actually offered by this sender.
-     * - Coalesces repeated ACKs into bounded _pendingAcks work (upgrading empty receipts to non-empty receipts).
+     * - Only acknowledges IDs that were actually offered on `conn`.
+     * - Coalesces repeated ACKs into bounded conn.pendingAcks work (upgrading empty receipts to non-empty receipts).
      */
-    async _handleAck(ack, gen = this._generation, port = this.port) {
-      if (!this._isGenerationActive(gen, port) || !ack || !Array.isArray(ack.ids)) {
+    async _handleAck(ack, conn = this._conn) {
+      if (!this._isActiveConn(conn) || !ack || !Array.isArray(ack.ids)) {
         return;
       }
       const rawIds = ack.ids
         .filter(isValidMessageId)
         .slice(0, MAX_BATCH_IDS);
-      const validIds = rawIds.filter(id => this._offeredIds.has(id));
+      const validIds = rawIds.filter(id => conn.offeredIds.has(id));
       if (validIds.length !== rawIds.length) {
-        this.log('warn', `Ignored unoffered ACK ID(s)`, rawIds.filter(id => !this._offeredIds.has(id)));
+        this.log('warn', `Ignored unoffered ACK ID(s)`, rawIds.filter(id => !conn.offeredIds.has(id)));
       }
       this.log('info', `Received ACK confirming acceptance of ${validIds.length} message(s)`, validIds);
       this._emitTransfer({ direction: 'incoming', type: 'ACK', ids: validIds });
-      if (!this._isGenerationActive(gen, port) || validIds.length === 0) {
+      if (!this._isActiveConn(conn) || validIds.length === 0) {
         return;
       }
 
@@ -2058,40 +2111,40 @@
           incomingReceipt = ack.receipts[id];
         }
 
-        if (this._pendingAcks.has(id)) {
+        if (conn.pendingAcks.has(id)) {
           // Never let an empty receipt overwrite a non-empty receipt; upgrade when a non-empty receipt arrives
           if (incomingReceipt !== '') {
-            this._pendingAcks.set(id, incomingReceipt);
+            conn.pendingAcks.set(id, incomingReceipt);
           }
-        } else if (this._pendingAcks.size < MAX_BATCH_IDS) {
-          this._pendingAcks.set(id, incomingReceipt);
+        } else if (conn.pendingAcks.size < MAX_BATCH_IDS) {
+          conn.pendingAcks.set(id, incomingReceipt);
         }
       }
 
-      await this._drainPendingAcks(gen, port);
+      await this._drainPendingAcks(conn);
     }
 
     /**
-     * Single-worker loop per generation that drains coalesced _pendingAcks sequentially.
+     * Single-worker loop per connection that drains coalesced conn.pendingAcks sequentially.
      * If storage.onAcknowledged() fails (e.g. due to an invalid/missing receipt), the IDs remain in
-     * _offeredIds so a subsequent ACK carrying a valid receipt retries cleanly.
+     * conn.offeredIds so a subsequent ACK carrying a valid receipt retries cleanly.
      */
-    async _drainPendingAcks(gen = this._generation, port = this.port) {
-      if (!this._isGenerationActive(gen, port) || this._processingAcks || this._pendingAcks.size === 0) {
+    async _drainPendingAcks(conn = this._conn) {
+      if (!this._isActiveConn(conn) || conn.processingAcks || conn.pendingAcks.size === 0) {
         return;
       }
 
-      this._processingAcks = true;
+      conn.processingAcks = true;
       try {
-        while (this._isGenerationActive(gen, port) && this._pendingAcks.size > 0) {
-          const entries = Array.from(this._pendingAcks.entries()).slice(0, MAX_BATCH_IDS);
+        while (this._isActiveConn(conn) && conn.pendingAcks.size > 0) {
+          const entries = Array.from(conn.pendingAcks.entries()).slice(0, MAX_BATCH_IDS);
           const batchIds = [];
           const receipts = Object.create(null);
 
           for (let i = 0; i < entries.length; i++) {
             const [id, rec] = entries[i];
-            this._pendingAcks.delete(id);
-            this._activeAckBatchSet.add(id);
+            conn.pendingAcks.delete(id);
+            conn.activeAckBatchSet.add(id);
             batchIds.push(id);
             if (rec !== '') {
               receipts[id] = rec;
@@ -2099,39 +2152,39 @@
           }
 
           this._notifySyncStatus(`Acknowledging ${batchIds.length} message(s)...`);
-          if (!this._isGenerationActive(gen, port)) {
+          if (!this._isActiveConn(conn)) {
             return;
           }
 
           try {
             await this.storage.onAcknowledged(batchIds, receipts);
-            if (!this._isGenerationActive(gen, port)) {
+            if (!this._isActiveConn(conn)) {
               return;
             }
             for (const id of batchIds) {
-              this._activeAckBatchSet.delete(id);
-              this._offeredIds.delete(id);
-              this._pendingAcks.delete(id);
-              if (this._reconciling) {
-                this._ackedDuringOutboxRead.add(id);
+              conn.activeAckBatchSet.delete(id);
+              conn.offeredIds.delete(id);
+              conn.pendingAcks.delete(id);
+              if (conn.reconciling) {
+                conn.ackedDuringOutboxRead.add(id);
               }
             }
             this.log('info', `Removed acknowledged message(s) from outbox:`, batchIds);
           } catch (err) {
-            if (!this._isGenerationActive(gen, port)) {
+            if (!this._isActiveConn(conn)) {
               return;
             }
             for (const id of batchIds) {
-              this._activeAckBatchSet.delete(id);
+              conn.activeAckBatchSet.delete(id);
             }
             this.log('error', 'Error processing ACK in local storage', err.message);
             this._emitError(err);
           }
         }
       } finally {
-        if (this._isGenerationActive(gen, port)) {
-          this._processingAcks = false;
-          this._activeAckBatchSet.clear();
+        conn.processingAcks = false;
+        conn.activeAckBatchSet.clear();
+        if (this._isActiveConn(conn)) {
           this._notifySyncStatus();
         }
       }

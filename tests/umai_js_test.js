@@ -319,11 +319,11 @@ function makeBatchAcceptance(fn) {
   assert.strictEqual(receiverSlow.getSyncStatus().isSyncing, false, 'isSyncing must become false after acceptMessage finishes');
   assert.strictEqual(ackReceiptsOnSenderSlow['msg-slow-1'], 'receipt-slow-1', 'Structured { accepted: true, ackReceipt } must propagate receipt in ACK');
 
-  // Verify expired GET reservation demotion (F3): expired _inFlightGets entry frees its active slot and moves to _expiredGets
-  receiverSlow._inFlightGets.set('msg-expired-get', Date.now() - 130000);
+  // Verify expired GET reservation demotion (F3): expired inFlightGets entry frees its active slot and moves to expiredGets
+  receiverSlow._conn.inFlightGets.set('msg-expired-get', Date.now() - 130000);
   receiverSlow._pruneExpiredGets();
-  assert.strictEqual(receiverSlow._inFlightGets.has('msg-expired-get'), false, 'Expired GET reservation must free active _inFlightGets slot (F3)');
-  assert.strictEqual(receiverSlow._expiredGets.has('msg-expired-get'), true, 'Expired GET reservation must move to bounded _expiredGets');
+  assert.strictEqual(receiverSlow._conn.inFlightGets.has('msg-expired-get'), false, 'Expired GET reservation must free active inFlightGets slot (F3)');
+  assert.strictEqual(receiverSlow._conn.expiredGets.has('msg-expired-get'), true, 'Expired GET reservation must move to bounded expiredGets');
 
   senderSlow.stop();
   receiverSlow.stop();
@@ -473,14 +473,14 @@ function makeBatchAcceptance(fn) {
     stopReceiver.port = stopRecChan.port1;
     stopRecChan.port1.onmessage = stopReceiver._portListener;
     stopReceiver.state = 'connected';
-    stopReceiver._peerOfferedOnce = true;
+    stopReceiver._conn.peerOfferedOnce = true;
     stopReceiver._handleOffer({
       protocol: PROTOCOL_NAME,
       version: PROTOCOL_VERSION,
       type: 'OFFER',
       ids: ['msg-stop-offer']
     });
-    stopReceiver._inFlightGets.set('msg-stop-put', Date.now());
+    stopReceiver._conn.inFlightGets.set('msg-stop-put', Date.now());
     stopReceiver._handlePut({
       protocol: PROTOCOL_NAME,
       version: PROTOCOL_VERSION,
@@ -571,7 +571,7 @@ function makeBatchAcceptance(fn) {
     c4Chan.port1.onmessage = c4Receiver._portListener;
     c4Receiver.state = 'connected';
 
-    c4Receiver._inFlightGets.set('msg-bad-att', Date.now());
+    c4Receiver._conn.inFlightGets.set('msg-bad-att', Date.now());
     await c4Receiver._handlePut({
       protocol: PROTOCOL_NAME,
       version: PROTOCOL_VERSION,
@@ -582,7 +582,7 @@ function makeBatchAcceptance(fn) {
     });
     assert.strictEqual(badPutAccepted, false, 'Malformed non-array attachments must be rejected before acceptMessage (C4)');
 
-    c4Receiver._inFlightGets.set('msg-str-false', Date.now());
+    c4Receiver._conn.inFlightGets.set('msg-str-false', Date.now());
     await c4Receiver._handlePut({
       protocol: PROTOCOL_NAME,
       version: PROTOCOL_VERSION,
@@ -596,7 +596,7 @@ function makeBatchAcceptance(fn) {
 
     // Plain object attachment (not a Blob/File) must be rejected (C4)
     let plainObjAccepted = false;
-    c4Receiver._inFlightGets.set('msg-plain-att', Date.now());
+    c4Receiver._conn.inFlightGets.set('msg-plain-att', Date.now());
     await c4Receiver._handlePut({
       protocol: PROTOCOL_NAME,
       version: PROTOCOL_VERSION,
@@ -628,7 +628,7 @@ function makeBatchAcceptance(fn) {
     smallLimitReceiver.port = smallChan.port1;
     smallChan.port1.onmessage = smallLimitReceiver._portListener;
     smallLimitReceiver.state = 'connected';
-    smallLimitReceiver._inFlightGets.set('msg-big-json', Date.now());
+    smallLimitReceiver._conn.inFlightGets.set('msg-big-json', Date.now());
     await smallLimitReceiver._handlePut({
       protocol: PROTOCOL_NAME,
       version: PROTOCOL_VERSION,
@@ -704,7 +704,7 @@ function makeBatchAcceptance(fn) {
     assert.strictEqual(maxConcurrentAckCalls, 1, '100 simultaneous ACK frames must never run >1 concurrent onAcknowledged()');
     assert.strictEqual(totalAckCalls, 2, '100 ACK frames (1st bad, 99 coalesced) must execute at most 2 onAcknowledged() calls');
     assert.strictEqual(acceptedReceiptOnSender, 'valid-receipt-sig', 'Earlier empty/bad receipts must not suppress later valid receipt');
-    assert.strictEqual(ackSender._offeredIds.has('msg-ack-flood'), false, 'Acknowledged ID must be removed from _offeredIds after valid receipt');
+    assert.strictEqual(ackSender._conn.offeredIds.has('msg-ack-flood'), false, 'Acknowledged ID must be removed from offeredIds after valid receipt');
     ackSender.stop();
 
     // --- 8b: Nested Blob / non-JSON structured-clone types in payload must be rejected ---
@@ -734,7 +734,7 @@ function makeBatchAcceptance(fn) {
     blobChan.port1.onmessage = blobReceiver._portListener;
     blobReceiver.state = 'connected';
 
-    blobReceiver._inFlightGets.set('msg-in-blob', Date.now());
+    blobReceiver._conn.inFlightGets.set('msg-in-blob', Date.now());
     await blobReceiver._handlePut({
       protocol: PROTOCOL_NAME,
       version: PROTOCOL_VERSION,
@@ -745,7 +745,7 @@ function makeBatchAcceptance(fn) {
     });
     assert.strictEqual(nestedBlobAccepted, false, 'Payload containing nested Blob must be rejected before acceptMessage');
 
-    blobReceiver._inFlightGets.set('msg-in-date', Date.now());
+    blobReceiver._conn.inFlightGets.set('msg-in-date', Date.now());
     await blobReceiver._handlePut({
       protocol: PROTOCOL_NAME,
       version: PROTOCOL_VERSION,
@@ -805,7 +805,7 @@ function makeBatchAcceptance(fn) {
     const r2 = largeSender.reconcile(true);
     await Promise.all([r1, r2]);
 
-    assert.strictEqual(largeSender._offeredIds.size, 1000, '_offeredIds must be capped at 1000');
+    assert.strictEqual(largeSender._conn.offeredIds.size, 1000, 'offeredIds must be capped at 1000');
     // Start an active PUT on msg-large-0001
     await largeSender._handleGet({ protocol: PROTOCOL_NAME, version: PROTOCOL_VERSION, type: 'GET', ids: ['msg-large-0001'] });
     await new Promise(r => setTimeout(r, 10));
@@ -817,11 +817,11 @@ function makeBatchAcceptance(fn) {
     await largeSender.reconcile(true);
     const reorderedOffer = largeChan.port1.sent.find(m => m.type === 'OFFER');
     assert.ok(reorderedOffer, 'Reordered reconcile must emit OFFER');
-    assert.strictEqual(largeSender._offeredIds.has('msg-large-0001'), true, 'Actively sending ID must remain protected in _offeredIds across reorder');
-    assert.strictEqual(largeSender._offeredIds.size <= 1000, true, '_offeredIds must never exceed 1000');
-    // Every single advertised ID in reorderedOffer.ids MUST be present in _offeredIds and fetchable!
+    assert.strictEqual(largeSender._conn.offeredIds.has('msg-large-0001'), true, 'Actively sending ID must remain protected in offeredIds across reorder');
+    assert.strictEqual(largeSender._conn.offeredIds.size <= 1000, true, 'offeredIds must never exceed 1000');
+    // Every single advertised ID in reorderedOffer.ids MUST be present in offeredIds and fetchable!
     for (const advId of reorderedOffer.ids) {
-      assert.strictEqual(largeSender._offeredIds.has(advId), true, `Advertised ID ${advId} must be tracked in _offeredIds`);
+      assert.strictEqual(largeSender._conn.offeredIds.has(advId), true, `Advertised ID ${advId} must be tracked in offeredIds`);
     }
     assert.ok(reorderedOffer.ids.includes('msg-large-1001'), 'Newly rotated-in ID msg-large-1001 must be advertised and fetchable');
 
@@ -959,7 +959,7 @@ function makeBatchAcceptance(fn) {
       attachments: []
     });
     assert.strictEqual(acceptedLateSet.has('msg-stalled'), false, 'Late PUT must not exceed maxConcurrency while reused slot is busy');
-    assert.strictEqual(timeoutReceiver._failedAttempts.get('msg-stalled') || 0, 0, 'Deferred late PUT must not increment _failedAttempts');
+    assert.strictEqual(timeoutReceiver._conn.failedAttempts.get('msg-stalled') || 0, 0, 'Deferred late PUT must not increment failedAttempts');
 
     // Now test late PUT admission when a slot IS free (slow attachment transfer completing after getTimeoutMs)
     const soloLateChan = createMockChannel();
@@ -990,10 +990,10 @@ function makeBatchAcceptance(fn) {
       ids: ['msg-slow-50mb']
     });
     // Let 50ms GET timeout expire (and prune), then deliver the slow PUT while no other message holds the slot
-    soloLateReceiver._inFlightGets.set('msg-slow-50mb', Date.now() - 100);
+    soloLateReceiver._conn.inFlightGets.set('msg-slow-50mb', Date.now() - 100);
     soloLateReceiver._pruneExpiredGets();
     // Clear any auto-requeued GET so slot is free when the slow response arrives
-    soloLateReceiver._pendingGetQueue = [];
+    soloLateReceiver._conn.pendingGetQueue = [];
     await soloLateReceiver._handlePut({
       protocol: PROTOCOL_NAME,
       version: PROTOCOL_VERSION,
@@ -1073,7 +1073,7 @@ function makeBatchAcceptance(fn) {
     const sentGets = chan9a.port1.sent.filter(m => m.type === 'GET');
     assert.strictEqual(sentGets.length, 1, 'Initial GET window must be dispatched');
     assert.strictEqual(sentGets[0].ids.length, 2, 'Initial GET window must respect maxConcurrency=2');
-    assert.strictEqual(rec9a._pendingGetQueue.length, 148, 'Remaining 148 unaccepted IDs must be queued in _pendingGetQueue');
+    assert.strictEqual(rec9a._conn.pendingGetQueue.length, 148, 'Remaining 148 unaccepted IDs must be queued in pendingGetQueue');
 
     // Repeated OFFER for the exact 150 unaccepted IDs (2 in _inFlightGets, 148 in _pendingGetQueue)
     await rec9a._handleOffer({
@@ -1146,22 +1146,22 @@ function makeBatchAcceptance(fn) {
     sender9b.port = chan9b.port1;
     chan9b.port1.onmessage = sender9b._portListener;
     sender9b.state = 'connected';
-    sender9b._offeredIds.add('msg-fill-0');
-    sender9b._offeredIds.add('msg-overflow-1001');
-    sender9b._offeredIds.add('msg-overflow-1002');
+    sender9b._conn.offeredIds.add('msg-fill-0');
+    sender9b._conn.offeredIds.add('msg-overflow-1001');
+    sender9b._conn.offeredIds.add('msg-overflow-1002');
 
     rec9b.port = chan9b.port2;
     chan9b.port2.onmessage = rec9b._portListener;
     rec9b.state = 'connected';
-    rec9b._peerOfferedOnce = true;
+    rec9b._conn.peerOfferedOnce = true;
 
     // Fill receiver's GET capacity completely to MAX_BATCH_IDS = 1,000 (1 in-flight + 999 queued = 1,000)
-    rec9b._inFlightGets.set('msg-fill-0', Date.now());
+    rec9b._conn.inFlightGets.set('msg-fill-0', Date.now());
     for (let q = 1; q < 1000; q++) {
-      rec9b._pendingGetQueue.push(`msg-fill-${q}`);
+      rec9b._conn.pendingGetQueue.push(`msg-fill-${q}`);
     }
     assert.strictEqual(
-      rec9b._inFlightGets.size + rec9b._pendingGetQueue.length,
+      rec9b._conn.inFlightGets.size + rec9b._conn.pendingGetQueue.length,
       1000,
       'Receiver GET queue must be completely full (0 spare GET capacity)'
     );
@@ -1179,10 +1179,10 @@ function makeBatchAcceptance(fn) {
     assert.deepStrictEqual(immediateAcks9b[0].ids, ['msg-already-1', 'msg-already-2'], 'Repeated ACK must include all already-accepted IDs');
     assert.strictEqual(immediateAcks9b[0].receipts['msg-already-1'], 'sig-a1', 'Repeated ACK must preserve stored receipt sig-a1');
     assert.strictEqual(immediateAcks9b[0].receipts['msg-already-2'], 'sig-a2', 'Repeated ACK must preserve stored receipt sig-a2');
-    assert.strictEqual(rec9b._deferredOfferIds.size, 2, 'Unaccepted IDs exceeding MAX_BATCH_IDS GET capacity must be retained in _deferredOfferIds');
+    assert.strictEqual(rec9b._conn.deferredOfferIds.size, 2, 'Unaccepted IDs exceeding MAX_BATCH_IDS GET capacity must be retained in deferredOfferIds');
 
     // Clear the 999 synthetic filler queue items and complete the 1 active transfer ('msg-fill-0') WITHOUT sending any new OFFER
-    rec9b._pendingGetQueue = [];
+    rec9b._conn.pendingGetQueue = [];
     await rec9b._handlePut({
       protocol: PROTOCOL_NAME,
       version: PROTOCOL_VERSION,
@@ -1193,7 +1193,7 @@ function makeBatchAcceptance(fn) {
     });
     await new Promise(r => setTimeout(r, 40));
 
-    assert.strictEqual(rec9b._deferredOfferIds.size, 0, 'Deferred unaccepted IDs must be automatically promoted once GET capacity frees up');
+    assert.strictEqual(rec9b._conn.deferredOfferIds.size, 0, 'Deferred unaccepted IDs must be automatically promoted once GET capacity frees up');
     assert.strictEqual(acceptedIn9b.has('msg-overflow-1001'), true, 'Deferred overflow ID #1001 must advance and be accepted without a new OFFER');
     assert.strictEqual(acceptedIn9b.has('msg-overflow-1002'), true, 'Deferred overflow ID #1002 must advance and be accepted without a new OFFER');
     sender9b.stop();
@@ -1274,13 +1274,13 @@ function makeBatchAcceptance(fn) {
     sender9c.port = chan9c.port1;
     chan9c.port1.onmessage = sender9c._portListener;
     sender9c.state = 'connected';
-    sender9c._offeredIds.add('msg-outage-acc');
-    sender9c._offeredIds.add('msg-outage-new');
+    sender9c._conn.offeredIds.add('msg-outage-acc');
+    sender9c._conn.offeredIds.add('msg-outage-new');
 
     rec9c.port = chan9c.port2;
     chan9c.port2.onmessage = rec9c._portListener;
     rec9c.state = 'connected';
-    rec9c._peerOfferedOnce = true;
+    rec9c._conn.peerOfferedOnce = true;
 
     // Trigger initial OFFER (Attempt 1 fails with HTTP 503) + flood 20 duplicate OFFERs during backoff window
     for (let k = 0; k < 20; k++) {
@@ -1299,7 +1299,7 @@ function makeBatchAcceptance(fn) {
     await new Promise(r => setTimeout(r, 250));
 
     assert.strictEqual(outageErrors.length, 4, 'All 4 failed/malformed lookup batches must report errors via onError');
-    assert.strictEqual(rec9c._failedAttempts.size, 0, 'Lookup outages must NOT increment per-message _failedAttempts cutoff');
+    assert.strictEqual(rec9c._conn.failedAttempts.size, 0, 'Lookup outages must NOT increment per-message failedAttempts cutoff');
     assert.strictEqual(outageLookupCalls, 5, 'Expected 4 failed batch lookups + 1 recovered batch lookup, with zero post-PUT getAcceptance calls');
 
     const recoveredAcks = chan9c.port2.sent.filter(m => m.type === 'ACK');
@@ -1341,7 +1341,7 @@ function makeBatchAcceptance(fn) {
     rec9d.port = chan9d.port1;
     chan9d.port1.onmessage = rec9d._portListener;
     rec9d.state = 'connected';
-    rec9d._inFlightGets.set('msg-concurrent-tab', Date.now());
+    rec9d._conn.inFlightGets.set('msg-concurrent-tab', Date.now());
     await rec9d._handlePut({
       protocol: PROTOCOL_NAME,
       version: PROTOCOL_VERSION,
@@ -1357,13 +1357,13 @@ function makeBatchAcceptance(fn) {
     assert.strictEqual(acks9d.length, 1);
     assert.strictEqual(acks9d[0].receipts['msg-concurrent-tab'], 'concurrent-session-receipt', 'Idempotent acceptMessage() duplicate receipt must be forwarded in ACK');
 
-    // Verify _setBoundedMap caps _failedAttempts to MAX_BATCH_IDS = 1,000 with FIFO eviction
+    // Verify _setBoundedMap caps failedAttempts to MAX_BATCH_IDS = 1,000 with FIFO eviction
     for (let m = 0; m < 1050; m++) {
-      rec9d._setBoundedMap(rec9d._failedAttempts, `msg-fail-${m}`, 3);
+      rec9d._setBoundedMap(rec9d._conn.failedAttempts, `msg-fail-${m}`, 3);
     }
-    assert.strictEqual(rec9d._failedAttempts.size, 1000, '_failedAttempts must remain strictly bounded to MAX_BATCH_IDS (1,000)');
-    assert.strictEqual(rec9d._failedAttempts.has('msg-fail-0'), false, 'Oldest entries must be evicted once _failedAttempts exceeds 1,000');
-    assert.strictEqual(rec9d._failedAttempts.has('msg-fail-1049'), true, 'Newest entries must be retained in _failedAttempts');
+    assert.strictEqual(rec9d._conn.failedAttempts.size, 1000, 'failedAttempts must remain strictly bounded to MAX_BATCH_IDS (1,000)');
+    assert.strictEqual(rec9d._conn.failedAttempts.has('msg-fail-0'), false, 'Oldest entries must be evicted once failedAttempts exceeds 1,000');
+    assert.strictEqual(rec9d._conn.failedAttempts.has('msg-fail-1049'), true, 'Newest entries must be retained in failedAttempts');
     rec9d.stop();
   }
   console.log('✓ Test 9: Batch getAcceptance(ids) full-queue ACK independence, outage backoff recovery, whole-batch validation, and bounded maps passed');
@@ -1371,7 +1371,7 @@ function makeBatchAcceptance(fn) {
   // Test 10: Reviewer Progress & Outage-Backoff Completeness Regressions:
   //   10a) Slow getOutboxIds() overlapped by faster periodic reconcile(false) heartbeats still emits OFFERs (no starvation)
   //        and excludes IDs acknowledged while getOutboxIds() was in flight
-  //   10b) Incoming PUT duplicate checks respect lookup outage backoff (20 offered messages do NOT trigger 20 lookups or 20 payload transfers during outage)
+  //   10b) Incoming PUT commits directly via acceptMessage() with zero post-PUT lookups while OFFER lookup backoff pauses new GETs
   {
     // --- 10a: Slow getOutboxIds() overlapped by faster reconcile(false) heartbeats ---
     let slowReadCount = 0;
@@ -1401,7 +1401,7 @@ function makeBatchAcceptance(fn) {
     sender10a.port = chan10a.port1;
     chan10a.port1.onmessage = sender10a._portListener;
     sender10a.state = 'connected';
-    sender10a._offeredIds.add('msg-concurrent-ack');
+    sender10a._conn.offeredIds.add('msg-concurrent-ack');
 
     // Start initial reconcile(true) (110ms read), overlap with 35ms heartbeats (faster than 110ms read!),
     // AND deliver an ACK for 'msg-concurrent-ack' while read #1 is in flight!
@@ -1801,12 +1801,12 @@ function makeBatchAcceptance(fn) {
 
       // 4. Verify zero leaked worker counters, queues, or open superseded MessagePorts
       for (const [label, sess] of [['host', hostChurn], ['embedded', embChurn]]) {
-        assert.strictEqual(sess._activeSendCount, 0, `${label} _activeSendCount must settle at 0`);
-        assert.strictEqual(sess._activeAcceptCount, 0, `${label} _activeAcceptCount must settle at 0`);
-        assert.strictEqual(sess._putQueue.length, 0, `${label} _putQueue must be empty`);
-        assert.strictEqual(sess._incomingPutQueue.length, 0, `${label} _incomingPutQueue must be empty`);
-        assert.strictEqual(sess._acceptingIds.size, 0, `${label} _acceptingIds must be empty`);
-        assert.strictEqual(sess._inFlightGets.size, 0, `${label} _inFlightGets must be empty`);
+        assert.strictEqual(sess._conn.activeSendCount, 0, `${label} activeSendCount must settle at 0`);
+        assert.strictEqual(sess._conn.activeAcceptCount, 0, `${label} activeAcceptCount must settle at 0`);
+        assert.strictEqual(sess._conn.putQueue.length, 0, `${label} putQueue must be empty`);
+        assert.strictEqual(sess._conn.incomingPutQueue.length, 0, `${label} incomingPutQueue must be empty`);
+        assert.strictEqual(sess._conn.acceptingIds.size, 0, `${label} acceptingIds must be empty`);
+        assert.strictEqual(sess._conn.inFlightGets.size, 0, `${label} inFlightGets must be empty`);
         assert.strictEqual(sess.getSyncStatus().isSyncing, false, `${label} getSyncStatus().isSyncing must be false`);
       }
 
@@ -1887,10 +1887,10 @@ function makeBatchAcceptance(fn) {
       assert.strictEqual(
         gen2ReceivedOffers.some(ids => ids.includes('stale-gen1-msg')),
         false,
-        'Stale getOutboxIds() from superseded generation must NEVER emit OFFER on replacement port'
+        'Stale getOutboxIds() from superseded connection must NEVER emit OFFER on replacement port'
       );
-      assert.strictEqual(midRecHost._offeredIds.has('stale-gen1-msg'), false, 'Stale ID must not pollute Gen 2 _offeredIds');
-      assert.strictEqual(midRecHost._offeredIds.has('fresh-gen2-msg'), true, 'Fresh Gen 2 outbox ID must be offered');
+      assert.strictEqual(midRecHost._conn.offeredIds.has('stale-gen1-msg'), false, 'Stale ID must not pollute Conn 2 offeredIds');
+      assert.strictEqual(midRecHost._conn.offeredIds.has('fresh-gen2-msg'), true, 'Fresh Conn 2 outbox ID must be offered');
       midRecHost.stop();
 
       // --- 11c: Deterministic heartbeat OFFERs colliding with active lookup backoff ---
@@ -1934,7 +1934,7 @@ function makeBatchAcceptance(fn) {
         ids: ['msg-b1']
       });
       assert.strictEqual(collisionLookupCalls, 1, 'Initial OFFER must trigger lookup #1');
-      assert.strictEqual(backoffCollisionRec._lookupFailureCount, 1, 'Failed lookup must enter backoff');
+      assert.strictEqual(backoffCollisionRec._conn.lookupFailureCount, 1, 'Failed lookup must enter backoff');
 
       // Send two heartbeat re-OFFERs (adding msg-b2) mid-backoff; neither may trigger an early lookup
       await delay(20);
@@ -2019,7 +2019,7 @@ function makeBatchAcceptance(fn) {
     });
     await new Promise(r => setTimeout(r, 10));
     assert.strictEqual(typeof rejectFirstLookup12, 'function', 'Initial lookup must be in flight');
-    assert.strictEqual(rec12._inFlightLookupIds.size, 2, 'Both in-flight lookup IDs must reserve retry capacity');
+    assert.strictEqual(rec12._conn.inFlightLookupIds.size, 2, 'Both in-flight lookup IDs must reserve retry capacity');
 
     // 2. While first lookup is pending, flood _handleOffer with 1,000 different IDs
     const floodIds12 = Array.from({ length: 1000 }, (_, i) => `flood-12-${String(i + 1).padStart(4, '0')}`);
@@ -2030,19 +2030,19 @@ function makeBatchAcceptance(fn) {
       ids: floodIds12
     });
     assert.strictEqual(
-      rec12._pendingOfferIds.size,
+      rec12._conn.pendingOfferIds.size,
       998,
-      `Offer admission must reserve 2 slots for in-flight lookup IDs (expected 998, got ${rec12._pendingOfferIds.size})`
+      `Offer admission must reserve 2 slots for in-flight lookup IDs (expected 998, got ${rec12._conn.pendingOfferIds.size})`
     );
 
     // 3. Fail the first lookup while the lookup queue is full
     rejectFirstLookup12(new Error('transient lookup failure under full queue'));
     await offer1Promise;
 
-    assert.strictEqual(rec12._pendingGetQueue.length, 0, 'Failed lookup under full queue must NEVER push unresolved IDs into _pendingGetQueue');
-    assert.strictEqual(rec12._deferredOfferIds.size, 0, 'Failed lookup under full queue must NEVER push unresolved IDs into _deferredOfferIds');
-    assert.strictEqual(rec12._pendingOfferIds.has('msg-already-acc'), true, 'msg-already-acc must be re-queued into reserved _pendingOfferIds slot');
-    assert.strictEqual(rec12._pendingOfferIds.has('msg-needs-get'), true, 'msg-needs-get must be re-queued into reserved _pendingOfferIds slot');
+    assert.strictEqual(rec12._conn.pendingGetQueue.length, 0, 'Failed lookup under full queue must NEVER push unresolved IDs into pendingGetQueue');
+    assert.strictEqual(rec12._conn.deferredOfferIds.size, 0, 'Failed lookup under full queue must NEVER push unresolved IDs into deferredOfferIds');
+    assert.strictEqual(rec12._conn.pendingOfferIds.has('msg-already-acc'), true, 'msg-already-acc must be re-queued into reserved pendingOfferIds slot');
+    assert.strictEqual(rec12._conn.pendingOfferIds.has('msg-needs-get'), true, 'msg-needs-get must be re-queued into reserved pendingOfferIds slot');
     assert.strictEqual(chan12.port1.sent.some(m => m.type === 'GET'), false, 'Zero GET frames may be sent after failed lookup');
 
     // 4. Wait for backoff to expire so retry lookup #2 starts (and hold it before resolving)
@@ -2120,15 +2120,14 @@ function makeBatchAcceptance(fn) {
 
       dagRec64.port = realMc.port2;
       dagRec64.state = 'connected';
-      const gen64 = dagRec64._generation;
-      realMc.port2.onmessage = (ev) => dagRec64._handlePortMessage(ev, gen64, realMc.port2);
+      realMc.port2.onmessage = dagRec64._portListener;
 
       let dagPayload = true;
       for (let i = 0; i < 30; i++) {
         dagPayload = { a: dagPayload, b: dagPayload };
       }
 
-      dagRec64._inFlightGets.set('msg-dag-64', Date.now());
+      dagRec64._conn.inFlightGets.set('msg-dag-64', Date.now());
       const t0 = Date.now();
       realMc.port1.postMessage({
         protocol: PROTOCOL_NAME,
@@ -2148,7 +2147,7 @@ function makeBatchAcceptance(fn) {
 
       assert.strictEqual(dagAccepted, false, 'Shared-reference DAG payload must NEVER reach acceptMessage');
       assert.strictEqual(dagRejectedCount, 1, 'Shared-reference DAG payload over real MessageChannel must be rejected');
-      assert.strictEqual(dagRec64._failedAttempts.get('msg-dag-64'), 1, 'Rejected DAG PUT must record failed attempt');
+      assert.strictEqual(dagRec64._conn.failedAttempts.get('msg-dag-64'), 1, 'Rejected DAG PUT must record failed attempt');
       assert.strictEqual(elapsed64 < 200, true, `30-level DAG validation must complete immediately without hanging (took ${elapsed64}ms)`);
 
       // Also verify 30-level DAG is rejected in <50ms even with default 50MB maxMessageBytes,
@@ -2171,7 +2170,7 @@ function makeBatchAcceptance(fn) {
       dagRec50.port = dagChan50.port1;
       dagChan50.port1.onmessage = dagRec50._portListener;
       dagRec50.state = 'connected';
-      dagRec50._inFlightGets.set('msg-dag-50mb', Date.now());
+      dagRec50._conn.inFlightGets.set('msg-dag-50mb', Date.now());
 
       const t50 = Date.now();
       await dagRec50._handlePut({
@@ -2184,7 +2183,7 @@ function makeBatchAcceptance(fn) {
       });
       const elapsed50 = Date.now() - t50;
       assert.strictEqual(dagAccepted, false, 'Shared-reference DAG must be rejected even under 50MB maxMessageBytes');
-      assert.strictEqual(dagRec50._failedAttempts.get('msg-dag-50mb'), 1, 'Rejected 50MB DAG PUT must record failed attempt');
+      assert.strictEqual(dagRec50._conn.failedAttempts.get('msg-dag-50mb'), 1, 'Rejected 50MB DAG PUT must record failed attempt');
       assert.strictEqual(elapsed50 < 50, true, `50MB DAG rejection must run in O(distinct objects) (<50ms, took ${elapsed50}ms)`);
 
       // Verify oversized distinct tree aborts during traversal before JSON.stringify runs
@@ -2195,7 +2194,7 @@ function makeBatchAcceptance(fn) {
         return origStringify.apply(this, args);
       };
       try {
-        dagRec64._inFlightGets.set('msg-oversized-tree', Date.now());
+        dagRec64._conn.inFlightGets.set('msg-oversized-tree', Date.now());
         const distinctOversizedTree = { items: Array.from({ length: 100 }, (_, i) => ({ idx: i })) };
         await dagRec64._handlePut({
           protocol: PROTOCOL_NAME,
@@ -2241,7 +2240,8 @@ function makeBatchAcceptance(fn) {
     rec13b.port = chan13b.port1;
     chan13b.port1.onmessage = rec13b._portListener;
     rec13b.state = 'connected';
-    rec13b._peerOfferedOnce = true;
+    const conn13b = rec13b._conn;
+    conn13b.peerOfferedOnce = true;
 
     const offerPromise13b = rec13b._handleOffer({
       protocol: PROTOCOL_NAME,
@@ -2263,14 +2263,16 @@ function makeBatchAcceptance(fn) {
     await new Promise(r => setTimeout(r, 15));
 
     assert.strictEqual(rec13b.state, 'disconnected', 'Session must be disconnected');
+    assert.strictEqual(rec13b._conn, null, 'Active connection reference must be cleared after stop()');
+    assert.strictEqual(conn13b.closed, true, 'Closed connection must be explicitly marked closed');
     assert.strictEqual(
       chan13b.port1.sent.length,
       0,
       'Zero GET or ACK frames may be sent when stop() fires between lookup helper return and _drainPendingOffers continuation'
     );
-    assert.strictEqual(rec13b._pendingGetQueue.length, 0, '_pendingGetQueue must remain empty after stop()');
+    assert.strictEqual(conn13b.pendingGetQueue.length, 0, 'conn13b.pendingGetQueue must remain empty after stop()');
 
-    // --- 13c: Stale Generation A lookup completion (resolve & reject) must NOT erase Generation B reservations ---
+    // --- 13c: Stale Connection A lookup completion (resolve & reject) must NOT erase Connection B reservations ---
     for (const mode of ['resolve', 'reject']) {
       let lookupCall13c = 0;
       let settleGenA13c = null;
@@ -2306,7 +2308,7 @@ function makeBatchAcceptance(fn) {
         }
       });
 
-      // Generation A starts lookup for 'shared-res-id'
+      // Connection A starts lookup for 'shared-res-id'
       rec13c.port = chanGenA.port1;
       chanGenA.port1.onmessage = rec13c._portListener;
       rec13c.state = 'connected';
@@ -2317,9 +2319,9 @@ function makeBatchAcceptance(fn) {
         ids: ['shared-res-id']
       });
       await new Promise(r => setTimeout(r, 5));
-      assert.strictEqual(rec13c._inFlightLookupIds.has('shared-res-id'), true, 'Gen A must reserve shared-res-id');
+      assert.strictEqual(rec13c._conn.inFlightLookupIds.has('shared-res-id'), true, 'Conn A must reserve shared-res-id');
 
-      // Reset into Generation B and start lookup for the same 'shared-res-id'
+      // Reset into Connection B and start lookup for the same 'shared-res-id'
       rec13c._resetChannelState();
       rec13c.port = chanGenB.port1;
       chanGenB.port1.onmessage = rec13c._portListener;
@@ -2331,25 +2333,25 @@ function makeBatchAcceptance(fn) {
         ids: ['shared-res-id']
       });
       await new Promise(r => setTimeout(r, 5));
-      assert.strictEqual(lookupCall13c, 2, 'Gen B lookup must be running');
-      assert.strictEqual(rec13c._inFlightLookupIds.has('shared-res-id'), true, 'Gen B must reserve shared-res-id');
+      assert.strictEqual(lookupCall13c, 2, 'Conn B lookup must be running');
+      assert.strictEqual(rec13c._conn.inFlightLookupIds.has('shared-res-id'), true, 'Conn B must reserve shared-res-id');
 
-      // Settle obsolete Generation A's lookup while Generation B's lookup is still pending
+      // Settle obsolete Connection A's lookup while Connection B's lookup is still pending
       if (mode === 'resolve') {
         settleGenA13c({ 'shared-res-id': { accepted: false } });
       } else {
-        settleGenA13c(new Error('obsolete Gen A lookup error'));
+        settleGenA13c(new Error('obsolete Conn A lookup error'));
       }
       await genAOffer;
       await new Promise(r => setTimeout(r, 5));
 
       assert.strictEqual(
-        rec13c._inFlightLookupIds.has('shared-res-id'),
+        rec13c._conn.inFlightLookupIds.has('shared-res-id'),
         true,
-        `Obsolete Gen A lookup (${mode}) must NEVER erase Gen B's active reservation`
+        `Obsolete Conn A lookup (${mode}) must NEVER erase Conn B's active reservation`
       );
 
-      // Verify Gen B's reserved retry slot still caps a 1,000-ID OFFER flood at 999 admitted IDs
+      // Verify Conn B's reserved retry slot still caps a 1,000-ID OFFER flood at 999 admitted IDs
       const flood13c = Array.from({ length: 1000 }, (_, i) => `f13c-${mode}-${String(i + 1).padStart(4, '0')}`);
       await rec13c._handleOffer({
         protocol: PROTOCOL_NAME,
@@ -2358,9 +2360,9 @@ function makeBatchAcceptance(fn) {
         ids: flood13c
       });
       assert.strictEqual(
-        rec13c._pendingOfferIds.size,
+        rec13c._conn.pendingOfferIds.size,
         999,
-        `Gen B reservation (${mode}) must keep 1 retry slot reserved during 1,000-ID flood (got ${rec13c._pendingOfferIds.size})`
+        `Conn B reservation (${mode}) must keep 1 retry slot reserved during 1,000-ID flood (got ${rec13c._conn.pendingOfferIds.size})`
       );
 
       resolveGenB13c({ 'shared-res-id': { accepted: true } });
@@ -2368,7 +2370,7 @@ function makeBatchAcceptance(fn) {
       rec13c.stop();
     }
   }
-  console.log('✓ Test 13: Shared-reference DAG bomb rejection, inter-continuation stop() guard, and generation-scoped reservation cleanup passed');
+  console.log('✓ Test 13: Shared-reference DAG bomb rejection, inter-continuation stop() guard, and connection-scoped reservation cleanup passed');
 
   // Test 14: Reusable Browser HTTP Spool Adapter (js/umai-spool.js — createHttpSpoolAdapter):
   //   14a) End-to-end UmaiSession transfer + receipt verification through createHttpSpoolAdapter
@@ -2689,6 +2691,187 @@ function makeBatchAcceptance(fn) {
     assert.deepStrictEqual(badRes, { accepted: false }, 'Parameterized File.type must be rejected');
   }
   console.log('✓ Test 15: Optional authenticated media_type (C2), explicit attachment_meta, and accepted_at round-trip passed');
+
+  // Test 16: Connection-Owned State Isolation (_createConnection / _closeConnection / _isActiveConn):
+  //   Simultaneously suspends all 5 async storage operations (getOutboxIds, getAcceptance, getMessage,
+  //   acceptMessage, onAcknowledged) + active timers on superseded conn1 (resolved) and conn2 (rejected),
+  //   switches via setPeerWindow() + rapid handshakes into conn3 with overlapping message IDs, and proves
+  //   explicit conn.closed + timer cancellation + port.close() + zero cross-connection container mutation.
+  {
+    class TrackingPort {
+      constructor() {
+        this.sent = [];
+        this.onmessage = null;
+        this.closed = false;
+      }
+      postMessage(msg) {
+        if (this.closed) {
+          throw new Error('postMessage called on closed port');
+        }
+        this.sent.push(msg);
+      }
+      close() {
+        this.closed = true;
+        this.onmessage = null;
+      }
+    }
+
+    const pendingOutbox = [];
+    const pendingLookup = [];
+    const pendingGetMsg = [];
+    const pendingAccept = [];
+    const pendingAck = [];
+    const observedErrors16 = [];
+
+    const sess16 = new UmaiSession({
+      peerOrigin: 'http://peer.example',
+      role: 'host',
+      maxConcurrency: 2,
+      getTimeoutMs: 5000,
+      lookupMinIntervalMs: 5000,
+      onError: (err) => observedErrors16.push(err.message),
+      storage: {
+        getOutboxIds: () => new Promise((resolve, reject) => pendingOutbox.push({ resolve, reject })),
+        getAcceptance: (ids) => new Promise((resolve, reject) => pendingLookup.push({ ids, resolve, reject })),
+        getMessage: (id) => new Promise((resolve, reject) => pendingGetMsg.push({ id, resolve, reject })),
+        acceptMessage: (msg) => new Promise((resolve, reject) => pendingAccept.push({ msg, resolve, reject })),
+        onAcknowledged: (ids, receipts) => new Promise((resolve, reject) => pendingAck.push({ ids, receipts, resolve, reject }))
+      }
+    });
+
+    // --- Attach conn1 and suspend all 5 storage operations + arm both timers ---
+    const p1 = new TrackingPort();
+    sess16.port = p1;
+    sess16.state = 'connected';
+    const conn1 = sess16._conn;
+    assert.ok(conn1 && !conn1.closed, 'conn1 must be attached and open');
+
+    conn1.offeredIds.add('shared-out');
+    conn1.offeredIds.add('shared-ack');
+    conn1.inFlightGets.set('shared-put', Date.now());
+    conn1.inFlightGets.set('shared-timer-slot', Date.now());
+    sess16._scheduleGetExpiryTimer(conn1);
+    conn1.pendingOfferIds.add('shared-paced-offer');
+    sess16._schedulePendingOfferDrain(5000, conn1);
+    assert.ok(conn1.getExpiryTimer !== null, 'conn1.getExpiryTimer must be armed');
+    assert.ok(conn1.lookupTimer !== null, 'conn1.lookupTimer must be armed');
+
+    const c1Rec = sess16.reconcile(false);
+    conn1.lastLookupStartedAt = 0; // allow immediate lookup on conn1
+    conn1.peerOfferedOnce = true;
+    const c1Offer = sess16._handleOffer({ protocol: PROTOCOL_NAME, version: PROTOCOL_VERSION, type: 'OFFER', ids: ['shared-lookup'] });
+    const c1Get = sess16._handleGet({ protocol: PROTOCOL_NAME, version: PROTOCOL_VERSION, type: 'GET', ids: ['shared-out'] });
+    const c1Put = sess16._handlePut({ protocol: PROTOCOL_NAME, version: PROTOCOL_VERSION, type: 'PUT', id: 'shared-put', payload: { v: 1 }, attachments: [] });
+    const c1Ack = sess16._handleAck({ protocol: PROTOCOL_NAME, version: PROTOCOL_VERSION, type: 'ACK', ids: ['shared-ack'], receipts: { 'shared-ack': 'r1' } });
+    await new Promise(r => setTimeout(r, 10));
+
+    assert.strictEqual(pendingOutbox.length, 1, 'conn1 getOutboxIds must be suspended');
+    assert.strictEqual(pendingLookup.length, 1, 'conn1 getAcceptance must be suspended');
+    assert.strictEqual(pendingGetMsg.length, 1, 'conn1 getMessage must be suspended');
+    assert.strictEqual(pendingAccept.length, 1, 'conn1 acceptMessage must be suspended');
+    assert.strictEqual(pendingAck.length, 1, 'conn1 onAcknowledged must be suspended');
+
+    // --- Switch peerWindow -> closes conn1 explicitly, then attach conn2 and suspend rejecting operations ---
+    const companionWin16 = { closed: false, postMessage() {} };
+    sess16.setPeerWindow(companionWin16);
+    assert.strictEqual(conn1.closed, true, 'setPeerWindow must explicitly mark conn1.closed = true');
+    assert.strictEqual(conn1.getExpiryTimer, null, 'setPeerWindow must cancel conn1.getExpiryTimer');
+    assert.strictEqual(conn1.lookupTimer, null, 'setPeerWindow must cancel conn1.lookupTimer');
+    assert.strictEqual(conn1.port, null, 'setPeerWindow must detach conn1.port');
+    assert.strictEqual(p1.closed, true, 'setPeerWindow must close p1');
+
+    const p2 = new TrackingPort();
+    sess16.port = p2;
+    sess16.state = 'connected';
+    const conn2 = sess16._conn;
+    assert.notStrictEqual(conn2, conn1, 'conn2 must be a distinct connection object');
+    conn2.offeredIds.add('shared-out');
+    conn2.offeredIds.add('shared-ack');
+    conn2.inFlightGets.set('shared-put', Date.now());
+    conn2.peerOfferedOnce = true;
+
+    const c2Rec = sess16.reconcile(false);
+    const c2Offer = sess16._handleOffer({ protocol: PROTOCOL_NAME, version: PROTOCOL_VERSION, type: 'OFFER', ids: ['shared-lookup'] });
+    const c2Get = sess16._handleGet({ protocol: PROTOCOL_NAME, version: PROTOCOL_VERSION, type: 'GET', ids: ['shared-out'] });
+    const c2Put = sess16._handlePut({ protocol: PROTOCOL_NAME, version: PROTOCOL_VERSION, type: 'PUT', id: 'shared-put', payload: { v: 2 }, attachments: [] });
+    const c2Ack = sess16._handleAck({ protocol: PROTOCOL_NAME, version: PROTOCOL_VERSION, type: 'ACK', ids: ['shared-ack'], receipts: { 'shared-ack': 'r2' } });
+    await new Promise(r => setTimeout(r, 10));
+
+    // --- Replace conn2 with active conn3 carrying overlapping active IDs ---
+    const p3 = new TrackingPort();
+    sess16.port = p3;
+    sess16.state = 'connected';
+    const conn3 = sess16._conn;
+    assert.strictEqual(conn2.closed, true, 'Port replacement must mark conn2.closed = true');
+    assert.strictEqual(p2.closed, true, 'Port replacement must close p2');
+    assert.notStrictEqual(conn3, conn2, 'conn3 must be a fresh connection instance');
+    assert.notStrictEqual(conn3.inFlightLookupIds, conn1.inFlightLookupIds, 'Per-connection Sets must never be shared');
+
+    conn3.offeredIds.add('shared-out');
+    conn3.offeredIds.add('shared-ack');
+    conn3.inFlightGets.set('shared-put', Date.now());
+    conn3.peerOfferedOnce = true;
+    const c3Offer = sess16._handleOffer({ protocol: PROTOCOL_NAME, version: PROTOCOL_VERSION, type: 'OFFER', ids: ['shared-lookup'] });
+    const c3Get = sess16._handleGet({ protocol: PROTOCOL_NAME, version: PROTOCOL_VERSION, type: 'GET', ids: ['shared-out'] });
+    const c3Put = sess16._handlePut({ protocol: PROTOCOL_NAME, version: PROTOCOL_VERSION, type: 'PUT', id: 'shared-put', payload: { v: 3 }, attachments: [] });
+    await new Promise(r => setTimeout(r, 10));
+
+    assert.strictEqual(conn3.inFlightLookupIds.has('shared-lookup'), true, 'conn3 lookup reservation active');
+    assert.strictEqual(conn3.acceptingIds.has('shared-put'), true, 'conn3 accept reservation active');
+    assert.strictEqual(conn3.activeSendCount, 1, 'conn3 activeSendCount === 1');
+    assert.strictEqual(conn3.activeAcceptCount, 1, 'conn3 activeAcceptCount === 1');
+
+    // --- Resolve ALL 5 suspended conn1 promises AND reject ALL 5 suspended conn2 promises while conn3 is active ---
+    pendingOutbox[0].resolve(['stale-conn1-outbox']);
+    pendingLookup[0].resolve({ 'shared-lookup': { accepted: false } });
+    pendingGetMsg[0].resolve({ id: 'shared-out', payload: { stale: 1 }, attachments: [] });
+    pendingAccept[0].resolve({ accepted: true, ackReceipt: 'stale-rcpt-1' });
+    pendingAck[0].resolve();
+
+    pendingOutbox[1].reject(new Error('conn2 outbox error'));
+    pendingLookup[1].reject(new Error('conn2 lookup error'));
+    pendingGetMsg[1].reject(new Error('conn2 getMessage error'));
+    pendingAccept[1].reject(new Error('conn2 accept error'));
+    pendingAck[1].reject(new Error('conn2 ack error'));
+
+    await Promise.all([c1Rec, c1Offer, c1Get, c1Put, c1Ack, c2Rec, c2Offer, c2Get, c2Put, c2Ack]);
+    await new Promise(r => setTimeout(r, 15));
+
+    // Zero leakage onto p1, p2, p3, onError, or conn3's active containers!
+    assert.strictEqual(p1.sent.length, 0, 'Closed p1 must emit zero frames');
+    assert.strictEqual(p2.sent.length, 0, 'Closed p2 must emit zero frames');
+    assert.strictEqual(p3.sent.length, 0, 'Stale conn1/conn2 completions must emit zero frames on active p3');
+    assert.strictEqual(observedErrors16.length, 0, 'Superseded conn2 rejections must emit zero onError callbacks');
+    assert.strictEqual(conn3.offeredIds.has('stale-conn1-outbox'), false, 'conn1 outbox snapshot must not touch conn3.offeredIds');
+    assert.strictEqual(conn3.offeredIds.has('shared-ack'), true, 'conn1 ACK completion must not delete shared-ack from conn3.offeredIds');
+    assert.strictEqual(conn3.inFlightLookupIds.has('shared-lookup'), true, 'conn1/conn2 lookup cleanup must not erase conn3.inFlightLookupIds');
+    assert.strictEqual(conn3.acceptingIds.has('shared-put'), true, 'conn1/conn2 accept cleanup must not erase conn3.acceptingIds');
+    assert.strictEqual(conn3.activeSendCount, 1, 'conn3.activeSendCount must remain 1');
+    assert.strictEqual(conn3.activeAcceptCount, 1, 'conn3.activeAcceptCount must remain 1');
+
+    // Now complete conn3's own operations and verify conn3 works normally
+    pendingLookup[2].resolve({ 'shared-lookup': { accepted: false } });
+    pendingGetMsg[2].resolve({ id: 'shared-out', payload: { fresh: 3 }, attachments: [] });
+    pendingAccept[2].resolve({ accepted: true, ackReceipt: 'fresh-rcpt-3' });
+    await Promise.all([c3Offer, c3Get, c3Put]);
+    await new Promise(r => setTimeout(r, 15));
+
+    assert.strictEqual(p3.sent.some(m => m.type === 'GET' && m.ids.includes('shared-lookup')), true, 'conn3 must emit GET for shared-lookup');
+    assert.strictEqual(p3.sent.some(m => m.type === 'PUT' && m.id === 'shared-out'), true, 'conn3 must emit PUT for shared-out');
+    assert.strictEqual(p3.sent.some(m => m.type === 'ACK' && m.receipts['shared-put'] === 'fresh-rcpt-3'), true, 'conn3 must emit ACK with fresh-rcpt-3');
+
+    sess16.stop();
+    assert.strictEqual(conn3.closed, true, 'stop() must explicitly close conn3');
+    assert.strictEqual(sess16._conn, null, 'stop() must clear _conn');
+    assert.strictEqual(p3.closed, true, 'stop() must close p3');
+    assert.deepStrictEqual(sess16.getSyncStatus(), {
+      isSyncing: false,
+      state: 'disconnected',
+      pendingOutgoing: 0,
+      pendingIncoming: 0
+    });
+  }
+  console.log('✓ Test 16: Connection-owned state isolation across rapid connection replacement and stop() passed');
 
   senderPoison.stop();
   receiverPoison.stop();
