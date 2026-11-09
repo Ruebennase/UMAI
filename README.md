@@ -196,11 +196,13 @@ umai/
 ├── SPEC.md                 # Formal, vendor-neutral protocol specification
 ├── SECURITY.md             # Security model, threat analysis, and limitations
 ├── LICENSE                 # MIT License
+├── cmd/
+│   └── umai-spool/         # Standalone CLI for stateless outbox publication (prepare/ -> outbox/)
 ├── js/
 │   ├── umai.js             # Standalone, framework-free JavaScript protocol library
 │   └── umai-spool.js       # Reusable browser HTTP spool adapter (UMAI.createHttpSpoolAdapter)
 ├── pkg/
-│   └── umaispool/          # Reusable Go file-spool package (Storage, Ed25519 signing, HTTP Handler)
+│   └── umaispool/          # Reusable Go file-spool package (Storage, Publish, Ed25519 signing, HTTP Handler)
 ├── internal/
 │   └── demoapp/            # Demo application server (demo login, local docs/ CRUD, UI serving)
 ├── examples/
@@ -211,6 +213,7 @@ umai/
 │       ├── main.go
 │       └── static/         # Dual inspector & minimal single-app production view (/minimal.html)
 ├── tests/
+│   ├── publish_test.go        # Stateless Publish, cmd/umai-spool CLI, and concurrency tests
 │   ├── spool_contract_test.go # Security & boundary tests for standalone pkg/umaispool
 │   ├── storage_test.go        # Go tests for atomic storage, crash recovery, immutability
 │   ├── protocol_test.go       # Protocol exchange, binary integrity, duplicate rejection

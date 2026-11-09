@@ -32,6 +32,7 @@ var (
 	ErrTooManyAttachments  = errors.New("too many attachments in message")
 	ErrTooManyIDs          = errors.New("batch exceeds maximum allowed message IDs")
 	ErrStorageCollision    = errors.New("storage directory collision detected")
+	ErrAlreadyPublished    = errors.New("message ID already published in outbox")
 )
 
 // AttachmentInfo describes a binary attachment belonging to a message.
@@ -70,6 +71,9 @@ type SigningConfig struct {
 // Process Ownership & Directory Model:
 //   - A single spool server process per `dataDir` opens `Storage` and exclusively owns `.staging/`,
 //     `.committing/`, `accepted.json`, `inbox/` commits, and startup crash recovery.
+//   - External producers (see `Publish` and `cmd/umai-spool`) stage outgoing messages exclusively inside
+//     the producer-owned `prepare/` directory and atomically rename completed directories into `outbox/m-<sha256(id)>/`.
+//     Server startup (`NewStorage`) never purges or modifies `prepare/`.
 //   - Incoming commit sequence:
 //     1. Incoming files and message.json are written and fsynced in `.staging/`.
 //     2. The staged directory is atomically renamed to `.committing/m-<sha256(id)>/` (invisible to `inbox/` consumers).
@@ -110,11 +114,12 @@ func NewStorage(dataDir string, maxUploadSize int64) (*Storage, error) {
 
 	stagingDir := filepath.Join(absDataDir, ".staging")
 	committingDir := filepath.Join(absDataDir, ".committing")
+	prepareDir := filepath.Join(absDataDir, "prepare")
 	outboxDir := filepath.Join(absDataDir, "outbox")
 	inboxDir := filepath.Join(absDataDir, "inbox")
 	acceptedFile := filepath.Join(absDataDir, "accepted.json")
 
-	for _, dir := range []string{absDataDir, stagingDir, committingDir, outboxDir, inboxDir} {
+	for _, dir := range []string{absDataDir, stagingDir, committingDir, prepareDir, outboxDir, inboxDir} {
 		if err := os.MkdirAll(dir, 0700); err != nil {
 			return nil, fmt.Errorf("creating directory %s: %w", dir, err)
 		}
@@ -395,7 +400,10 @@ func (s *Storage) CreateOutboxMessageWithID(id string, payload any, attachments 
 	dirKey := storageDirKey(msgID)
 	msgDir := filepath.Join(s.outboxDir, dirKey)
 	if _, err := os.Stat(msgDir); err == nil {
-		return nil, ErrStorageCollision
+		if existing, rErr := readMessageJSON(msgDir); rErr == nil && existing.ID != msgID {
+			return nil, ErrStorageCollision
+		}
+		return nil, ErrAlreadyPublished
 	} else if !os.IsNotExist(err) {
 		return nil, err
 	}
@@ -500,6 +508,12 @@ func (s *Storage) CreateOutboxMessageWithID(id string, payload any, attachments 
 
 	if err := os.Rename(tmpDir, msgDir); err != nil {
 		_ = os.RemoveAll(tmpDir)
+		if _, statErr := os.Stat(msgDir); statErr == nil {
+			if existing, rErr := readMessageJSON(msgDir); rErr == nil && existing.ID != msgID {
+				return nil, ErrStorageCollision
+			}
+			return nil, ErrAlreadyPublished
+		}
 		return nil, err
 	}
 	if err := s.syncDirLocked(s.outboxDir); err != nil {

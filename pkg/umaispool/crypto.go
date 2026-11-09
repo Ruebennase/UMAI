@@ -23,30 +23,39 @@ var (
 	ErrSigningNotConfigured = errors.New("cryptographic signing keys and identities are not configured")
 )
 
+// ParsePrivateKey parses a hex-encoded Ed25519 private key (32-byte seed or 64-byte expanded key).
+// It never falls back to default keys.
+func ParsePrivateKey(privHex string) (ed25519.PublicKey, ed25519.PrivateKey, error) {
+	privTrimmed := strings.TrimSpace(privHex)
+	if privTrimmed == "" {
+		return nil, nil, ErrSigningNotConfigured
+	}
+	rawPriv, err := hex.DecodeString(privTrimmed)
+	if err != nil {
+		return nil, nil, fmt.Errorf("decoding signing private key hex: %w", err)
+	}
+	switch len(rawPriv) {
+	case ed25519.SeedSize:
+		ownPriv := ed25519.NewKeyFromSeed(rawPriv)
+		return ownPriv.Public().(ed25519.PublicKey), ownPriv, nil
+	case ed25519.PrivateKeySize:
+		ownPriv := ed25519.PrivateKey(rawPriv)
+		return ownPriv.Public().(ed25519.PublicKey), ownPriv, nil
+	default:
+		return nil, nil, fmt.Errorf("invalid Ed25519 private key length: %d", len(rawPriv))
+	}
+}
+
 // ParseSigningKeys parses hex-encoded Ed25519 private (32-byte seed or 64-byte key)
 // and 32-byte peer public keys. Unlike demo utilities, it never falls back to default keys.
 func ParseSigningKeys(privHex, peerPubHex string) (ed25519.PublicKey, ed25519.PrivateKey, ed25519.PublicKey, error) {
-	privTrimmed := strings.TrimSpace(privHex)
 	peerTrimmed := strings.TrimSpace(peerPubHex)
-	if privTrimmed == "" || peerTrimmed == "" {
+	if strings.TrimSpace(privHex) == "" || peerTrimmed == "" {
 		return nil, nil, nil, ErrSigningNotConfigured
 	}
-
-	rawPriv, err := hex.DecodeString(privTrimmed)
+	ownPub, ownPriv, err := ParsePrivateKey(privHex)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("decoding signing private key hex: %w", err)
-	}
-	var ownPriv ed25519.PrivateKey
-	var ownPub ed25519.PublicKey
-	switch len(rawPriv) {
-	case ed25519.SeedSize:
-		ownPriv = ed25519.NewKeyFromSeed(rawPriv)
-		ownPub = ownPriv.Public().(ed25519.PublicKey)
-	case ed25519.PrivateKeySize:
-		ownPriv = ed25519.PrivateKey(rawPriv)
-		ownPub = ownPriv.Public().(ed25519.PublicKey)
-	default:
-		return nil, nil, nil, fmt.Errorf("invalid Ed25519 private key length: %d", len(rawPriv))
+		return nil, nil, nil, err
 	}
 
 	rawPeer, err := hex.DecodeString(peerTrimmed)
