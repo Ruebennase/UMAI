@@ -300,9 +300,11 @@ function createMockChannel() {
   assert.strictEqual(receiverSlow.getSyncStatus().isSyncing, false, 'isSyncing must become false after acceptMessage finishes');
   assert.strictEqual(ackReceiptsOnSenderSlow['msg-slow-1'], 'receipt-slow-1', 'Structured { accepted: true, ackReceipt } must propagate receipt in ACK');
 
-  // Verify expired GET reservation recovery (F3): if an ID is in _inFlightGets with an expired timestamp, next OFFER re-requests it
-  receiverSlow._inFlightGets.set('msg-expired-get', Date.now() - 20000);
-  assert.strictEqual(receiverSlow._isGetInFlight('msg-expired-get'), false, 'Expired GET reservation must be pruned and allow retry (F3)');
+  // Verify expired GET reservation demotion (F3): expired _inFlightGets entry frees its active slot and moves to _expiredGets
+  receiverSlow._inFlightGets.set('msg-expired-get', Date.now() - 130000);
+  receiverSlow._pruneExpiredGets();
+  assert.strictEqual(receiverSlow._inFlightGets.has('msg-expired-get'), false, 'Expired GET reservation must free active _inFlightGets slot (F3)');
+  assert.strictEqual(receiverSlow._expiredGets.has('msg-expired-get'), true, 'Expired GET reservation must move to bounded _expiredGets');
 
   senderSlow.stop();
   receiverSlow.stop();
@@ -611,6 +613,377 @@ function createMockChannel() {
     c4Receiver.stop();
   }
   console.log('✓ Test 7: Generation isolation (C1), bounded concurrency & payload size (C2), wildcard origin rejection (C3), and strict validation (C4) passed');
+
+  // Test 8: Reviewer Follow-Up Regressions:
+  //   8a) 100 ACK flood coalescing + receipt upgrade + failed-receipt retry
+  //   8b) Strict JSON payload validation (nested Blob / TypedArray / Date rejection)
+  //   8c) >1,000-entry outbox reordering, active transfer protection, stale retirement, & serialized reconcile()
+  //   8d) Lifecycle-aware callback stop() & exception safety
+  //   8e) getTimeoutMs expiry, non-blocking slot reuse, busy-slot deferral, & late PUT admission
+  {
+    // --- 8a: Bounded ACK coalescing & receipt upgrade ---
+    let concurrentAckCalls = 0;
+    let maxConcurrentAckCalls = 0;
+    let totalAckCalls = 0;
+    let acceptedReceiptOnSender = null;
+
+    const ackSender = new UmaiSession({
+      peerOrigin: 'http://peer.example',
+      role: 'host',
+      storage: {
+        getOutboxIds: async () => (acceptedReceiptOnSender ? [] : ['msg-ack-flood']),
+        getMessage: async (id) => ({ id, payload: {}, attachments: [] }),
+        isAccepted: async () => false,
+        acceptMessage: async () => true,
+        onAcknowledged: async (ids, receipts) => {
+          totalAckCalls++;
+          concurrentAckCalls++;
+          if (concurrentAckCalls > maxConcurrentAckCalls) {
+            maxConcurrentAckCalls = concurrentAckCalls;
+          }
+          await new Promise(r => setTimeout(r, 25));
+          concurrentAckCalls--;
+          const r = receipts && receipts['msg-ack-flood'];
+          if (r !== 'valid-receipt-sig') {
+            throw new Error('Invalid or missing receipt');
+          }
+          acceptedReceiptOnSender = r;
+        }
+      }
+    });
+    const ackChan = createMockChannel();
+    ackSender.port = ackChan.port1;
+    ackChan.port1.onmessage = ackSender._portListener;
+    ackSender.state = 'connected';
+    await ackSender.reconcile();
+
+    // Fire 100 ACK frames concurrently: 1st has bad receipt, next 50 have empty receipts, last 49 have valid receipt
+    const ackPromises = [];
+    for (let i = 0; i < 100; i++) {
+      const rec = i === 0 ? { 'msg-ack-flood': 'bad-receipt' } : (i <= 50 ? {} : { 'msg-ack-flood': 'valid-receipt-sig' });
+      ackPromises.push(ackSender._handleAck({
+        protocol: PROTOCOL_NAME,
+        version: PROTOCOL_VERSION,
+        type: 'ACK',
+        ids: ['msg-ack-flood'],
+        receipts: rec
+      }));
+    }
+    await Promise.all(ackPromises);
+    await new Promise(r => setTimeout(r, 60));
+
+    assert.strictEqual(maxConcurrentAckCalls, 1, '100 simultaneous ACK frames must never run >1 concurrent onAcknowledged()');
+    assert.strictEqual(totalAckCalls, 2, '100 ACK frames (1st bad, 99 coalesced) must execute at most 2 onAcknowledged() calls');
+    assert.strictEqual(acceptedReceiptOnSender, 'valid-receipt-sig', 'Earlier empty/bad receipts must not suppress later valid receipt');
+    assert.strictEqual(ackSender._offeredIds.has('msg-ack-flood'), false, 'Acknowledged ID must be removed from _offeredIds after valid receipt');
+    ackSender.stop();
+
+    // --- 8b: Nested Blob / non-JSON structured-clone types in payload must be rejected ---
+    let nestedBlobAccepted = false;
+    let nestedBlobSent = false;
+    const blobChan = createMockChannel();
+    const blobReceiver = new UmaiSession({
+      peerOrigin: 'http://host.example',
+      role: 'embedded',
+      maxMessageBytes: 64,
+      storage: {
+        getOutboxIds: async () => ['msg-out-blob'],
+        getMessage: async (id) => ({
+          id,
+          payload: { sneaky: new Blob([new Uint8Array(1024)]) },
+          attachments: []
+        }),
+        isAccepted: async () => false,
+        acceptMessage: async () => {
+          nestedBlobAccepted = true;
+          return true;
+        },
+        onAcknowledged: async () => {}
+      }
+    });
+    blobReceiver.port = blobChan.port1;
+    blobChan.port1.onmessage = blobReceiver._portListener;
+    blobReceiver.state = 'connected';
+
+    blobReceiver._inFlightGets.set('msg-in-blob', Date.now());
+    await blobReceiver._handlePut({
+      protocol: PROTOCOL_NAME,
+      version: PROTOCOL_VERSION,
+      type: 'PUT',
+      id: 'msg-in-blob',
+      payload: { sneaky: new Blob([new Uint8Array(1024)]) },
+      attachments: []
+    });
+    assert.strictEqual(nestedBlobAccepted, false, 'Payload containing nested Blob must be rejected before acceptMessage');
+
+    blobReceiver._inFlightGets.set('msg-in-date', Date.now());
+    await blobReceiver._handlePut({
+      protocol: PROTOCOL_NAME,
+      version: PROTOCOL_VERSION,
+      type: 'PUT',
+      id: 'msg-in-date',
+      payload: { when: new Date() },
+      attachments: []
+    });
+    assert.strictEqual(nestedBlobAccepted, false, 'Payload containing non-JSON Date object must be rejected');
+
+    await blobReceiver.reconcile();
+    await blobReceiver._handleGet({ protocol: PROTOCOL_NAME, version: PROTOCOL_VERSION, type: 'GET', ids: ['msg-out-blob'] });
+    await new Promise(r => setTimeout(r, 20));
+    nestedBlobSent = blobChan.port1.sent.some(m => m.type === 'PUT' && m.id === 'msg-out-blob');
+    assert.strictEqual(nestedBlobSent, false, 'Outgoing getMessage with nested Blob in payload must be rejected before PUT');
+    blobReceiver.stop();
+
+    // --- 8c: >1,000-entry outbox reordering, active transfer protection, stale retirement, & serialized reconcile ---
+    let currentOutbox = Array.from({ length: 1200 }, (_, i) => `msg-large-${String(i + 1).padStart(4, '0')}`);
+    let getOutboxCallCount = 0;
+    let releaseFirstGetMessage = null;
+    const fetchedLargeIds = [];
+    const largeChan = createMockChannel();
+
+    const largeSender = new UmaiSession({
+      peerOrigin: 'http://peer.example',
+      role: 'host',
+      storage: {
+        getOutboxIds: async () => {
+          getOutboxCallCount++;
+          const snapshot = currentOutbox.slice();
+          if (getOutboxCallCount === 1) {
+            // Simulate slow first snapshot while a newer reconcile() arrives with updated state
+            await new Promise(r => setTimeout(r, 25));
+          }
+          return snapshot;
+        },
+        getMessage: async (id) => {
+          fetchedLargeIds.push(id);
+          if (id === 'msg-large-0001' && !releaseFirstGetMessage) {
+            await new Promise(r => { releaseFirstGetMessage = r; });
+          }
+          return { id, payload: { id }, attachments: [] };
+        },
+        isAccepted: async () => false,
+        acceptMessage: async () => true,
+        onAcknowledged: async () => {}
+      }
+    });
+    largeSender.port = largeChan.port1;
+    largeChan.port1.onmessage = largeSender._portListener;
+    largeSender.state = 'connected';
+
+    // Trigger overlapping reconcile() calls: mutate currentOutbox before 1st resolves
+    const r1 = largeSender.reconcile(true);
+    await new Promise(r => setTimeout(r, 5));
+    const r2 = largeSender.reconcile(true);
+    await Promise.all([r1, r2]);
+
+    assert.strictEqual(largeSender._offeredIds.size, 1000, '_offeredIds must be capped at 1000');
+    // Start an active PUT on msg-large-0001
+    await largeSender._handleGet({ protocol: PROTOCOL_NAME, version: PROTOCOL_VERSION, type: 'GET', ids: ['msg-large-0001'] });
+    await new Promise(r => setTimeout(r, 10));
+    assert.strictEqual(typeof releaseFirstGetMessage, 'function', 'msg-large-0001 should be actively sending');
+
+    // Reorder the 1,200-entry outbox so msg-large-0201..1200 come first while msg-large-0001 is still active
+    currentOutbox = currentOutbox.slice(200).concat(currentOutbox.slice(0, 200));
+    largeChan.port1.sent = [];
+    await largeSender.reconcile(true);
+    const reorderedOffer = largeChan.port1.sent.find(m => m.type === 'OFFER');
+    assert.ok(reorderedOffer, 'Reordered reconcile must emit OFFER');
+    assert.strictEqual(largeSender._offeredIds.has('msg-large-0001'), true, 'Actively sending ID must remain protected in _offeredIds across reorder');
+    assert.strictEqual(largeSender._offeredIds.size <= 1000, true, '_offeredIds must never exceed 1000');
+    // Every single advertised ID in reorderedOffer.ids MUST be present in _offeredIds and fetchable!
+    for (const advId of reorderedOffer.ids) {
+      assert.strictEqual(largeSender._offeredIds.has(advId), true, `Advertised ID ${advId} must be tracked in _offeredIds`);
+    }
+    assert.ok(reorderedOffer.ids.includes('msg-large-1001'), 'Newly rotated-in ID msg-large-1001 must be advertised and fetchable');
+
+    releaseFirstGetMessage();
+    await new Promise(r => setTimeout(r, 20));
+
+    // Now remove all 1,200 IDs externally (as if another pooled browser session completed them) and add 1 new message
+    currentOutbox = ['msg-after-pool-drain-1201'];
+    largeChan.port1.sent = [];
+    await largeSender.reconcile(true);
+    await largeSender._handleGet({
+      protocol: PROTOCOL_NAME,
+      version: PROTOCOL_VERSION,
+      type: 'GET',
+      ids: ['msg-after-pool-drain-1201']
+    });
+    await new Promise(r => setTimeout(r, 20));
+    assert.ok(fetchedLargeIds.includes('msg-after-pool-drain-1201'), 'New message after 1,000+ external removals must be advertised and fetchable via GET');
+    largeSender.stop();
+
+    // --- 8d: Lifecycle-aware callback guard (stop() in onTransfer on ACK; throwing callbacks) ---
+    let onAckCalledAfterCallbackStop = false;
+    let statusCallbackSawHandshaking = false;
+    const cbChan = createMockChannel();
+    const cbSession = new UmaiSession({
+      peerOrigin: 'http://peer.example',
+      role: 'host',
+      onStatusChange: ({ state }) => {
+        if (state === 'handshaking') {
+          statusCallbackSawHandshaking = true;
+          throw new Error('Simulated status callback throw during startup');
+        }
+      },
+      onTransfer: ({ direction, type }) => {
+        if (direction === 'incoming' && type === 'ACK') {
+          cbSession.stop();
+        }
+      },
+      storage: {
+        getOutboxIds: async () => ['msg-cb-stop'],
+        getMessage: async (id) => ({ id, payload: {}, attachments: [] }),
+        isAccepted: async () => false,
+        acceptMessage: async () => true,
+        onAcknowledged: async () => {
+          onAckCalledAfterCallbackStop = true;
+        }
+      }
+    });
+    // start() transitions to 'handshaking' and invokes throwing onStatusChange -> must not abort startup!
+    cbSession.start();
+    assert.strictEqual(statusCallbackSawHandshaking, true, 'onStatusChange must run on handshaking');
+    assert.strictEqual(cbSession.state, 'handshaking', 'Throwing callback during handshaking must not corrupt startup state');
+
+    cbSession.port = cbChan.port1;
+    cbChan.port1.onmessage = cbSession._portListener;
+    cbSession.state = 'connected';
+    await cbSession.reconcile();
+
+    await cbSession._handleAck({
+      protocol: PROTOCOL_NAME,
+      version: PROTOCOL_VERSION,
+      type: 'ACK',
+      ids: ['msg-cb-stop']
+    });
+    await new Promise(r => setTimeout(r, 20));
+    assert.strictEqual(onAckCalledAfterCallbackStop, false, 'storage.onAcknowledged must NOT be called if onTransfer called stop()');
+    cbSession.stop();
+
+    // --- 8e: getTimeoutMs expiry, slot reuse for waiting messages, busy-slot protection, & late PUT admission ---
+    const acceptedLateSet = new Set();
+    let releaseHealthyAccept = null;
+    const timeoutChan = createMockChannel();
+
+    const timeoutReceiver = new UmaiSession({
+      peerOrigin: 'http://host.example',
+      role: 'embedded',
+      maxConcurrency: 1,
+      getTimeoutMs: 60,
+      storage: {
+        getOutboxIds: async () => [],
+        getMessage: async () => null,
+        isAccepted: async (id) => ({ accepted: acceptedLateSet.has(id) }),
+        acceptMessage: async (msg) => {
+          if (msg.id === 'msg-healthy' && !releaseHealthyAccept) {
+            await new Promise(r => { releaseHealthyAccept = r; });
+          }
+          acceptedLateSet.add(msg.id);
+          return { accepted: true };
+        },
+        onAcknowledged: async () => {}
+      }
+    });
+    timeoutReceiver.port = timeoutChan.port1;
+    timeoutChan.port1.onmessage = timeoutReceiver._portListener;
+    timeoutReceiver.state = 'connected';
+
+    // Offer ['msg-stalled', 'msg-healthy']. With maxConcurrency=1, only GET ['msg-stalled'] is sent initially.
+    await timeoutReceiver._handleOffer({
+      protocol: PROTOCOL_NAME,
+      version: PROTOCOL_VERSION,
+      type: 'OFFER',
+      ids: ['msg-stalled', 'msg-healthy']
+    });
+    const firstGets = timeoutChan.port1.sent.filter(m => m.type === 'GET');
+    assert.strictEqual(firstGets.length, 1);
+    assert.deepStrictEqual(firstGets[0].ids, ['msg-stalled']);
+
+    // Wait for msg-stalled's 60ms GET reservation to expire automatically via timer and reuse the slot for msg-healthy!
+    await new Promise(r => setTimeout(r, 95));
+    const allGetsAfterTimeout = timeoutChan.port1.sent.filter(m => m.type === 'GET');
+    assert.ok(
+      allGetsAfterTimeout.some(m => m.ids.includes('msg-healthy')),
+      'Expired GET reservation must release its slot so waiting msg-healthy is requested'
+    );
+
+    // Deliver msg-healthy PUT and hold it inside acceptMessage so the single slot is actively busy
+    timeoutReceiver._handlePut({
+      protocol: PROTOCOL_NAME,
+      version: PROTOCOL_VERSION,
+      type: 'PUT',
+      id: 'msg-healthy',
+      payload: { ok: 1 },
+      attachments: []
+    });
+    await new Promise(r => setTimeout(r, 15));
+    assert.strictEqual(typeof releaseHealthyAccept, 'function', 'msg-healthy should hold the active acceptance slot');
+
+    // While msg-healthy owns the slot, late PUT for msg-stalled arrives -> must be deferred without failure penalty
+    await timeoutReceiver._handlePut({
+      protocol: PROTOCOL_NAME,
+      version: PROTOCOL_VERSION,
+      type: 'PUT',
+      id: 'msg-stalled',
+      payload: { slow: true },
+      attachments: []
+    });
+    assert.strictEqual(acceptedLateSet.has('msg-stalled'), false, 'Late PUT must not exceed maxConcurrency while reused slot is busy');
+    assert.strictEqual(timeoutReceiver._failedAttempts.get('msg-stalled') || 0, 0, 'Deferred late PUT must not increment _failedAttempts');
+
+    // Now test late PUT admission when a slot IS free (slow attachment transfer completing after getTimeoutMs)
+    const soloLateChan = createMockChannel();
+    const soloLateReceiver = new UmaiSession({
+      peerOrigin: 'http://host.example',
+      role: 'embedded',
+      maxConcurrency: 1,
+      getTimeoutMs: 50,
+      storage: {
+        getOutboxIds: async () => [],
+        getMessage: async () => null,
+        isAccepted: async (id) => ({ accepted: acceptedLateSet.has(id) }),
+        acceptMessage: async (msg) => {
+          acceptedLateSet.add(msg.id);
+          return { accepted: true };
+        },
+        onAcknowledged: async () => {}
+      }
+    });
+    soloLateReceiver.port = soloLateChan.port1;
+    soloLateChan.port1.onmessage = soloLateReceiver._portListener;
+    soloLateReceiver.state = 'connected';
+
+    await soloLateReceiver._handleOffer({
+      protocol: PROTOCOL_NAME,
+      version: PROTOCOL_VERSION,
+      type: 'OFFER',
+      ids: ['msg-slow-50mb']
+    });
+    // Let 50ms GET timeout expire (and prune), then deliver the slow PUT while no other message holds the slot
+    soloLateReceiver._inFlightGets.set('msg-slow-50mb', Date.now() - 100);
+    soloLateReceiver._pruneExpiredGets();
+    // Clear any auto-requeued GET so slot is free when the slow response arrives
+    soloLateReceiver._pendingGetQueue = [];
+    await soloLateReceiver._handlePut({
+      protocol: PROTOCOL_NAME,
+      version: PROTOCOL_VERSION,
+      type: 'PUT',
+      id: 'msg-slow-50mb',
+      payload: { size: 'large' },
+      attachments: []
+    });
+    await new Promise(r => setTimeout(r, 20));
+    assert.strictEqual(acceptedLateSet.has('msg-slow-50mb'), true, 'Slow valid PUT arriving after getTimeoutMs must be accepted when slot is free');
+
+    releaseHealthyAccept();
+    await new Promise(r => setTimeout(r, 20));
+    assert.strictEqual(acceptedLateSet.has('msg-healthy'), true, 'msg-healthy must complete acceptance');
+
+    soloLateReceiver.stop();
+    timeoutReceiver.stop();
+  }
+  console.log('✓ Test 8: Bounded ACK coalescing, strict JSON payload, >1,000 outbox progress, callback stop() isolation, and late-PUT timeout handling passed');
 
   senderPoison.stop();
   receiverPoison.stop();

@@ -329,7 +329,7 @@ func TestSecurity_SignedMessages_TamperAndForgeryRejection(t *testing.T) {
 	appA := setupApp(t, "app-a", "http://127.0.0.1:8082")
 	appB := setupApp(t, "app-b", "http://127.0.0.1:8081")
 
-	_, _ = appA.Server.Storage().SaveDocument("invoice.pdf", bytes.NewReader([]byte("Original Amount: CHF 100")))
+	_, _ = appA.Server.Storage().SaveDocument("invoice.pdf", bytes.NewReader([]byte("Original Amount: EUR 100")))
 	msgA, err := appA.Server.Storage().CreateOutboxMessage(map[string]any{"amount": 100}, []string{"invoice.pdf"})
 	if err != nil {
 		t.Fatalf("CreateOutboxMessage: %v", err)
@@ -346,7 +346,7 @@ func TestSecurity_SignedMessages_TamperAndForgeryRejection(t *testing.T) {
 	_ = mw.WriteField("payload", string(pJSON))
 	_ = mw.WriteField("signature", msgA.Signature)
 	part, _ := mw.CreateFormFile("attachments", "invoice.pdf")
-	_, _ = part.Write([]byte("Tampered Amount: CHF 999999"))
+	_, _ = part.Write([]byte("Tampered Amount: EUR 999999"))
 	_ = mw.Close()
 
 	reqTamper, _ := authenticatedRequest("POST", "/api/inbox", appB.SessionID, &bufTamper, mw.FormDataContentType())
@@ -366,7 +366,7 @@ func TestSecurity_SignedMessages_TamperAndForgeryRejection(t *testing.T) {
 	_ = mwStrip.WriteField("id", msgA.ID)
 	_ = mwStrip.WriteField("payload", string(pJSON))
 	partStrip, _ := mwStrip.CreateFormFile("attachments", "invoice.pdf")
-	_, _ = partStrip.Write([]byte("Original Amount: CHF 100"))
+	_, _ = partStrip.Write([]byte("Original Amount: EUR 100"))
 	_ = mwStrip.Close()
 
 	reqStrip, _ := authenticatedRequest("POST", "/api/inbox", appB.SessionID, &bufStrip, mwStrip.FormDataContentType())
@@ -404,7 +404,7 @@ func TestSecurity_SignedMessages_TamperAndForgeryRejection(t *testing.T) {
 	_ = mwWrong.WriteField("payload", string(pJSON))
 	_ = mwWrong.WriteField("signature", sigForAppC)
 	partWrong, _ := mwWrong.CreateFormFile("attachments", "invoice.pdf")
-	_, _ = partWrong.Write([]byte("Original Amount: CHF 100"))
+	_, _ = partWrong.Write([]byte("Original Amount: EUR 100"))
 	_ = mwWrong.Close()
 
 	reqWrong, _ := authenticatedRequest("POST", "/api/inbox", appB.SessionID, &bufWrongReceiver, mwWrong.FormDataContentType())
