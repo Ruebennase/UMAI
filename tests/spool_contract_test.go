@@ -321,6 +321,7 @@ func TestSpoolHandler_CustomIdentities_RoutePrefix_CSRF_And_OctetStreamDownloads
 	pBytes, _ := json.Marshal(outMsg.Payload)
 	_ = goodMW.WriteField("payload", string(pBytes))
 	_ = goodMW.WriteField("signature", outMsg.Signature)
+	_ = goodMW.WriteField("attachment_meta", `[{"name":"preview.html"}]`)
 	part, _ := goodMW.CreateFormFile("attachments", "preview.html")
 	_, _ = part.Write(dlBytes)
 	_ = goodMW.Close()

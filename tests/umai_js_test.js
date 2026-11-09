@@ -2561,6 +2561,123 @@ function makeBatchAcceptance(fn) {
   }
   console.log('✓ Test 14: Reusable HTTP spool adapter (js/umai-spool.js) end-to-end, complete-attachment abort, and hook isolation passed');
 
+  // ===========================================================================
+  // Test 15: Stage 2C — Optional Authenticated media_type (C2) & attachment_meta
+  // ===========================================================================
+  {
+    const { createHttpSpoolAdapter, validateMediaType } = require('../js/umai-spool.js');
+
+    // 15a: validateMediaType normalization and strict rejection rules
+    assert.strictEqual(validateMediaType(undefined), '');
+    assert.strictEqual(validateMediaType('   '), '');
+    assert.strictEqual(validateMediaType('  Application/PDF '), 'application/pdf');
+    assert.strictEqual(validateMediaType('image/svg+xml'), 'image/svg+xml');
+    assert.throws(() => validateMediaType('text/plain; charset=utf-8'), /Invalid attachment media_type/);
+    assert.throws(() => validateMediaType('application/'), /Invalid attachment media_type/);
+    assert.throws(() => validateMediaType('/pdf'), /Invalid attachment media_type/);
+    assert.throws(() => validateMediaType('a/b/c'), /Invalid attachment media_type/);
+    assert.throws(() => validateMediaType('a'.repeat(120) + '/bbbbbbbbbb'), /exceeds 127/);
+
+    // 15b: getMessage reconstructs File.type strictly from att.media_type, ignoring HTTP application/octet-stream,
+    //      and acceptMessage emits 1:1 attachment_meta preserving absent vs non-empty media_type.
+    let capturedAttachmentMeta = null;
+    let capturedUploadedTypes = null;
+    const c2Adapter = createHttpSpoolAdapter({
+      baseUrl: '/api',
+      fetchImpl: async (url, init) => {
+        if (url === '/api/outbox/msg-c2') {
+          return new Response(JSON.stringify({
+            id: 'msg-c2',
+            created_at: '2026-11-09T18:00:00Z',
+            payload: { kind: 'bundle' },
+            signature: 'sig-c2',
+            attachments: [
+              { name: 'untyped.bin', size: 4, sha256: 'aa' }, // absent media_type
+              { name: 'typed.pdf', size: 5, sha256: 'bb', media_type: 'Application/PDF' }
+            ]
+          }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+        }
+        if (url === '/api/outbox/msg-c2/attachments/untyped.bin') {
+          return new Response(Buffer.from('1234'), {
+            status: 200,
+            headers: { 'Content-Type': 'application/octet-stream' }
+          });
+        }
+        if (url === '/api/outbox/msg-c2/attachments/typed.pdf') {
+          return new Response(Buffer.from('%PDF-'), {
+            status: 200,
+            headers: { 'Content-Type': 'application/octet-stream' }
+          });
+        }
+        if (url === '/api/inbox' && init.method === 'POST') {
+          capturedAttachmentMeta = JSON.parse(init.body.get('attachment_meta'));
+          const uploaded = init.body.getAll('attachments');
+          capturedUploadedTypes = uploaded.map(f => ({ name: f.name, type: f.type }));
+          return new Response(JSON.stringify({
+            accepted: true,
+            accepted_at: '2026-11-09T18:00:05Z',
+            ack_receipt: 'rcpt-c2'
+          }), { status: 200 });
+        }
+        if (url === '/api/inbox/acceptance' && init.method === 'POST') {
+          return new Response(JSON.stringify({
+            results: {
+              'msg-c2': {
+                accepted: true,
+                accepted_at: '2026-11-09T18:00:05Z',
+                ack_receipt: 'rcpt-c2'
+              }
+            }
+          }), { status: 200 });
+        }
+        throw new Error('Unexpected URL in Test 15: ' + url);
+      }
+    });
+
+    const fetched = await c2Adapter.getMessage('msg-c2');
+    assert.strictEqual(fetched.attachments.length, 2);
+    assert.strictEqual(fetched.attachments[0].name, 'untyped.bin');
+    assert.strictEqual(
+      fetched.attachments[0].type,
+      '',
+      'Absent media_type must remain "" and NEVER become application/octet-stream from HTTP download'
+    );
+    assert.strictEqual(fetched.attachments[1].name, 'typed.pdf');
+    assert.strictEqual(
+      fetched.attachments[1].type,
+      'application/pdf',
+      'Declared media_type must be normalized and reconstructed on File.type despite application/octet-stream download'
+    );
+
+    const acceptOut = await c2Adapter.acceptMessage(fetched);
+    assert.strictEqual(acceptOut.accepted, true);
+    assert.strictEqual(acceptOut.ackReceipt, 'rcpt-c2');
+    assert.strictEqual(acceptOut.acceptedAt, '2026-11-09T18:00:05Z');
+    assert.deepStrictEqual(capturedAttachmentMeta, [
+      { name: 'untyped.bin' },
+      { name: 'typed.pdf', media_type: 'application/pdf' }
+    ]);
+    assert.deepStrictEqual(capturedUploadedTypes, [
+      { name: 'untyped.bin', type: '' },
+      { name: 'typed.pdf', type: 'application/pdf' }
+    ]);
+
+    const accLookup = await c2Adapter.getAcceptance(['msg-c2']);
+    assert.strictEqual(accLookup['msg-c2'].accepted, true);
+    assert.strictEqual(accLookup['msg-c2'].acceptedAt, '2026-11-09T18:00:05Z');
+    assert.strictEqual(accLookup['msg-c2'].ackReceipt, 'rcpt-c2');
+
+    // 15c: Parameterized or malformed File.type is rejected fail-closed by acceptMessage before upload
+    const badFile = { name: 'bad.txt', type: 'text/plain; charset=utf-8', size: 1 };
+    const badRes = await c2Adapter.acceptMessage({
+      id: 'msg-bad-type',
+      payload: {},
+      attachments: [badFile]
+    });
+    assert.deepStrictEqual(badRes, { accepted: false }, 'Parameterized File.type must be rejected');
+  }
+  console.log('✓ Test 15: Optional authenticated media_type (C2), explicit attachment_meta, and accepted_at round-trip passed');
+
   senderPoison.stop();
   receiverPoison.stop();
   secSession.stop();

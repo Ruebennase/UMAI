@@ -1,6 +1,7 @@
 package umaispool
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha256"
@@ -23,39 +24,57 @@ const (
 )
 
 var (
-	ErrNotFound            = errors.New("not found")
-	ErrInvalidID           = errors.New("invalid identifier")
-	ErrAlreadyAccepted     = errors.New("message already accepted")
-	ErrTraversal           = errors.New("invalid file path / directory traversal detected")
-	ErrFileTooLarge        = errors.New("file exceeds maximum allowed size")
-	ErrDuplicateAttachment = errors.New("duplicate attachment filename in message")
-	ErrTooManyAttachments  = errors.New("too many attachments in message")
-	ErrTooManyIDs          = errors.New("batch exceeds maximum allowed message IDs")
-	ErrStorageCollision    = errors.New("storage directory collision detected")
-	ErrAlreadyPublished    = errors.New("message ID already published in outbox")
+	ErrNotFound              = errors.New("not found")
+	ErrInvalidID             = errors.New("invalid identifier")
+	ErrAlreadyAccepted       = errors.New("message already accepted")
+	ErrConflictingDuplicate  = errors.New("conflicting message content for already-accepted ID")
+	ErrInvalidAttachmentMeta = errors.New("invalid attachment_meta: must match uploaded attachments 1:1 without duplicates")
+	ErrTraversal             = errors.New("invalid file path / directory traversal detected")
+	ErrFileTooLarge          = errors.New("file exceeds maximum allowed size")
+	ErrDuplicateAttachment   = errors.New("duplicate attachment filename in message")
+	ErrTooManyAttachments    = errors.New("too many attachments in message")
+	ErrTooManyIDs            = errors.New("batch exceeds maximum allowed message IDs")
+	ErrStorageCollision      = errors.New("storage directory collision detected")
+	ErrAlreadyPublished      = errors.New("message ID already published in outbox")
+)
+
+const (
+	unsignedDigestSender   = "umai:unsigned:sender"
+	unsignedDigestReceiver = "umai:unsigned:receiver"
 )
 
 // AttachmentInfo describes a binary attachment belonging to a message.
 type AttachmentInfo struct {
-	Name   string `json:"name"`
-	Size   int64  `json:"size"`
-	SHA256 string `json:"sha256"`
+	Name      string `json:"name"`
+	Size      int64  `json:"size"`
+	SHA256    string `json:"sha256"`
+	MediaType string `json:"media_type,omitempty"`
+}
+
+// AcceptedRecord is the durable per-ID acceptance entry persisted in accepted.json.
+type AcceptedRecord struct {
+	AcceptedAt time.Time `json:"accepted_at"`
+	AckReceipt string    `json:"ack_receipt,omitempty"`
+	Digest     string    `json:"digest"`
 }
 
 // Message represents an immutable UMAI message stored in outbox or inbox.
 type Message struct {
 	ID          string           `json:"id"`
-	CreatedAt   time.Time        `json:"created_at"`
+	CreatedAt   *time.Time       `json:"created_at,omitempty"`
+	AcceptedAt  *time.Time       `json:"accepted_at,omitempty"`
 	Payload     any              `json:"payload"`
 	Attachments []AttachmentInfo `json:"attachments"`
 	Signature   string           `json:"signature,omitempty"`
 	AckReceipt  string           `json:"ack_receipt,omitempty"`
+	Digest      string           `json:"digest,omitempty"`
 }
 
 // AttachmentReader encapsulates an attachment stream for outbox publication or inbox acceptance.
 type AttachmentReader struct {
-	Name   string
-	Reader io.Reader
+	Name      string
+	MediaType string
+	Reader    io.Reader
 }
 
 // SigningConfig configures the explicit local/peer logical identities and Ed25519 keys for a spool instance.
@@ -77,9 +96,9 @@ type SigningConfig struct {
 //   - Incoming commit sequence:
 //     1. Incoming files and message.json are written and fsynced in `.staging/`.
 //     2. The staged directory is atomically renamed to `.committing/m-<sha256(id)>/` (invisible to `inbox/` consumers).
-//     3. `accepted.json` (`id -> ackReceipt`) is atomically updated and its parent directory (`dataDir`) is fsynced.
+//     3. `accepted.json` (`id -> {accepted_at, ack_receipt, digest}`) is atomically updated and its parent directory (`dataDir`) is fsynced.
 //     4. Only AFTER both `accepted.json` and `dataDir` are durable on disk is `.committing/m-<sha256(id)>/` renamed
-//     into `inbox/m-<sha256(id)>/` and `inboxDir` fsynced, promoting the ID from `pendingCommits` to `acceptedIDs`.
+//     into `inbox/m-<sha256(id)>/` and `inboxDir` fsynced, promoting the ID from `pendingCommits` to `acceptedRecords`.
 type Storage struct {
 	mu                sync.RWMutex
 	dataDir           string
@@ -89,8 +108,7 @@ type Storage struct {
 	inboxDir          string
 	acceptedFile      string
 	maxUploadSize     int64
-	acceptedIDs       map[string]bool
-	acceptedReceipts  map[string]string
+	acceptedRecords   map[string]AcceptedRecord
 	pendingCommits    map[string]*Message
 	inFlightUntil     map[string]time.Time
 	syncDirFn         func(string) error
@@ -126,18 +144,17 @@ func NewStorage(dataDir string, maxUploadSize int64) (*Storage, error) {
 	}
 
 	s := &Storage{
-		dataDir:          absDataDir,
-		stagingDir:       stagingDir,
-		committingDir:    committingDir,
-		outboxDir:        outboxDir,
-		inboxDir:         inboxDir,
-		acceptedFile:     acceptedFile,
-		maxUploadSize:    maxUploadSize,
-		acceptedIDs:      make(map[string]bool),
-		acceptedReceipts: make(map[string]string),
-		pendingCommits:   make(map[string]*Message),
-		inFlightUntil:    make(map[string]time.Time),
-		syncDirFn:        SyncDir,
+		dataDir:         absDataDir,
+		stagingDir:      stagingDir,
+		committingDir:   committingDir,
+		outboxDir:       outboxDir,
+		inboxDir:        inboxDir,
+		acceptedFile:    acceptedFile,
+		maxUploadSize:   maxUploadSize,
+		acceptedRecords: make(map[string]AcceptedRecord),
+		pendingCommits:  make(map[string]*Message),
+		inFlightUntil:   make(map[string]time.Time),
+		syncDirFn:       SyncDir,
 	}
 
 	if err := s.loadAcceptedIDs(); err != nil {
@@ -204,7 +221,33 @@ func (s *Storage) SetSigningConfig(cfg SigningConfig) error {
 	s.ownPrivKey = ownPriv
 	s.peerPubKey = peerPub
 	s.signingConfigured = true
+
+	// Backfill any recovered record whose Digest was empty at startup (before identities were configured).
+	for id, rec := range s.acceptedRecords {
+		if rec.Digest == "" {
+			if _, existing, err := s.resolveInboxDirLocked(id); err == nil && existing != nil {
+				if d, dErr := s.computeIncomingDigestLocked(id, existing.Payload, existing.Attachments); dErr == nil {
+					rec.Digest = d
+					s.acceptedRecords[id] = rec
+				}
+			}
+		}
+	}
 	return nil
+}
+
+func (s *Storage) computeIncomingDigestLocked(cleanID string, payload any, attInfos []AttachmentInfo) (string, error) {
+	sender := s.peerIdentity
+	receiver := s.localIdentity
+	if !s.signingConfigured {
+		sender = unsignedDigestSender
+		receiver = unsignedDigestReceiver
+	}
+	digest, err := CanonicalPutDigest(sender, receiver, cleanID, payload, attInfos)
+	if err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(digest[:]), nil
 }
 
 // HasSigningConfig reports whether explicit identities and Ed25519 signing/verification keys are configured.
@@ -318,12 +361,29 @@ func readMessageJSON(dirPath string) (*Message, error) {
 		return nil, err
 	}
 	var msg Message
-	if err := json.Unmarshal(data, &msg); err != nil {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
+	if err := dec.Decode(&msg); err != nil {
 		return nil, err
 	}
 	cleanID, err := SanitizeID(msg.ID)
 	if err != nil || cleanID != msg.ID {
 		return nil, ErrInvalidID
+	}
+	for i := range msg.Attachments {
+		cleanMedia, mErr := ValidateMediaType(msg.Attachments[i].MediaType)
+		if mErr != nil {
+			return nil, mErr
+		}
+		msg.Attachments[i].MediaType = cleanMedia
+	}
+	if msg.CreatedAt != nil {
+		utc := msg.CreatedAt.UTC()
+		msg.CreatedAt = &utc
+	}
+	if msg.AcceptedAt != nil {
+		utc := msg.AcceptedAt.UTC()
+		msg.AcceptedAt = &utc
 	}
 	return &msg, nil
 }
@@ -423,11 +483,20 @@ func (s *Storage) CreateOutboxMessageWithID(id string, payload any, attachments 
 			_ = os.RemoveAll(tmpDir)
 			return nil, err
 		}
+		cleanMedia, err := ValidateMediaType(att.MediaType)
+		if err != nil {
+			_ = os.RemoveAll(tmpDir)
+			return nil, err
+		}
 		if seenNames[cleanName] {
 			_ = os.RemoveAll(tmpDir)
 			return nil, fmt.Errorf("%w: %s", ErrDuplicateAttachment, cleanName)
 		}
 		seenNames[cleanName] = true
+		if att.Reader == nil {
+			_ = os.RemoveAll(tmpDir)
+			return nil, fmt.Errorf("nil reader for attachment %s", cleanName)
+		}
 
 		dstPath := filepath.Join(attachmentsDir, cleanName)
 		dstFile, err := os.OpenFile(dstPath, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0600)
@@ -464,9 +533,10 @@ func (s *Storage) CreateOutboxMessageWithID(id string, payload any, attachments 
 		}
 
 		attInfos = append(attInfos, AttachmentInfo{
-			Name:   cleanName,
-			Size:   n,
-			SHA256: hex.EncodeToString(hasher.Sum(nil)),
+			Name:      cleanName,
+			Size:      n,
+			SHA256:    hex.EncodeToString(hasher.Sum(nil)),
+			MediaType: cleanMedia,
 		})
 	}
 
@@ -485,9 +555,10 @@ func (s *Storage) CreateOutboxMessageWithID(id string, payload any, attachments 
 		}
 	}
 
+	createdAt := time.Now().UTC()
 	msg := &Message{
 		ID:          msgID,
-		CreatedAt:   time.Now().UTC(),
+		CreatedAt:   &createdAt,
 		Payload:     payload,
 		Attachments: attInfos,
 		Signature:   sigHex,
@@ -751,10 +822,11 @@ func (s *Storage) AcknowledgeMessagesVerified(ids []string, receipts map[string]
 // Inbox & Acceptance Management (Rules 3, 4, 5)
 // -----------------------------------------------------------------------------
 
-// AcceptanceStatus represents the durable acceptance status and optional signed receipt for a message ID.
+// AcceptanceStatus represents the durable acceptance status, timestamp, and optional signed receipt for a message ID.
 type AcceptanceStatus struct {
-	Accepted   bool   `json:"accepted"`
-	AckReceipt string `json:"ack_receipt,omitempty"`
+	Accepted   bool       `json:"accepted"`
+	AcceptedAt *time.Time `json:"accepted_at,omitempty"`
+	AckReceipt string     `json:"ack_receipt,omitempty"`
 }
 
 // IsAccepted returns true if the message ID has already been durably accepted.
@@ -765,7 +837,20 @@ func (s *Storage) IsAccepted(id string) bool {
 	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.acceptedIDs[cleanID]
+	_, ok := s.acceptedRecords[cleanID]
+	return ok
+}
+
+// GetAcceptedRecord returns the full AcceptedRecord for a confirmed message ID if present.
+func (s *Storage) GetAcceptedRecord(id string) (AcceptedRecord, bool) {
+	cleanID, err := SanitizeID(id)
+	if err != nil {
+		return AcceptedRecord{}, false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	rec, ok := s.acceptedRecords[cleanID]
+	return rec, ok
 }
 
 // GetAcceptance checks a bounded batch of message IDs and returns an explicit AcceptanceStatus
@@ -818,18 +903,21 @@ func (s *Storage) buildAcceptanceMapLocked(cleanIDs []string) map[string]Accepta
 		if _, exists := results[id]; exists {
 			continue
 		}
-		if !s.acceptedIDs[id] {
+		rec, ok := s.acceptedRecords[id]
+		if !ok {
 			results[id] = AcceptanceStatus{Accepted: false}
 			continue
 		}
-		receipt := s.acceptedReceipts[id]
+		receipt := rec.AckReceipt
 		if receipt == "" {
 			if _, m, err := s.resolveInboxDirLocked(id); err == nil && m != nil && m.AckReceipt != "" {
 				receipt = m.AckReceipt
 			}
 		}
+		ts := rec.AcceptedAt.UTC()
 		results[id] = AcceptanceStatus{
 			Accepted:   true,
+			AcceptedAt: &ts,
 			AckReceipt: receipt,
 		}
 	}
@@ -842,7 +930,7 @@ func (s *Storage) ListAccepted() []string {
 	defer s.mu.RUnlock()
 
 	var ids []string
-	for id := range s.acceptedIDs {
+	for id := range s.acceptedRecords {
 		ids = append(ids, id)
 	}
 	return ids
@@ -853,10 +941,10 @@ func (s *Storage) ListAcceptedReceipts() map[string]string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	receipts := make(map[string]string, len(s.acceptedIDs))
-	for id := range s.acceptedIDs {
-		if r, ok := s.acceptedReceipts[id]; ok && r != "" {
-			receipts[id] = r
+	receipts := make(map[string]string, len(s.acceptedRecords))
+	for id, rec := range s.acceptedRecords {
+		if rec.AckReceipt != "" {
+			receipts[id] = rec.AckReceipt
 			continue
 		}
 		if _, m, err := s.resolveInboxDirLocked(id); err == nil && m != nil && m.AckReceipt != "" {
@@ -866,6 +954,18 @@ func (s *Storage) ListAcceptedReceipts() map[string]string {
 		receipts[id] = ""
 	}
 	return receipts
+}
+
+// ListAcceptedRecords returns a copy of all confirmed AcceptedRecord entries.
+func (s *Storage) ListAcceptedRecords() map[string]AcceptedRecord {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	out := make(map[string]AcceptedRecord, len(s.acceptedRecords))
+	for id, rec := range s.acceptedRecords {
+		out[id] = rec
+	}
+	return out
 }
 
 // ListInbox returns all confirmed accepted messages currently stored in inbox.
@@ -892,7 +992,7 @@ func (s *Storage) ListInbox() ([]*Message, error) {
 		if dirName != storageDirKey(msg.ID) {
 			continue
 		}
-		if !s.acceptedIDs[msg.ID] || seenIDs[msg.ID] {
+		if _, ok := s.acceptedRecords[msg.ID]; !ok || seenIDs[msg.ID] {
 			continue
 		}
 		seenIDs[msg.ID] = true
@@ -912,7 +1012,7 @@ func (s *Storage) GetInboxMessage(id string) (*Message, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	if !s.acceptedIDs[cleanID] {
+	if _, ok := s.acceptedRecords[cleanID]; !ok {
 		return nil, ErrNotFound
 	}
 	_, msg, err := s.resolveInboxDirLocked(cleanID)
@@ -936,7 +1036,7 @@ func (s *Storage) GetInboxAttachmentPath(id, filename string) (string, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	if !s.acceptedIDs[cleanID] {
+	if _, ok := s.acceptedRecords[cleanID]; !ok {
 		return "", ErrNotFound
 	}
 	msgDir, _, err := s.resolveInboxDirLocked(cleanID)
@@ -961,6 +1061,85 @@ func (s *Storage) AcceptMessage(id string, payload any, attachments []Attachment
 // strictly requiring configured signing keys and verifying the sender's Ed25519 signature (fail-closed).
 func (s *Storage) AcceptSignedMessage(id string, payload any, attachments []AttachmentReader, sigHex string) (*Message, error) {
 	return s.acceptMessageInternal(id, payload, attachments, sigHex, true)
+}
+
+func (s *Storage) hashIncomingCandidateLocked(cleanID string, payload any, attachments []AttachmentReader) ([]AttachmentInfo, string, error) {
+	if len(attachments) > MaxAttachmentsPerMessage {
+		return nil, "", ErrTooManyAttachments
+	}
+	var attInfos []AttachmentInfo
+	seenNames := make(map[string]bool)
+	for _, att := range attachments {
+		cleanName, err := SanitizeFilename(att.Name)
+		if err != nil {
+			return nil, "", err
+		}
+		cleanMedia, err := ValidateMediaType(att.MediaType)
+		if err != nil {
+			return nil, "", err
+		}
+		if seenNames[cleanName] {
+			return nil, "", fmt.Errorf("%w: %s", ErrDuplicateAttachment, cleanName)
+		}
+		seenNames[cleanName] = true
+		if att.Reader == nil {
+			return nil, "", fmt.Errorf("nil reader for attachment %s", cleanName)
+		}
+
+		hasher := sha256.New()
+		limitReader := io.LimitReader(att.Reader, s.maxUploadSize+1)
+		n, err := io.Copy(hasher, limitReader)
+		if err != nil {
+			return nil, "", err
+		}
+		if n > s.maxUploadSize {
+			return nil, "", ErrFileTooLarge
+		}
+		attInfos = append(attInfos, AttachmentInfo{
+			Name:      cleanName,
+			Size:      n,
+			SHA256:    hex.EncodeToString(hasher.Sum(nil)),
+			MediaType: cleanMedia,
+		})
+	}
+	incomingDigest, err := s.computeIncomingDigestLocked(cleanID, payload, attInfos)
+	if err != nil {
+		return nil, "", err
+	}
+	return attInfos, incomingDigest, nil
+}
+
+func (s *Storage) verifyDuplicateCandidateLocked(
+	cleanID string,
+	payload any,
+	attachments []AttachmentReader,
+	sigHex string,
+	requireSignature bool,
+	expectedDigest string,
+	expectedReceipt string,
+) ([]AttachmentInfo, error) {
+	attInfos, incomingDigest, err := s.hashIncomingCandidateLocked(cleanID, payload, attachments)
+	if err != nil {
+		return nil, err
+	}
+
+	if (requireSignature || strings.TrimSpace(sigHex) != "") && s.signingConfigured {
+		if err := VerifyPutMessage(s.peerPubKey, s.peerIdentity, s.localIdentity, cleanID, payload, attInfos, sigHex); err != nil {
+			return nil, err
+		}
+	}
+
+	if expectedDigest == "" || !strings.EqualFold(incomingDigest, expectedDigest) {
+		return nil, ErrConflictingDuplicate
+	}
+
+	if (requireSignature || strings.TrimSpace(sigHex) != "") && s.signingConfigured && expectedReceipt != "" {
+		if err := VerifyAckReceipt(s.ownPubKey, s.localIdentity, cleanID, strings.TrimSpace(sigHex), expectedReceipt); err != nil {
+			return nil, ErrInvalidSignature
+		}
+	}
+
+	return attInfos, nil
 }
 
 func (s *Storage) acceptMessageInternal(id string, payload any, attachments []AttachmentReader, sigHex string, requireSignature bool) (*Message, error) {
@@ -988,43 +1167,55 @@ func (s *Storage) acceptMessageInternal(id string, payload any, attachments []At
 	targetDir := filepath.Join(s.inboxDir, dirKey)
 
 	// 0. Unresolved durability check: if accepted.json was previously renamed on disk for this ID
-	//    but directory synchronization or inbox exposure failed, verify signature match and retry finalization.
+	//    but directory synchronization or inbox exposure failed, verify full content + signature match
+	//    and retry finalization.
 	if pendingMsg, isPending := s.pendingCommits[cleanID]; isPending {
-		if (requireSignature || sigHex != "") && s.signingConfigured {
-			if pendingMsg.Signature == "" || !strings.EqualFold(strings.TrimSpace(pendingMsg.Signature), strings.TrimSpace(sigHex)) {
-				return nil, ErrInvalidSignature
-			}
+		expectedDigest := pendingMsg.Digest
+		if expectedDigest == "" {
+			expectedDigest, _ = s.computeIncomingDigestLocked(cleanID, pendingMsg.Payload, pendingMsg.Attachments)
+		}
+		if _, err := s.verifyDuplicateCandidateLocked(cleanID, payload, attachments, sigHex, requireSignature, expectedDigest, pendingMsg.AckReceipt); err != nil {
+			return nil, err
 		}
 		return s.finalizePendingCommitLocked(cleanID)
 	}
 
-	// 1. Confirmed duplicate check: if already durably accepted, verify signature match (when required)
-	//    and return the stored message / receipt without re-importing or overwriting anything.
-	if s.acceptedIDs[cleanID] {
+	// 1. Confirmed duplicate check: applies identically whether inbox/m-<sha256(id)> still exists on disk
+	//    or has already been archived/deleted by a downstream consumer.
+	if rec, isAccepted := s.acceptedRecords[cleanID]; isAccepted {
 		_, existing, resolveErr := s.resolveInboxDirLocked(cleanID)
+		expectedDigest := rec.Digest
+		if expectedDigest == "" && resolveErr == nil && existing != nil {
+			expectedDigest, _ = s.computeIncomingDigestLocked(cleanID, existing.Payload, existing.Attachments)
+			if expectedDigest != "" {
+				rec.Digest = expectedDigest
+				s.acceptedRecords[cleanID] = rec
+			}
+		}
+		attInfos, err := s.verifyDuplicateCandidateLocked(cleanID, payload, attachments, sigHex, requireSignature, expectedDigest, rec.AckReceipt)
+		if err != nil {
+			return nil, err
+		}
+
+		origAcceptedAt := rec.AcceptedAt.UTC()
 		if resolveErr == nil && existing != nil {
-			if (requireSignature || sigHex != "") && s.signingConfigured {
-				if existing.Signature == "" || !strings.EqualFold(strings.TrimSpace(existing.Signature), strings.TrimSpace(sigHex)) {
-					return nil, ErrInvalidSignature
-				}
+			if existing.AcceptedAt == nil {
+				existing.AcceptedAt = &origAcceptedAt
+			}
+			if existing.AckReceipt == "" {
+				existing.AckReceipt = rec.AckReceipt
 			}
 			return existing, nil
 		}
 
-		storedReceipt := s.acceptedReceipts[cleanID]
-		if (requireSignature || sigHex != "") && s.signingConfigured {
-			if strings.TrimSpace(sigHex) == "" || len(s.ownPubKey) == 0 || storedReceipt == "" {
-				return nil, ErrInvalidSignature
-			}
-			if err := VerifyAckReceipt(s.ownPubKey, s.localIdentity, cleanID, strings.TrimSpace(sigHex), storedReceipt); err != nil {
-				return nil, ErrInvalidSignature
-			}
-		}
 		return &Message{
-			ID:         cleanID,
-			Payload:    payload,
-			Signature:  sigHex,
-			AckReceipt: storedReceipt,
+			ID:          cleanID,
+			AcceptedAt:  &origAcceptedAt,
+			Payload:     payload,
+			Attachments: attInfos,
+			Signature:   strings.TrimSpace(sigHex),
+			AckReceipt:  rec.AckReceipt,
+			Digest:      expectedDigest,
 		}, nil
 	}
 
@@ -1034,12 +1225,29 @@ func (s *Storage) acceptMessageInternal(id string, payload any, attachments []At
 		if readErr != nil || existing.ID != cleanID {
 			return nil, ErrStorageCollision
 		}
-		if (requireSignature || sigHex != "") && s.signingConfigured {
-			if existing.Signature == "" || !strings.EqualFold(strings.TrimSpace(existing.Signature), strings.TrimSpace(sigHex)) {
-				return nil, ErrInvalidSignature
+		existingDigest := existing.Digest
+		if existingDigest == "" {
+			existingDigest, err = s.computeIncomingDigestLocked(existing.ID, existing.Payload, existing.Attachments)
+			if err != nil {
+				return nil, err
 			}
+			existing.Digest = existingDigest
 		}
-		renamedOnDisk, pErr := s.persistAcceptedIDsWithCandidateLocked(cleanID, existing.AckReceipt)
+		if _, err := s.verifyDuplicateCandidateLocked(cleanID, payload, attachments, sigHex, requireSignature, existingDigest, existing.AckReceipt); err != nil {
+			return nil, err
+		}
+		acceptedAt := time.Now().UTC()
+		if existing.AcceptedAt != nil && !existing.AcceptedAt.IsZero() {
+			acceptedAt = existing.AcceptedAt.UTC()
+		}
+		existing.AcceptedAt = &acceptedAt
+
+		candidateRec := AcceptedRecord{
+			AcceptedAt: acceptedAt,
+			AckReceipt: existing.AckReceipt,
+			Digest:     existingDigest,
+		}
+		renamedOnDisk, pErr := s.persistAcceptedRecordsWithCandidateLocked(cleanID, &candidateRec)
 		if pErr != nil {
 			if renamedOnDisk {
 				s.pendingCommits[cleanID] = existing
@@ -1079,11 +1287,20 @@ func (s *Storage) acceptMessageInternal(id string, payload any, attachments []At
 			_ = os.RemoveAll(tmpDir)
 			return nil, err
 		}
+		cleanMedia, err := ValidateMediaType(att.MediaType)
+		if err != nil {
+			_ = os.RemoveAll(tmpDir)
+			return nil, err
+		}
 		if seenNames[cleanName] {
 			_ = os.RemoveAll(tmpDir)
 			return nil, fmt.Errorf("%w: %s", ErrDuplicateAttachment, cleanName)
 		}
 		seenNames[cleanName] = true
+		if att.Reader == nil {
+			_ = os.RemoveAll(tmpDir)
+			return nil, fmt.Errorf("nil reader for attachment %s", cleanName)
+		}
 
 		dstPath := filepath.Join(tmpAttachmentsDir, cleanName)
 		dstFile, err := os.OpenFile(dstPath, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0600)
@@ -1121,9 +1338,10 @@ func (s *Storage) acceptMessageInternal(id string, payload any, attachments []At
 		}
 
 		attInfos = append(attInfos, AttachmentInfo{
-			Name:   cleanName,
-			Size:   n,
-			SHA256: hex.EncodeToString(hasher.Sum(nil)),
+			Name:      cleanName,
+			Size:      n,
+			SHA256:    hex.EncodeToString(hasher.Sum(nil)),
+			MediaType: cleanMedia,
 		})
 	}
 	if err := s.syncDirLocked(tmpAttachmentsDir); err != nil {
@@ -1131,11 +1349,17 @@ func (s *Storage) acceptMessageInternal(id string, payload any, attachments []At
 		return nil, err
 	}
 
-	if (requireSignature || sigHex != "") && s.signingConfigured {
+	if (requireSignature || strings.TrimSpace(sigHex) != "") && s.signingConfigured {
 		if err := VerifyPutMessage(s.peerPubKey, s.peerIdentity, s.localIdentity, cleanID, payload, attInfos, sigHex); err != nil {
 			_ = os.RemoveAll(tmpDir)
 			return nil, err
 		}
+	}
+
+	incomingDigest, err := s.computeIncomingDigestLocked(cleanID, payload, attInfos)
+	if err != nil {
+		_ = os.RemoveAll(tmpDir)
+		return nil, err
 	}
 
 	ackReceipt := ""
@@ -1147,13 +1371,15 @@ func (s *Storage) acceptMessageInternal(id string, payload any, attachments []At
 		}
 	}
 
+	acceptedAt := time.Now().UTC()
 	msg := &Message{
 		ID:          cleanID,
-		CreatedAt:   time.Now().UTC(),
+		AcceptedAt:  &acceptedAt,
 		Payload:     payload,
 		Attachments: attInfos,
-		Signature:   sigHex,
+		Signature:   strings.TrimSpace(sigHex),
 		AckReceipt:  ackReceipt,
+		Digest:      incomingDigest,
 	}
 
 	if _, err := s.writeAtomicJSONWithCommitState(filepath.Join(tmpDir, "message.json"), msg); err != nil {
@@ -1179,8 +1405,13 @@ func (s *Storage) acceptMessageInternal(id string, payload any, attachments []At
 		return nil, err
 	}
 
-	// 5. Persist consolidated accepted.json (id -> ackReceipt) and synchronize dataDir BEFORE exposing inbox/.
-	renamedOnDisk, err := s.persistAcceptedIDsWithCandidateLocked(cleanID, ackReceipt)
+	// 5. Persist consolidated accepted.json (id -> {accepted_at, ack_receipt, digest}) and synchronize dataDir BEFORE exposing inbox/.
+	candidateRec := AcceptedRecord{
+		AcceptedAt: acceptedAt,
+		AckReceipt: ackReceipt,
+		Digest:     incomingDigest,
+	}
+	renamedOnDisk, err := s.persistAcceptedRecordsWithCandidateLocked(cleanID, &candidateRec)
 	if err != nil {
 		if !renamedOnDisk {
 			_ = os.RemoveAll(committingPath)
@@ -1191,7 +1422,7 @@ func (s *Storage) acceptMessageInternal(id string, payload any, attachments []At
 		return nil, fmt.Errorf("syncing accepted ID index: %w", err)
 	}
 
-	// 6. Finalize inbox exposure + directory synchronization before confirming acceptedIDs[cleanID] = true.
+	// 6. Finalize inbox exposure + directory synchronization before confirming acceptedRecords[cleanID].
 	s.pendingCommits[cleanID] = msg
 	return s.finalizePendingCommitLocked(cleanID)
 }
@@ -1226,8 +1457,22 @@ func (s *Storage) finalizePendingCommitLocked(cleanID string) (*Message, error) 
 	}
 	_ = s.syncDirLocked(s.committingDir)
 
-	s.acceptedIDs[cleanID] = true
-	s.acceptedReceipts[cleanID] = pendingMsg.AckReceipt
+	acceptedAt := time.Now().UTC()
+	if pendingMsg.AcceptedAt != nil && !pendingMsg.AcceptedAt.IsZero() {
+		acceptedAt = pendingMsg.AcceptedAt.UTC()
+	}
+	pendingMsg.AcceptedAt = &acceptedAt
+
+	digest := pendingMsg.Digest
+	if digest == "" {
+		digest, _ = s.computeIncomingDigestLocked(cleanID, pendingMsg.Payload, pendingMsg.Attachments)
+	}
+
+	s.acceptedRecords[cleanID] = AcceptedRecord{
+		AcceptedAt: acceptedAt,
+		AckReceipt: pendingMsg.AckReceipt,
+		Digest:     digest,
+	}
 	delete(s.pendingCommits, cleanID)
 	return pendingMsg, nil
 }
@@ -1251,20 +1496,24 @@ func (s *Storage) loadAcceptedIDs() error {
 	}
 	if err == nil {
 		loadedIndexFile = true
-		var mapFormat map[string]string
+		var mapFormat map[string]AcceptedRecord
 		if err := json.Unmarshal(data, &mapFormat); err != nil || mapFormat == nil {
 			if err != nil {
 				return err
 			}
 			return errors.New("invalid accepted.json format")
 		}
-		for id, receipt := range mapFormat {
-			if clean, err := SanitizeID(id); err == nil {
-				s.acceptedIDs[clean] = true
-				if receipt != "" {
-					s.acceptedReceipts[clean] = receipt
-				}
+		for id, rec := range mapFormat {
+			clean, err := SanitizeID(id)
+			if err != nil || clean != id {
+				return ErrInvalidID
 			}
+			if rec.AcceptedAt.IsZero() {
+				rec.AcceptedAt = time.Now().UTC()
+			} else {
+				rec.AcceptedAt = rec.AcceptedAt.UTC()
+			}
+			s.acceptedRecords[clean] = rec
 		}
 	}
 
@@ -1285,26 +1534,37 @@ func (s *Storage) loadAcceptedIDs() error {
 				continue
 			}
 			msg, readErr := readMessageJSON(commPath)
-			if readErr == nil && entry.Name() == storageDirKey(msg.ID) && s.acceptedIDs[msg.ID] {
-				if msg.AckReceipt != "" && s.acceptedReceipts[msg.ID] == "" {
-					s.acceptedReceipts[msg.ID] = msg.AckReceipt
-					needsPersist = true
-				}
-				dstInbox := filepath.Join(s.inboxDir, entry.Name())
-				if _, statErr := os.Stat(dstInbox); os.IsNotExist(statErr) {
-					if renErr := os.Rename(commPath, dstInbox); renErr != nil {
-						return renErr
+			if readErr == nil && entry.Name() == storageDirKey(msg.ID) {
+				if rec, ok := s.acceptedRecords[msg.ID]; ok {
+					updated := false
+					if msg.AckReceipt != "" && rec.AckReceipt == "" {
+						rec.AckReceipt = msg.AckReceipt
+						updated = true
 					}
-					commChanged = true
-					inboxChanged = true
-				} else if statErr == nil {
-					_ = os.RemoveAll(commPath)
-					commChanged = true
+					if msg.Digest != "" && rec.Digest == "" {
+						rec.Digest = msg.Digest
+						updated = true
+					}
+					if updated {
+						s.acceptedRecords[msg.ID] = rec
+						needsPersist = true
+					}
+					dstInbox := filepath.Join(s.inboxDir, entry.Name())
+					if _, statErr := os.Stat(dstInbox); os.IsNotExist(statErr) {
+						if renErr := os.Rename(commPath, dstInbox); renErr != nil {
+							return renErr
+						}
+						commChanged = true
+						inboxChanged = true
+					} else if statErr == nil {
+						_ = os.RemoveAll(commPath)
+						commChanged = true
+					}
+					continue
 				}
-			} else {
-				_ = os.RemoveAll(commPath)
-				commChanged = true
 			}
+			_ = os.RemoveAll(commPath)
+			commChanged = true
 		}
 		if inboxChanged {
 			if err := s.syncDirLocked(s.inboxDir); err != nil {
@@ -1331,35 +1591,66 @@ func (s *Storage) loadAcceptedIDs() error {
 			if dirName != storageDirKey(msg.ID) {
 				continue
 			}
-			if msg.AckReceipt != "" && s.acceptedReceipts[msg.ID] == "" {
-				s.acceptedReceipts[msg.ID] = msg.AckReceipt
+			rec, exists := s.acceptedRecords[msg.ID]
+			if !exists {
+				acceptedAt := time.Now().UTC()
+				if msg.AcceptedAt != nil && !msg.AcceptedAt.IsZero() {
+					acceptedAt = msg.AcceptedAt.UTC()
+				}
+				rec = AcceptedRecord{
+					AcceptedAt: acceptedAt,
+					AckReceipt: msg.AckReceipt,
+					Digest:     msg.Digest,
+				}
+				s.acceptedRecords[msg.ID] = rec
 				needsPersist = true
+				continue
 			}
-			if !s.acceptedIDs[msg.ID] {
-				s.acceptedIDs[msg.ID] = true
+			updated := false
+			if msg.AckReceipt != "" && rec.AckReceipt == "" {
+				rec.AckReceipt = msg.AckReceipt
+				updated = true
+			}
+			if msg.Digest != "" && rec.Digest == "" {
+				rec.Digest = msg.Digest
+				updated = true
+			}
+			if updated {
+				s.acceptedRecords[msg.ID] = rec
 				needsPersist = true
 			}
 		}
 	}
 
 	if needsPersist {
-		if _, err := s.persistAcceptedIDsWithCandidateLocked("", ""); err != nil {
+		if _, err := s.persistAcceptedRecordsWithCandidateLocked("", nil); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (s *Storage) persistAcceptedIDsWithCandidateLocked(candidateID string, candidateReceipt string) (bool, error) {
-	consolidated := make(map[string]string, len(s.acceptedIDs)+len(s.pendingCommits)+1)
-	for id := range s.acceptedIDs {
-		consolidated[id] = s.acceptedReceipts[id]
+func (s *Storage) persistAcceptedRecordsWithCandidateLocked(candidateID string, candidate *AcceptedRecord) (bool, error) {
+	consolidated := make(map[string]AcceptedRecord, len(s.acceptedRecords)+len(s.pendingCommits)+1)
+	for id, rec := range s.acceptedRecords {
+		rec.AcceptedAt = rec.AcceptedAt.UTC()
+		consolidated[id] = rec
 	}
 	for id, pending := range s.pendingCommits {
-		consolidated[id] = pending.AckReceipt
+		acceptedAt := time.Now().UTC()
+		if pending.AcceptedAt != nil && !pending.AcceptedAt.IsZero() {
+			acceptedAt = pending.AcceptedAt.UTC()
+		}
+		consolidated[id] = AcceptedRecord{
+			AcceptedAt: acceptedAt,
+			AckReceipt: pending.AckReceipt,
+			Digest:     pending.Digest,
+		}
 	}
-	if candidateID != "" {
-		consolidated[candidateID] = candidateReceipt
+	if candidateID != "" && candidate != nil {
+		c := *candidate
+		c.AcceptedAt = c.AcceptedAt.UTC()
+		consolidated[candidateID] = c
 	}
 	return s.writeAtomicJSONWithCommitState(s.acceptedFile, consolidated)
 }

@@ -69,6 +69,7 @@ func runPublish(args []string, stdout, stderr io.Writer) int {
 		payloadStr     string
 		payloadFile    string
 		attachPaths    stringSliceFlag
+		attachTypes    stringSliceFlag
 		maxAttachBytes int64
 		senderID       string
 		receiverID     string
@@ -82,6 +83,7 @@ func runPublish(args []string, stdout, stderr io.Writer) int {
 	fs.StringVar(&payloadStr, "payload", "", "Inline JSON payload string (defaults to {})")
 	fs.StringVar(&payloadFile, "payload-file", "", "Path to a JSON payload file")
 	fs.Var(&attachPaths, "attach", "Path to an attachment file (repeatable)")
+	fs.Var(&attachTypes, "attach-type", "Optional media_type for an attachment as <filename>=<type/subtype> (repeatable)")
 	fs.Int64Var(&maxAttachBytes, "max-attachment-bytes", 100*1024*1024, "Maximum size per attachment in bytes")
 	fs.StringVar(&senderID, "sender", os.Getenv("UMAI_LOCAL_IDENTITY"), "Local sender identity (or UMAI_LOCAL_IDENTITY)")
 	fs.StringVar(&receiverID, "receiver", os.Getenv("UMAI_PEER_IDENTITY"), "Intended peer receiver identity (or UMAI_PEER_IDENTITY)")
@@ -159,6 +161,30 @@ func runPublish(args []string, stdout, stderr io.Writer) int {
 		}
 	}
 
+	typeMap := make(map[string]string, len(attachTypes))
+	for _, spec := range attachTypes {
+		eq := strings.IndexByte(spec, '=')
+		if eq <= 0 || eq == len(spec)-1 {
+			fmt.Fprintf(stderr, "umai-spool publish: invalid -attach-type %q (expected <filename>=<type/subtype>)\n", spec)
+			return 2
+		}
+		cleanName, err := umaispool.SanitizeFilename(spec[:eq])
+		if err != nil {
+			fmt.Fprintf(stderr, "umai-spool publish: invalid attachment name in -attach-type %q: %v\n", spec, err)
+			return 2
+		}
+		cleanType, err := umaispool.ValidateMediaType(spec[eq+1:])
+		if err != nil {
+			fmt.Fprintf(stderr, "umai-spool publish: invalid media_type in -attach-type %q: %v\n", spec, err)
+			return 2
+		}
+		if _, exists := typeMap[cleanName]; exists {
+			fmt.Fprintf(stderr, "umai-spool publish: duplicate -attach-type for %q\n", cleanName)
+			return 2
+		}
+		typeMap[cleanName] = cleanType
+	}
+
 	var openFiles []*os.File
 	defer func() {
 		for _, f := range openFiles {
@@ -167,6 +193,7 @@ func runPublish(args []string, stdout, stderr io.Writer) int {
 	}()
 
 	attachments := make([]umaispool.AttachmentReader, 0, len(attachPaths))
+	seenAttachNames := make(map[string]bool, len(attachPaths))
 	for _, p := range attachPaths {
 		f, err := os.Open(p)
 		if err != nil {
@@ -183,10 +210,24 @@ func runPublish(args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintf(stderr, "umai-spool publish: attachment %q must be a regular file\n", p)
 			return 2
 		}
+		baseName := filepath.Base(p)
+		cleanBase, err := umaispool.SanitizeFilename(baseName)
+		if err != nil {
+			fmt.Fprintf(stderr, "umai-spool publish: invalid attachment name %q: %v\n", baseName, err)
+			return 2
+		}
+		seenAttachNames[cleanBase] = true
 		attachments = append(attachments, umaispool.AttachmentReader{
-			Name:   filepath.Base(p),
-			Reader: f,
+			Name:      cleanBase,
+			MediaType: typeMap[cleanBase],
+			Reader:    f,
 		})
+	}
+	for name := range typeMap {
+		if !seenAttachNames[name] {
+			fmt.Fprintf(stderr, "umai-spool publish: -attach-type specified for %q which was not passed via -attach\n", name)
+			return 2
+		}
 	}
 
 	msg, err := umaispool.Publish(umaispool.PublishRequest{

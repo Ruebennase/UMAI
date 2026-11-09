@@ -54,6 +54,7 @@ func TestMandatory_LostACKVerification(t *testing.T) {
 	pJSON, _ := json.Marshal(msgA.Payload)
 	_ = mw.WriteField("payload", string(pJSON))
 	_ = mw.WriteField("signature", msgA.Signature)
+	_ = mw.WriteField("attachment_meta", `[{"name":"contract.pdf"}]`)
 	part, _ := mw.CreateFormFile("attachments", "contract.pdf")
 	_, _ = part.Write(fileData)
 	_ = mw.Close()

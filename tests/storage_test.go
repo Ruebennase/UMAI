@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/umai-protocol/umai/internal/demoapp"
 	"github.com/umai-protocol/umai/pkg/umaispool"
@@ -423,10 +424,16 @@ func TestStorage_IndexWriteFailure_CommitRecovery_And_HotFolderDeletion(t *testi
 	if gotRec := storeAfterConsume.ListAcceptedReceipts()[msgID]; gotRec != acceptedMsg.AckReceipt {
 		t.Fatalf("Expected preserved AckReceipt %q after hot-folder deletion, got %q", acceptedMsg.AckReceipt, gotRec)
 	}
-	// Duplicate signed PUT with matching signature must return stored receipt, while forged signature must fail
-	dupMsg, err := storeAfterConsume.AcceptSignedMessage(msgID, payload, nil, sigHex)
+	// Duplicate signed PUT with matching content & signature must return stored receipt and original accepted_at,
+	// while forged signature or conflicting content must fail without modifying existing acceptance.
+	dupMsg, err := storeAfterConsume.AcceptSignedMessage(msgID, payload, []umaispool.AttachmentReader{
+		{Name: "doc.bin", Reader: bytes.NewReader(attBytes)},
+	}, sigHex)
 	if err != nil || dupMsg.AckReceipt != acceptedMsg.AckReceipt {
 		t.Fatalf("Expected duplicate signed PUT after hot-folder deletion to return stored receipt, got err=%v", err)
+	}
+	if dupMsg.AcceptedAt == nil || acceptedMsg.AcceptedAt == nil || !dupMsg.AcceptedAt.Equal(*acceptedMsg.AcceptedAt) {
+		t.Fatalf("Expected duplicate PUT to preserve original AcceptedAt (%v), got %v", acceptedMsg.AcceptedAt, dupMsg.AcceptedAt)
 	}
 	if _, err := storeAfterConsume.AcceptSignedMessage(msgID, payload, nil, "deadbeef"); err == nil {
 		t.Fatalf("Expected forged signature on already-archived message ID to be rejected")
@@ -437,15 +444,26 @@ func TestStorage_IndexWriteFailure_CommitRecovery_And_HotFolderDeletion(t *testi
 	crashKey, _ := umaispool.StorageDirKey(crashID)
 	commPath := filepath.Join(tmpDir, ".committing", crashKey)
 	_ = os.MkdirAll(filepath.Join(commPath, "attachments"), 0700)
+	crashPayload := map[string]string{"recovered": "yes"}
+	crashDigestBytes, _ := umaispool.CanonicalPutDigest("app-a", "app-b", crashID, crashPayload, nil)
+	crashDigest := hex.EncodeToString(crashDigestBytes[:])
+	crashAcceptedAt := time.Date(2026, 11, 9, 12, 0, 0, 0, time.UTC)
 	crashMsgBytes, _ := json.Marshal(umaispool.Message{
 		ID:         crashID,
-		Payload:    map[string]string{"recovered": "yes"},
+		AcceptedAt: &crashAcceptedAt,
+		Payload:    crashPayload,
 		AckReceipt: "rec-crash-1",
+		Digest:     crashDigest,
 	})
 	_ = os.WriteFile(filepath.Join(commPath, "message.json"), crashMsgBytes, 0600)
-	consolidatedBytes, _ := json.Marshal(map[string]string{
-		msgID:   acceptedMsg.AckReceipt,
-		crashID: "rec-crash-1",
+	existingRec, _ := storeAfterConsume.GetAcceptedRecord(msgID)
+	consolidatedBytes, _ := json.Marshal(map[string]umaispool.AcceptedRecord{
+		msgID: existingRec,
+		crashID: {
+			AcceptedAt: crashAcceptedAt,
+			AckReceipt: "rec-crash-1",
+			Digest:     crashDigest,
+		},
 	})
 	_ = os.WriteFile(filepath.Join(tmpDir, "accepted.json"), consolidatedBytes, 0600)
 

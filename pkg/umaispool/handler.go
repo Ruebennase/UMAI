@@ -14,6 +14,18 @@ import (
 	"strings"
 )
 
+const (
+	// MaxAttachmentMetaBytes bounds the explicit JSON attachment_meta field in multipart POST /inbox requests.
+	MaxAttachmentMetaBytes = 64 * 1024
+)
+
+// AttachmentMetaEntry declares explicit per-attachment metadata in multipart POST /inbox uploads,
+// avoiding reliance on browser/HTTP multipart Content-Type defaults so absent media_type remains absent.
+type AttachmentMetaEntry struct {
+	Name      string `json:"name"`
+	MediaType string `json:"media_type,omitempty"`
+}
+
 // Operation identifies the spool action being authorized by an Authorizer.
 type Operation string
 
@@ -470,6 +482,12 @@ func (h *Handler) handleAcceptMessage(w http.ResponseWriter, r *http.Request, _ 
 		return
 	}
 
+	metaByName, err := parseAndValidateAttachmentMeta(r.MultipartForm.Value["attachment_meta"], len(fileHeaders))
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+
 	attReaders := make([]AttachmentReader, 0, len(fileHeaders))
 	var openFiles []io.Closer
 	defer func() {
@@ -478,7 +496,25 @@ func (h *Handler) handleAcceptMessage(w http.ResponseWriter, r *http.Request, _ 
 		}
 	}()
 
+	seenUploads := make(map[string]bool, len(fileHeaders))
 	for _, fh := range fileHeaders {
+		cleanFileName, err := SanitizeFilename(fh.Filename)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		if seenUploads[cleanFileName] {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": ErrDuplicateAttachment.Error()})
+			return
+		}
+		seenUploads[cleanFileName] = true
+
+		declaredMedia, ok := metaByName[cleanFileName]
+		if !ok {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": ErrInvalidAttachmentMeta.Error()})
+			return
+		}
+
 		f, err := fh.Open()
 		if err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
@@ -486,30 +522,82 @@ func (h *Handler) handleAcceptMessage(w http.ResponseWriter, r *http.Request, _ 
 		}
 		openFiles = append(openFiles, f)
 		attReaders = append(attReaders, AttachmentReader{
-			Name:   fh.Filename,
-			Reader: f,
+			Name:      cleanFileName,
+			MediaType: declaredMedia,
+			Reader:    f,
 		})
 	}
 
-	var (
-		msg *Message
-		err error
-	)
+	var msg *Message
 	if h.storage.HasSigningConfig() || !h.allowUnsigned {
 		msg, err = h.storage.AcceptSignedMessage(msgID, payload, attReaders, signatureHex)
 	} else {
 		msg, err = h.storage.AcceptMessage(msgID, payload, attReaders)
 	}
 	if err != nil {
+		if errors.Is(err, ErrConflictingDuplicate) {
+			writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
+			return
+		}
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"accepted":    true,
+		"accepted_at": msg.AcceptedAt,
 		"ack_receipt": msg.AckReceipt,
 		"message":     msg,
 	})
+}
+
+func parseAndValidateAttachmentMeta(rawValues []string, expectedCount int) (map[string]string, error) {
+	if len(rawValues) > 1 {
+		return nil, ErrInvalidAttachmentMeta
+	}
+	if len(rawValues) == 0 || strings.TrimSpace(rawValues[0]) == "" {
+		if expectedCount == 0 {
+			return map[string]string{}, nil
+		}
+		return nil, ErrInvalidAttachmentMeta
+	}
+
+	raw := rawValues[0]
+	if len(raw) > MaxAttachmentMetaBytes {
+		return nil, ErrInvalidAttachmentMeta
+	}
+
+	var entries []AttachmentMetaEntry
+	dec := json.NewDecoder(strings.NewReader(raw))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&entries); err != nil || entries == nil {
+		return nil, ErrInvalidAttachmentMeta
+	}
+	var trailing any
+	if err := dec.Decode(&trailing); err != io.EOF {
+		return nil, ErrInvalidAttachmentMeta
+	}
+
+	if len(entries) > MaxAttachmentsPerMessage || len(entries) != expectedCount {
+		return nil, ErrInvalidAttachmentMeta
+	}
+
+	metaByName := make(map[string]string, len(entries))
+	for _, entry := range entries {
+		cleanName, err := SanitizeFilename(entry.Name)
+		if err != nil {
+			return nil, ErrInvalidAttachmentMeta
+		}
+		if _, dup := metaByName[cleanName]; dup {
+			return nil, fmt.Errorf("%w: %s", ErrDuplicateAttachment, cleanName)
+		}
+		cleanMedia, err := ValidateMediaType(entry.MediaType)
+		if err != nil {
+			return nil, err
+		}
+		metaByName[cleanName] = cleanMedia
+	}
+	return metaByName, nil
 }
 
 // -----------------------------------------------------------------------------

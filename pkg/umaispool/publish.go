@@ -147,6 +147,11 @@ func Publish(req PublishRequest) (*Message, error) {
 			_ = os.RemoveAll(tmpDir)
 			return nil, err
 		}
+		cleanMedia, err := ValidateMediaType(att.MediaType)
+		if err != nil {
+			_ = os.RemoveAll(tmpDir)
+			return nil, err
+		}
 		if seenNames[cleanName] {
 			_ = os.RemoveAll(tmpDir)
 			return nil, fmt.Errorf("%w: %s", ErrDuplicateAttachment, cleanName)
@@ -192,9 +197,10 @@ func Publish(req PublishRequest) (*Message, error) {
 		}
 
 		attInfos = append(attInfos, AttachmentInfo{
-			Name:   cleanName,
-			Size:   n,
-			SHA256: hex.EncodeToString(hasher.Sum(nil)),
+			Name:      cleanName,
+			Size:      n,
+			SHA256:    hex.EncodeToString(hasher.Sum(nil)),
+			MediaType: cleanMedia,
 		})
 	}
 
@@ -212,9 +218,10 @@ func Publish(req PublishRequest) (*Message, error) {
 		}
 	}
 
+	createdAt := time.Now().UTC()
 	msg := &Message{
 		ID:          msgID,
-		CreatedAt:   time.Now().UTC(),
+		CreatedAt:   &createdAt,
 		Payload:     payload,
 		Attachments: attInfos,
 		Signature:   sigHex,

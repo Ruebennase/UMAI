@@ -213,6 +213,7 @@ umai/
 │       ├── main.go
 │       └── static/         # Dual inspector & minimal single-app production view (/minimal.html)
 ├── tests/
+│   ├── media_type_and_duplicates_test.go # Authenticated media_type (C2) & duplicate digest verification tests
 │   ├── publish_test.go        # Stateless Publish, cmd/umai-spool CLI, and concurrency tests
 │   ├── spool_contract_test.go # Security & boundary tests for standalone pkg/umaispool
 │   ├── storage_test.go        # Go tests for atomic storage, crash recovery, immutability

@@ -15,13 +15,76 @@ import (
 	"strings"
 )
 
+const (
+	// MaxMediaTypeLength bounds optional sender-declared attachment media types ("type/subtype").
+	MaxMediaTypeLength = 127
+)
+
 var (
 	ErrInvalidSignature     = errors.New("invalid or missing cryptographic signature")
 	ErrInvalidReceipt       = errors.New("invalid or missing cryptographic ACK receipt")
 	ErrMissingIdentity      = errors.New("missing sender or receiver identity")
 	ErrInvalidIdentity      = errors.New("local identity and peer identity must be distinct and trimmed")
 	ErrSigningNotConfigured = errors.New("cryptographic signing keys and identities are not configured")
+	ErrInvalidMediaType     = errors.New("invalid attachment media_type: expected lowercase ASCII type/subtype without parameters")
 )
+
+// ValidateMediaType validates and normalizes an optional parameterless MIME media type ("type/subtype").
+// Empty or whitespace-only input normalizes to "" (absent). Non-empty values are trimmed, lowercased,
+// bounded to MaxMediaTypeLength (127 ASCII bytes), rejected if they contain parameters (';') or multiple
+// slashes, and validated against RFC 6838 restricted token characters.
+func ValidateMediaType(raw string) (string, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return "", nil
+	}
+	if len(trimmed) > MaxMediaTypeLength {
+		return "", ErrInvalidMediaType
+	}
+	for i := 0; i < len(trimmed); i++ {
+		c := trimmed[i]
+		if c <= 32 || c > 126 {
+			return "", ErrInvalidMediaType
+		}
+	}
+	normalized := strings.ToLower(trimmed)
+	slashIdx := strings.IndexByte(normalized, '/')
+	if slashIdx <= 0 || slashIdx == len(normalized)-1 {
+		return "", ErrInvalidMediaType
+	}
+	typePart := normalized[:slashIdx]
+	subPart := normalized[slashIdx+1:]
+	if !isValidMediaToken(typePart) || !isValidMediaToken(subPart) {
+		return "", ErrInvalidMediaType
+	}
+	return normalized, nil
+}
+
+func isValidMediaToken(part string) bool {
+	if len(part) == 0 || len(part) > MaxMediaTypeLength {
+		return false
+	}
+	for i := 0; i < len(part); i++ {
+		c := part[i]
+		isAlphaNum := (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')
+		if i == 0 {
+			if !isAlphaNum {
+				return false
+			}
+			continue
+		}
+		if isAlphaNum {
+			continue
+		}
+		switch c {
+		case '!', '#', '$', '&', '-', '^', '_', '.', '+':
+			// Allowed RFC 6838 restricted-name characters
+		default:
+			return false
+		}
+	}
+	return true
+}
 
 // ParsePrivateKey parses a hex-encoded Ed25519 private key (32-byte seed or 64-byte expanded key).
 // It never falls back to default keys.
@@ -77,10 +140,11 @@ func ParseSigningKeys(privHex, peerPubHex string) (ed25519.PublicKey, ed25519.Pr
 //	id:<len>:<id>\n
 //	payload:<payload_canonical_sha256>\n
 //	att_count:<count>\n
-//	att:<name_len>:<att1_name>:<att1_size>:<att1_sha256>\n...
+//	att:<name_len>:<att1_name>:<att1_size>:<att1_sha256>:<media_type_len>:<att1_media_type>\n...
 //
 // Binding both sender and intended receiver prevents cross-channel or multi-peer misdirection,
 // length-prefixing variable-length strings guarantees injectivity (zero delimiter collision ambiguity),
+// normalizing optional media_type ensures consistent treatment before signing and verification,
 // and sorting attachments by sanitized name ensures ordering differences never break verification.
 func CanonicalPutDigest(senderIdentity string, receiverIdentity string, id string, payload any, attachments []AttachmentInfo) ([32]byte, error) {
 	if strings.TrimSpace(senderIdentity) == "" || strings.TrimSpace(receiverIdentity) == "" {
@@ -109,7 +173,14 @@ func CanonicalPutDigest(senderIdentity string, receiverIdentity string, id strin
 	payloadHash := sha256.Sum256(canonicalPayload)
 
 	sortedAtts := make([]AttachmentInfo, len(attachments))
-	copy(sortedAtts, attachments)
+	for i, a := range attachments {
+		cleanMedia, err := ValidateMediaType(a.MediaType)
+		if err != nil {
+			return [32]byte{}, err
+		}
+		a.MediaType = cleanMedia
+		sortedAtts[i] = a
+	}
 	sort.Slice(sortedAtts, func(i, j int) bool {
 		return sortedAtts[i].Name < sortedAtts[j].Name
 	})
@@ -122,7 +193,11 @@ func CanonicalPutDigest(senderIdentity string, receiverIdentity string, id strin
 	sb.WriteString(fmt.Sprintf("payload:%s\n", hex.EncodeToString(payloadHash[:])))
 	sb.WriteString(fmt.Sprintf("att_count:%d\n", len(sortedAtts)))
 	for _, a := range sortedAtts {
-		sb.WriteString(fmt.Sprintf("att:%d:%s:%d:%s\n", len(a.Name), a.Name, a.Size, a.SHA256))
+		sb.WriteString(fmt.Sprintf("att:%d:%s:%d:%s:%d:%s\n",
+			len(a.Name), a.Name,
+			a.Size, a.SHA256,
+			len(a.MediaType), a.MediaType,
+		))
 	}
 
 	return sha256.Sum256([]byte(sb.String())), nil

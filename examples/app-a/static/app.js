@@ -352,7 +352,7 @@
         li.innerHTML = `
           <div style="flex: 1;">
             <div class="list-item-title">${escapeHtml(msg.id)}: ${escapeHtml(subj)}</div>
-            <div class="list-item-sub">Received ${new Date(msg.created_at).toLocaleTimeString()} ${note ? `• "${escapeHtml(note)}"` : ''}</div>
+            <div class="list-item-sub">Received ${new Date(msg.accepted_at || msg.created_at).toLocaleTimeString()} ${note ? `• "${escapeHtml(note)}"` : ''}</div>
             <div style="margin-top: 4px;">
               ${(msg.attachments || []).map(a => `
                 <a href="/api/inbox/${encodeURIComponent(msg.id)}/attachments/${encodeURIComponent(a.name)}"

@@ -369,7 +369,7 @@
       const rows = messages.map(msg => {
         const subj = (msg.payload && msg.payload.subject) || 'No subject';
         const note = (msg.payload && msg.payload.text) ? ` — ${msg.payload.text}` : '';
-        const date = new Date(msg.created_at || Date.now()).toLocaleTimeString();
+        const date = new Date(msg.accepted_at || msg.created_at || Date.now()).toLocaleTimeString();
         const attachments = msg.attachments || [];
 
         const attDisplay = attachments.length === 0

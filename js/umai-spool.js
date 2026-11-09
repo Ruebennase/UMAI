@@ -10,8 +10,50 @@
   }
   root.UMAI = root.UMAI || {};
   root.UMAI.createHttpSpoolAdapter = exportsObj.createHttpSpoolAdapter;
+  root.UMAI.validateMediaType = exportsObj.validateMediaType;
 })(typeof self !== 'undefined' ? self : this, function () {
   'use strict';
+
+  const MAX_MEDIA_TYPE_LENGTH = 127;
+  const MEDIA_TOKEN_RE = /^[a-z0-9][a-z0-9!#$&\-\^_.+]*$/;
+
+  /**
+   * Validates and normalizes an optional parameterless MIME media type ("type/subtype").
+   * Empty/absent values normalize to "". Rejects parameters (';'), non-ASCII, whitespace,
+   * multiple slashes, or values exceeding 127 bytes.
+   */
+  function validateMediaType(raw) {
+    if (raw === undefined || raw === null) {
+      return '';
+    }
+    if (typeof raw !== 'string') {
+      throw new Error('Invalid attachment media_type: expected string');
+    }
+    const trimmed = raw.trim();
+    if (trimmed === '') {
+      return '';
+    }
+    if (trimmed.length > MAX_MEDIA_TYPE_LENGTH) {
+      throw new Error('Invalid attachment media_type: exceeds 127 characters');
+    }
+    for (let i = 0; i < trimmed.length; i++) {
+      const code = trimmed.charCodeAt(i);
+      if (code <= 32 || code > 126) {
+        throw new Error('Invalid attachment media_type: contains control, space, or non-ASCII characters');
+      }
+    }
+    const normalized = trimmed.toLowerCase();
+    const slashIdx = normalized.indexOf('/');
+    if (slashIdx <= 0 || slashIdx === normalized.length - 1 || normalized.indexOf('/', slashIdx + 1) !== -1) {
+      throw new Error('Invalid attachment media_type: expected lowercase type/subtype without parameters');
+    }
+    const typePart = normalized.slice(0, slashIdx);
+    const subPart = normalized.slice(slashIdx + 1);
+    if (!MEDIA_TOKEN_RE.test(typePart) || !MEDIA_TOKEN_RE.test(subPart)) {
+      throw new Error('Invalid attachment media_type: invalid RFC 6838 token characters');
+    }
+    return normalized;
+  }
 
   function stripTrailingSlashes(str) {
     let end = str.length;
@@ -160,6 +202,10 @@
             throw new Error('Attachment descriptor missing filename for ' + id);
           }
 
+          const declaredMediaType = validateMediaType(
+            att.media_type !== undefined ? att.media_type : att.mediaType
+          );
+
           const fileRes = await request(
             '/outbox/' + encodedId + '/attachments/' + encodeURIComponent(filename),
             { method: 'GET' },
@@ -179,7 +225,9 @@
             );
           }
 
-          files.push(new File([blob], filename));
+          // Reconstruct File.type strictly from authenticated message metadata (never HTTP blob.type,
+          // which is application/octet-stream), keeping absent media_type as ''.
+          files.push(new File([blob], filename, { type: declaredMediaType }));
         }
 
         return {
@@ -217,9 +265,13 @@
           const receipt = typeof entry.ackReceipt === 'string'
             ? entry.ackReceipt
             : (typeof entry.ack_receipt === 'string' ? entry.ack_receipt : '');
-          normalized[key] = receipt
-            ? { accepted: entry.accepted, ackReceipt: receipt }
-            : { accepted: entry.accepted };
+          const acceptedAt = typeof entry.acceptedAt === 'string'
+            ? entry.acceptedAt
+            : (typeof entry.accepted_at === 'string' ? entry.accepted_at : '');
+          const normEntry = { accepted: entry.accepted };
+          if (receipt) normEntry.ackReceipt = receipt;
+          if (acceptedAt) normEntry.acceptedAt = acceptedAt;
+          normalized[key] = normEntry;
         }
         return normalized;
       },
@@ -235,9 +287,27 @@
           formData.append('signature', putMsg.signature);
         }
 
+        const attachmentMeta = [];
+        const seenNames = Object.create(null);
         for (const file of (putMsg.attachments || [])) {
+          if (!file || typeof file.name !== 'string' || file.name.length === 0 || seenNames[file.name]) {
+            return { accepted: false };
+          }
+          seenNames[file.name] = true;
+          let mediaType;
+          try {
+            mediaType = validateMediaType(typeof file.type === 'string' ? file.type : '');
+          } catch (_) {
+            return { accepted: false };
+          }
+          attachmentMeta.push(
+            mediaType
+              ? { name: file.name, media_type: mediaType }
+              : { name: file.name }
+          );
           formData.append('attachments', file, file.name);
         }
+        formData.append('attachment_meta', JSON.stringify(attachmentMeta));
 
         const res = await request(
           '/inbox',
@@ -259,13 +329,18 @@
         const ackReceipt = typeof data.ack_receipt === 'string'
           ? data.ack_receipt
           : (typeof data.ackReceipt === 'string' ? data.ackReceipt : '');
+        const acceptedAt = typeof data.accepted_at === 'string'
+          ? data.accepted_at
+          : (typeof data.acceptedAt === 'string' ? data.acceptedAt : '');
 
         await invokeHookSafely(opts.onAccepted, [putMsg, data]);
 
-        return {
+        const out = {
           accepted: true,
           ackReceipt: ackReceipt
         };
+        if (acceptedAt) out.acceptedAt = acceptedAt;
+        return out;
       },
 
       async onAcknowledged(ids, receipts) {
@@ -287,6 +362,7 @@
   }
 
   return {
-    createHttpSpoolAdapter: createHttpSpoolAdapter
+    createHttpSpoolAdapter: createHttpSpoolAdapter,
+    validateMediaType: validateMediaType
   };
 });
