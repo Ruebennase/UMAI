@@ -82,21 +82,29 @@
     return res;
   }
 
+  function alignLoopbackUrl(rawUrl, originOnly) {
+    if (!rawUrl) return rawUrl;
+    const locHost = window.location.hostname;
+    if (locHost !== 'localhost' && locHost !== '127.0.0.1') {
+      return rawUrl;
+    }
+    try {
+      const u = new URL(rawUrl);
+      if (u.hostname === '127.0.0.1' || u.hostname === 'localhost') {
+        u.hostname = locHost;
+        return originOnly ? u.origin : u.toString();
+      }
+    } catch (e) {}
+    return rawUrl;
+  }
+
   // Check App B authentication
   async function checkAuth() {
     try {
       const statusRes = await fetch('/api/status', { credentials: 'include' });
       const status = await statusRes.json();
-      peerOrigin = status.peer_origin || status.peerOrigin || 'http://127.0.0.1:8081';
-      embedUrl = status.peer_embed_url || status.peerEmbedURL || peerOrigin;
-
-      if (window.location.hostname === 'localhost') {
-        peerOrigin = peerOrigin.replace('127.0.0.1', 'localhost');
-        embedUrl = embedUrl.replace('127.0.0.1', 'localhost');
-      } else if (window.location.hostname === '127.0.0.1') {
-        peerOrigin = peerOrigin.replace('localhost', '127.0.0.1');
-        embedUrl = embedUrl.replace('localhost', '127.0.0.1');
-      }
+      peerOrigin = alignLoopbackUrl(status.peer_origin || status.peerOrigin || 'http://127.0.0.1:8081', true);
+      embedUrl = alignLoopbackUrl(status.peer_embed_url || status.peerEmbedURL || peerOrigin, false);
 
       let syncBase = peerOrigin;
       try {

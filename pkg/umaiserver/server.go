@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"mime"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -200,16 +201,19 @@ func (s *Server) securityMiddleware(next http.Handler) http.Handler {
 		w.Header().Set("Pragma", "no-cache")
 		w.Header().Set("Expires", "0")
 
-		altPeer := loopbackAlt(s.cfg.PeerOrigin)
+		peerCSPSources := s.cfg.PeerOrigin
+		if altPeer := loopbackAlt(s.cfg.PeerOrigin); altPeer != "" && altPeer != s.cfg.PeerOrigin {
+			peerCSPSources = s.cfg.PeerOrigin + " " + altPeer
+		}
 
 		// Content Security Policy (zero 'unsafe-inline' in script-src; strictly same-origin connect-src)
 		var csp string
 		if s.cfg.AllowEmbedding {
 			// Permitted to be embedded by peer origin
-			csp = fmt.Sprintf("frame-ancestors 'self' %s %s; default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'", s.cfg.PeerOrigin, altPeer)
+			csp = fmt.Sprintf("frame-ancestors 'self' %s; default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'", peerCSPSources)
 		} else {
 			// Host page embedding peer
-			csp = fmt.Sprintf("frame-ancestors 'none'; default-src 'self'; frame-src 'self' %s %s; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'", s.cfg.PeerOrigin, altPeer)
+			csp = fmt.Sprintf("frame-ancestors 'none'; default-src 'self'; frame-src 'self' %s; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'", peerCSPSources)
 		}
 		w.Header().Set("Content-Security-Policy", csp)
 
@@ -810,12 +814,40 @@ func isJSONContentType(r *http.Request) bool {
 	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(ct)), "application/json")
 }
 
-func loopbackAlt(origin string) string {
-	if strings.Contains(origin, "127.0.0.1") {
-		return strings.Replace(origin, "127.0.0.1", "localhost", 1)
+func swapLoopbackHost(hostPort string) (string, bool) {
+	if host, port, err := net.SplitHostPort(hostPort); err == nil {
+		switch strings.ToLower(host) {
+		case "127.0.0.1":
+			return net.JoinHostPort("localhost", port), true
+		case "localhost":
+			return net.JoinHostPort("127.0.0.1", port), true
+		default:
+			return hostPort, false
+		}
 	}
-	if strings.Contains(origin, "localhost") {
-		return strings.Replace(origin, "localhost", "127.0.0.1", 1)
+	switch strings.ToLower(hostPort) {
+	case "127.0.0.1":
+		return "localhost", true
+	case "localhost":
+		return "127.0.0.1", true
+	default:
+		return hostPort, false
 	}
-	return origin
+}
+
+func loopbackAlt(raw string) string {
+	if strings.Contains(raw, "://") {
+		u, err := url.Parse(raw)
+		if err != nil || u.Host == "" {
+			return raw
+		}
+		swapped, ok := swapLoopbackHost(u.Host)
+		if !ok {
+			return raw
+		}
+		u.Host = swapped
+		return u.String()
+	}
+	swapped, _ := swapLoopbackHost(raw)
+	return swapped
 }

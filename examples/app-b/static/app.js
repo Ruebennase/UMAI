@@ -175,16 +175,27 @@
     }
   });
 
+  function alignLoopbackUrl(rawUrl, originOnly) {
+    if (!rawUrl) return rawUrl;
+    const locHost = window.location.hostname;
+    if (locHost !== 'localhost' && locHost !== '127.0.0.1') {
+      return rawUrl;
+    }
+    try {
+      const u = new URL(rawUrl);
+      if (u.hostname === '127.0.0.1' || u.hostname === 'localhost') {
+        u.hostname = locHost;
+        return originOnly ? u.origin : u.toString();
+      }
+    } catch (e) {}
+    return rawUrl;
+  }
+
   if (btnOpenTop) {
     btnOpenTop.addEventListener('click', (e) => {
       e.preventDefault();
       if (!serverConfig || !serverConfig.peer_origin) return;
-      let targetUrl = serverConfig.peer_origin;
-      if (window.location.hostname === 'localhost') {
-        targetUrl = targetUrl.replace('127.0.0.1', 'localhost');
-      } else if (window.location.hostname === '127.0.0.1') {
-        targetUrl = targetUrl.replace('localhost', '127.0.0.1');
-      }
+      const targetUrl = alignLoopbackUrl(serverConfig.peer_origin, false);
       companionWin = window.open(targetUrl, 'umai_companion_a', 'width=960,height=720,resizable=yes,scrollbars=yes');
       if (umaiSession && companionWin) {
         appendLog('info', 'Opened Application A in companion window; binding UMAI channel');
@@ -236,16 +247,8 @@
       }
 
       // Load App A in iframe
-      let embedUrl = serverConfig.peer_embed_url || serverConfig.peer_origin;
-      let peerOrigin = serverConfig.peer_origin;
-
-      if (window.location.hostname === 'localhost') {
-        embedUrl = embedUrl.replace('127.0.0.1', 'localhost');
-        peerOrigin = peerOrigin.replace('127.0.0.1', 'localhost');
-      } else if (window.location.hostname === '127.0.0.1') {
-        embedUrl = embedUrl.replace('localhost', '127.0.0.1');
-        peerOrigin = peerOrigin.replace('localhost', '127.0.0.1');
-      }
+      const embedUrl = alignLoopbackUrl(serverConfig.peer_embed_url || serverConfig.peer_origin, false);
+      const peerOrigin = alignLoopbackUrl(serverConfig.peer_origin, true);
 
       if (peerIframe.src !== embedUrl) {
         peerIframe.src = embedUrl;

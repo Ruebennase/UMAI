@@ -160,6 +160,22 @@
     logBox.innerHTML = '';
   });
 
+  function alignLoopbackOrigin(rawOrigin) {
+    if (!rawOrigin) return rawOrigin;
+    const locHost = window.location.hostname;
+    if (locHost !== 'localhost' && locHost !== '127.0.0.1') {
+      return rawOrigin;
+    }
+    try {
+      const u = new URL(rawOrigin);
+      if (u.hostname === '127.0.0.1' || u.hostname === 'localhost') {
+        u.hostname = locHost;
+        return u.origin;
+      }
+    } catch (e) {}
+    return rawOrigin;
+  }
+
   // --- App Initialization & Data Loading ---
   async function initApp() {
     try {
@@ -182,7 +198,7 @@
         }, 2000);
       }
 
-      initUmaiSession(serverConfig.peer_origin);
+      initUmaiSession(alignLoopbackOrigin(serverConfig.peer_origin));
     } catch (err) {
       appendLog('error', 'Initialization error:', err.message);
     }

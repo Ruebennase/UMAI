@@ -1793,6 +1793,153 @@ function makeBatchAcceptance(fn) {
       hostChurn.stop();
       embChurn.stop();
       assert.strictEqual(allCreatedPorts.every(p => p.closed), true, 'All 12 ports must be closed after stop()');
+
+      // --- 11b: Deterministic READY arriving mid-getOutboxIds() reconcile loop ---
+      let releaseStaleGen1Outbox = null;
+      let outboxGenCall = 0;
+      const midRecPorts = [];
+      let midRecEmbWin = null;
+      let midRecHost = null;
+
+      midRecEmbWin = {
+        closed: false,
+        postMessage(msg, targetOrigin, transfer) {
+          if (msg.type === 'INIT' && transfer && transfer.length > 0) {
+            const p = transfer[0];
+            midRecPorts.push(p);
+            p.postMessage({ protocol: PROTOCOL_NAME, version: PROTOCOL_VERSION, type: 'INIT_ACK' });
+          }
+        }
+      };
+
+      midRecHost = new UmaiSession({
+        peerOrigin: 'http://emb-midrec.example',
+        role: 'host',
+        peerWindow: midRecEmbWin,
+        storage: {
+          getOutboxIds: async () => {
+            outboxGenCall++;
+            if (outboxGenCall === 1) {
+              return await new Promise(r => { releaseStaleGen1Outbox = r; });
+            }
+            return ['fresh-gen2-msg'];
+          },
+          getMessage: async (id) => ({ id, payload: {}, attachments: [] }),
+          getAcceptance: makeBatchAcceptance(() => ({ accepted: false })),
+          acceptMessage: async () => true,
+          onAcknowledged: async () => {}
+        }
+      });
+
+      // Establish Generation 1; reconcile(true) suspends inside getOutboxIds() #1
+      midRecHost._handleWindowMessage({
+        origin: 'http://emb-midrec.example',
+        source: midRecEmbWin,
+        data: { protocol: PROTOCOL_NAME, version: PROTOCOL_VERSION, type: 'READY' }
+      });
+      await delay(10);
+      assert.strictEqual(typeof releaseStaleGen1Outbox, 'function', 'Gen 1 getOutboxIds() must be suspended');
+
+      // Capture messages received on Generation 2's peer port
+      const gen2ReceivedOffers = [];
+      midRecHost._handleWindowMessage({
+        origin: 'http://emb-midrec.example',
+        source: midRecEmbWin,
+        data: { protocol: PROTOCOL_NAME, version: PROTOCOL_VERSION, type: 'READY' }
+      });
+      assert.strictEqual(midRecPorts.length, 2, 'Second READY must establish Generation 2 port');
+      midRecPorts[1].onmessage = (ev) => {
+        if (ev.data && ev.data.type === 'OFFER') {
+          gen2ReceivedOffers.push(ev.data.ids);
+        }
+      };
+      await delay(15);
+
+      // Now resolve Generation 1's stale getOutboxIds() after Generation 2 is active
+      releaseStaleGen1Outbox(['stale-gen1-msg']);
+      await delay(20);
+
+      assert.strictEqual(
+        gen2ReceivedOffers.some(ids => ids.includes('stale-gen1-msg')),
+        false,
+        'Stale getOutboxIds() from superseded generation must NEVER emit OFFER on replacement port'
+      );
+      assert.strictEqual(midRecHost._offeredIds.has('stale-gen1-msg'), false, 'Stale ID must not pollute Gen 2 _offeredIds');
+      assert.strictEqual(midRecHost._offeredIds.has('fresh-gen2-msg'), true, 'Fresh Gen 2 outbox ID must be offered');
+      midRecHost.stop();
+
+      // --- 11c: Deterministic heartbeat OFFERs colliding with active lookup backoff ---
+      const backoffCollisionChan = createMockChannel();
+      let collisionLookupCalls = 0;
+      const collisionBatchHistory = [];
+      let failFirstCollisionLookup = true;
+
+      const backoffCollisionRec = new UmaiSession({
+        peerOrigin: 'http://host.example',
+        role: 'embedded',
+        lookupMinIntervalMs: 5,
+        lookupRetryBaseMs: 140,
+        lookupRetryMaxMs: 500,
+        storage: {
+          getOutboxIds: async () => [],
+          getMessage: async () => null,
+          getAcceptance: async (ids) => {
+            collisionLookupCalls++;
+            collisionBatchHistory.push(ids.slice());
+            if (failFirstCollisionLookup) {
+              throw new Error('transient DB timeout');
+            }
+            const out = Object.create(null);
+            for (const id of ids) out[id] = { accepted: false };
+            return out;
+          },
+          acceptMessage: async () => true,
+          onAcknowledged: async () => {}
+        }
+      });
+      backoffCollisionRec.port = backoffCollisionChan.port1;
+      backoffCollisionChan.port1.onmessage = backoffCollisionRec._portListener;
+      backoffCollisionRec.state = 'connected';
+
+      // Initial OFFER triggers lookup #1 -> fails -> enters 140ms backoff
+      await backoffCollisionRec._handleOffer({
+        protocol: PROTOCOL_NAME,
+        version: PROTOCOL_VERSION,
+        type: 'OFFER',
+        ids: ['msg-b1']
+      });
+      assert.strictEqual(collisionLookupCalls, 1, 'Initial OFFER must trigger lookup #1');
+      assert.strictEqual(backoffCollisionRec._lookupFailureCount, 1, 'Failed lookup must enter backoff');
+
+      // Send two heartbeat re-OFFERs (adding msg-b2) mid-backoff; neither may trigger an early lookup
+      await delay(20);
+      await backoffCollisionRec._handleOffer({
+        protocol: PROTOCOL_NAME,
+        version: PROTOCOL_VERSION,
+        type: 'OFFER',
+        ids: ['msg-b1']
+      });
+      await delay(25);
+      await backoffCollisionRec._handleOffer({
+        protocol: PROTOCOL_NAME,
+        version: PROTOCOL_VERSION,
+        type: 'OFFER',
+        ids: ['msg-b1', 'msg-b2']
+      });
+      assert.strictEqual(collisionLookupCalls, 1, 'Heartbeat OFFERs arriving during active backoff must NOT trigger early getAcceptance()');
+
+      // Heal backend before the 140ms backoff window finishes and verify single coalesced batch lookup
+      failFirstCollisionLookup = false;
+      await delay(140);
+      assert.strictEqual(collisionLookupCalls, 2, 'Backoff expiry must execute exactly 1 coalesced retry lookup');
+      assert.deepStrictEqual(
+        collisionBatchHistory[1].sort(),
+        ['msg-b1', 'msg-b2'],
+        'Post-backoff lookup must coalesce initial + mid-backoff heartbeat OFFER IDs into one batch'
+      );
+      const postBackoffGets = backoffCollisionChan.port1.sent.filter(m => m.type === 'GET');
+      assert.strictEqual(postBackoffGets.length >= 1, true, 'GET must be dispatched once coalesced post-backoff lookup succeeds');
+      backoffCollisionRec.stop();
     } finally {
       global.MessageChannel = origMessageChannel;
     }

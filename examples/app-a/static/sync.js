@@ -48,17 +48,27 @@
     return res;
   }
 
+  function alignLoopbackOrigin(rawOrigin) {
+    if (!rawOrigin) return rawOrigin;
+    const locHost = window.location.hostname;
+    if (locHost !== 'localhost' && locHost !== '127.0.0.1') {
+      return rawOrigin;
+    }
+    try {
+      const u = new URL(rawOrigin);
+      if (u.hostname === '127.0.0.1' || u.hostname === 'localhost') {
+        u.hostname = locHost;
+        return u.origin;
+      }
+    } catch (e) {}
+    return rawOrigin;
+  }
+
   async function init() {
     try {
       const statusRes = await fetch('/api/status', { credentials: 'include' });
       const status = await statusRes.json();
-      peerOrigin = status.peer_origin || status.peerOrigin || 'http://127.0.0.1:8082';
-
-      if (window.location.hostname === 'localhost') {
-        peerOrigin = peerOrigin.replace('127.0.0.1', 'localhost');
-      } else if (window.location.hostname === '127.0.0.1') {
-        peerOrigin = peerOrigin.replace('localhost', '127.0.0.1');
-      }
+      peerOrigin = alignLoopbackOrigin(status.peer_origin || status.peerOrigin || 'http://127.0.0.1:8082');
 
       const meRes = await api('/api/auth/me');
       if (meRes.ok) {
