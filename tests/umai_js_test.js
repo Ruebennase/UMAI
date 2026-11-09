@@ -1500,6 +1500,305 @@ function makeBatchAcceptance(fn) {
   }
   console.log('✓ Test 10: Slow outbox non-starvation under heartbeat and PUT lookup-backoff cascade prevention passed');
 
+  // Test 11: Bidirectional Reconnect Churn (Repeated READY -> INIT -> INIT_ACK Handshakes) + Flaky Adapter Stress Test
+  {
+    const origMessageChannel = global.MessageChannel;
+    const allCreatedPorts = [];
+
+    class ClosableAsyncPort {
+      constructor() {
+        this.peer = null;
+        this.onmessage = null;
+        this.closed = false;
+        allCreatedPorts.push(this);
+      }
+      postMessage(msg) {
+        if (this.closed || !this.peer || this.peer.closed) {
+          return;
+        }
+        const target = this.peer;
+        setTimeout(() => {
+          if (!this.closed && !target.closed && typeof target.onmessage === 'function') {
+            target.onmessage({ data: msg });
+          }
+        }, 1);
+      }
+      close() {
+        this.closed = true;
+        this.onmessage = null;
+      }
+    }
+
+    global.MessageChannel = class ClosableAsyncChannel {
+      constructor() {
+        this.port1 = new ClosableAsyncPort();
+        this.port2 = new ClosableAsyncPort();
+        this.port1.peer = this.port2;
+        this.port2.peer = this.port1;
+      }
+    };
+
+    try {
+      const makeInitialOutbox = (prefix, count) => {
+        const map = new Map();
+        for (let i = 1; i <= count; i++) {
+          const id = `${prefix}-${String(i).padStart(2, '0')}`;
+          map.set(id, {
+            id,
+            payload: { seq: i, origin: prefix },
+            attachments: [new Blob([`blob-content-${id}`], { type: 'text/plain' })],
+            signature: `sig-${id}`
+          });
+        }
+        return map;
+      };
+
+      const hostOutbox = makeInitialOutbox('host-churn', 12);
+      const embOutbox = makeInitialOutbox('emb-churn', 12);
+      const hostAccepted = new Map(); // id -> ackReceipt
+      const embAccepted = new Map();  // id -> ackReceipt
+      const importCountById = new Map(); // id -> number of times storage committed new import
+      const ackedReceiptsOnHost = new Map();
+      const ackedReceiptsOnEmb = new Map();
+
+      let flakyEnabled = true;
+      const faultStats = {
+        outbox: 0,
+        lookupThrow: 0,
+        lookupPartial: 0,
+        getMessage: 0,
+        accept: 0,
+        ack: 0
+      };
+      let callTick = 0;
+      const delay = (ms) => new Promise(r => setTimeout(r, ms));
+
+      const perIdGetMsgFaults = new Map();
+      const perIdAcceptFaults = new Map();
+
+      const makeFlakyStorage = (roleLabel, ownOutbox, ownAccepted, ownAckedReceipts) => ({
+        getOutboxIds: async () => {
+          const n = ++callTick;
+          await delay(4 + (n % 5));
+          if (flakyEnabled && (faultStats.outbox === 0 || n % 11 === 1)) {
+            faultStats.outbox++;
+            throw new Error(`${roleLabel} transient getOutboxIds error`);
+          }
+          return Array.from(ownOutbox.keys());
+        },
+        getMessage: async (id) => {
+          const n = ++callTick;
+          await delay(5 + (n % 6));
+          const prevGetFaults = perIdGetMsgFaults.get(id) || 0;
+          if (flakyEnabled && prevGetFaults < 2 && (faultStats.getMessage === 0 || n % 13 === 2)) {
+            perIdGetMsgFaults.set(id, prevGetFaults + 1);
+            faultStats.getMessage++;
+            throw new Error(`${roleLabel} transient getMessage(${id}) error`);
+          }
+          return ownOutbox.get(id) || null;
+        },
+        getAcceptance: async (ids) => {
+          const n = ++callTick;
+          await delay(3 + (n % 5));
+          if (flakyEnabled && (faultStats.lookupThrow === 0 || n % 11 === 3)) {
+            faultStats.lookupThrow++;
+            throw new Error(`${roleLabel} transient getAcceptance outage`);
+          }
+          const out = Object.create(null);
+          for (let i = 0; i < ids.length; i++) {
+            const id = ids[i];
+            if (flakyEnabled && ids.length > 1 && i === ids.length - 1 && (faultStats.lookupPartial === 0 || n % 12 === 4)) {
+              // Omit the last requested ID to trigger whole-batch fail-closed validation
+              faultStats.lookupPartial++;
+              continue;
+            }
+            if (ownAccepted.has(id)) {
+              out[id] = { accepted: true, ackReceipt: ownAccepted.get(id) };
+            } else {
+              out[id] = { accepted: false };
+            }
+          }
+          return out;
+        },
+        acceptMessage: async (msg) => {
+          const n = ++callTick;
+          await delay(6 + (n % 7));
+          const prevAccFaults = perIdAcceptFaults.get(msg.id) || 0;
+          if (flakyEnabled && !ownAccepted.has(msg.id) && prevAccFaults < 2 && (faultStats.accept === 0 || n % 9 === 5)) {
+            perIdAcceptFaults.set(msg.id, prevAccFaults + 1);
+            faultStats.accept++;
+            throw new Error(`${roleLabel} transient acceptMessage(${msg.id}) disk error`);
+          }
+          if (!ownAccepted.has(msg.id)) {
+            assert.strictEqual(Array.isArray(msg.attachments) && msg.attachments.length, 1, 'Attachment must survive transfer');
+            assert.strictEqual(msg.signature, `sig-${msg.id}`, 'Signature must survive transfer');
+            ownAccepted.set(msg.id, `receipt-for-${msg.id}`);
+            importCountById.set(msg.id, (importCountById.get(msg.id) || 0) + 1);
+          }
+          return { accepted: true, ackReceipt: ownAccepted.get(msg.id) };
+        },
+        onAcknowledged: async (ids, receipts) => {
+          const n = ++callTick;
+          await delay(3 + (n % 4));
+          if (flakyEnabled && (faultStats.ack === 0 || n % 7 === 0)) {
+            faultStats.ack++;
+            throw new Error(`${roleLabel} transient onAcknowledged error`);
+          }
+          for (const id of ids) {
+            const rec = receipts && receipts[id];
+            assert.strictEqual(rec, `receipt-for-${id}`, `ACK receipt for ${id} must match peer receipt`);
+            ownAckedReceipts.set(id, rec);
+            ownOutbox.delete(id);
+          }
+        }
+      });
+
+      let hostChurn = null;
+      let embChurn = null;
+
+      const hostMockWindow = {
+        closed: false,
+        postMessage(msg, targetOrigin, transfer) {
+          setTimeout(() => {
+            if (hostChurn && !hostChurn._stopped) {
+              hostChurn._handleWindowMessage({
+                origin: 'http://emb-churn.example',
+                source: embMockWindow,
+                data: msg,
+                ports: transfer || []
+              });
+            }
+          }, 1);
+        }
+      };
+
+      const embMockWindow = {
+        closed: false,
+        postMessage(msg, targetOrigin, transfer) {
+          setTimeout(() => {
+            if (embChurn && !embChurn._stopped) {
+              embChurn._handleWindowMessage({
+                origin: 'http://host-churn.example',
+                source: hostMockWindow,
+                data: msg,
+                ports: transfer || []
+              });
+            }
+          }, 1);
+        }
+      };
+
+      hostChurn = new UmaiSession({
+        peerOrigin: 'http://emb-churn.example',
+        role: 'host',
+        peerWindow: embMockWindow,
+        maxConcurrency: 3,
+        getTimeoutMs: 90,
+        lookupMinIntervalMs: 4,
+        lookupRetryBaseMs: 20,
+        lookupRetryMaxMs: 50,
+        storage: makeFlakyStorage('host', hostOutbox, hostAccepted, ackedReceiptsOnHost)
+      });
+
+      embChurn = new UmaiSession({
+        peerOrigin: 'http://host-churn.example',
+        role: 'embedded',
+        peerWindow: hostMockWindow,
+        maxConcurrency: 3,
+        getTimeoutMs: 90,
+        lookupMinIntervalMs: 4,
+        lookupRetryBaseMs: 20,
+        lookupRetryMaxMs: 50,
+        storage: makeFlakyStorage('embedded', embOutbox, embAccepted, ackedReceiptsOnEmb)
+      });
+
+      const triggerReadyHandshake = () => {
+        hostMockWindow.postMessage(
+          { protocol: PROTOCOL_NAME, version: PROTOCOL_VERSION, type: 'READY' },
+          'http://host-churn.example'
+        );
+      };
+
+      // Initial handshake + 5 rapid READY reconnect cycles mid-flight while flaky adapter errors fire
+      triggerReadyHandshake();
+      for (let cycle = 0; cycle < 5; cycle++) {
+        await delay(28);
+        triggerReadyHandshake();
+      }
+
+      // Let churn run long enough on the 6th generation for every adapter method (outbox, lookup, getMessage, accept, ack)
+      // to fire at least one transient fault while flakyEnabled is active, then heal adapter and let settle
+      await delay(120);
+      flakyEnabled = false;
+
+      // Wait for full bidirectional convergence (bounded polling up to 2s)
+      const deadline = Date.now() + 2000;
+      while (Date.now() < deadline) {
+        if (
+          hostOutbox.size === 0 &&
+          embOutbox.size === 0 &&
+          hostAccepted.size === 12 &&
+          embAccepted.size === 12 &&
+          !hostChurn.getSyncStatus().isSyncing &&
+          !embChurn.getSyncStatus().isSyncing
+        ) {
+          break;
+        }
+        // Periodic heartbeat reconcile just like the demo UI's 3s interval
+        hostChurn.reconcile(false);
+        embChurn.reconcile(false);
+        await delay(40);
+      }
+
+      // 1. Verify every individual fault mode actually fired during churn
+      assert.strictEqual(faultStats.outbox >= 1, true, 'Must exercise transient getOutboxIds error');
+      assert.strictEqual(faultStats.lookupThrow >= 1, true, 'Must exercise transient getAcceptance throw');
+      assert.strictEqual(faultStats.lookupPartial >= 1, true, 'Must exercise partial getAcceptance batch rejection');
+      assert.strictEqual(faultStats.getMessage >= 1, true, 'Must exercise transient getMessage error');
+      assert.strictEqual(faultStats.accept >= 1, true, 'Must exercise transient acceptMessage error');
+      assert.strictEqual(faultStats.ack >= 1, true, 'Must exercise transient onAcknowledged error');
+
+      // 2. Verify 100% bidirectional delivery and outbox cleanup with verified receipts
+      assert.strictEqual(embAccepted.size, 12, `Embedded peer must accept all 12 host messages (got ${embAccepted.size})`);
+      assert.strictEqual(hostAccepted.size, 12, `Host peer must accept all 12 embedded messages (got ${hostAccepted.size})`);
+      assert.strictEqual(hostOutbox.size, 0, `Host outbox must drain completely (remaining: ${hostOutbox.size})`);
+      assert.strictEqual(embOutbox.size, 0, `Embedded outbox must drain completely (remaining: ${embOutbox.size})`);
+      assert.strictEqual(ackedReceiptsOnHost.size, 12, 'Host must verify and record all 12 ACK receipts');
+      assert.strictEqual(ackedReceiptsOnEmb.size, 12, 'Embedded must verify and record all 12 ACK receipts');
+
+      // 3. Verify zero duplicate imports across all 24 messages despite 6 connection generations
+      for (let i = 1; i <= 12; i++) {
+        const hId = `host-churn-${String(i).padStart(2, '0')}`;
+        const eId = `emb-churn-${String(i).padStart(2, '0')}`;
+        assert.strictEqual(importCountById.get(hId), 1, `Message ${hId} must be imported exactly once`);
+        assert.strictEqual(importCountById.get(eId), 1, `Message ${eId} must be imported exactly once`);
+      }
+
+      // 4. Verify zero leaked worker counters, queues, or open superseded MessagePorts
+      for (const [label, sess] of [['host', hostChurn], ['embedded', embChurn]]) {
+        assert.strictEqual(sess._activeSendCount, 0, `${label} _activeSendCount must settle at 0`);
+        assert.strictEqual(sess._activeAcceptCount, 0, `${label} _activeAcceptCount must settle at 0`);
+        assert.strictEqual(sess._putQueue.length, 0, `${label} _putQueue must be empty`);
+        assert.strictEqual(sess._incomingPutQueue.length, 0, `${label} _incomingPutQueue must be empty`);
+        assert.strictEqual(sess._acceptingIds.size, 0, `${label} _acceptingIds must be empty`);
+        assert.strictEqual(sess._inFlightGets.size, 0, `${label} _inFlightGets must be empty`);
+        assert.strictEqual(sess.getSyncStatus().isSyncing, false, `${label} getSyncStatus().isSyncing must be false`);
+      }
+
+      // 6 handshakes created 12 ports total; the 10 superseded ports must already be closed, and the active 2 open
+      const closedBeforeStop = allCreatedPorts.filter(p => p.closed).length;
+      assert.strictEqual(allCreatedPorts.length, 12, `Expected 12 ports across 6 handshakes, got ${allCreatedPorts.length}`);
+      assert.strictEqual(closedBeforeStop, 10, `All 10 superseded ports from earlier generations must be closed, got ${closedBeforeStop}`);
+
+      hostChurn.stop();
+      embChurn.stop();
+      assert.strictEqual(allCreatedPorts.every(p => p.closed), true, 'All 12 ports must be closed after stop()');
+    } finally {
+      global.MessageChannel = origMessageChannel;
+    }
+  }
+  console.log('✓ Test 11: Bidirectional reconnect churn (6 READY/INIT generations) + flaky adapter stress test passed');
+
   senderPoison.stop();
   receiverPoison.stop();
   secSession.stop();

@@ -1013,7 +1013,12 @@
 
           case 'PUT':
             if (this._isGenerationActive(gen, port)) {
-              await this._handlePut(data, gen, port);
+              this._handlePut(data, gen, port).catch((err) => {
+                if (this._isGenerationActive(gen, port)) {
+                  this.log('error', 'Error handling PUT message', err.message);
+                  this._emitError(err);
+                }
+              });
             }
             break;
 
@@ -1268,6 +1273,42 @@
     }
 
     /**
+     * Shared fail-closed batch acceptance lookup helper used by both OFFER batch draining
+     * and incoming PUT duplicate verification:
+     * - Records lookup start timestamp (`_lastLookupStartedAt`) for lookup rate pacing.
+     * - Invokes `storage.getAcceptance(ids)` with a defensive copy and validates the complete
+     *   batch via `validateBatchAcceptance` (failing closed if any requested ID is missing or malformed).
+     * - Resets lookup outage backoff counters on success, or delegates to `_recordLookupFailure` on error.
+     */
+    async _queryValidatedAcceptance(queryIds, gen = this._generation, port = this.port, onBeforeFailure = null) {
+      if (!this._isGenerationActive(gen, port) || !Array.isArray(queryIds) || queryIds.length === 0) {
+        return null;
+      }
+      this._lastLookupStartedAt = Date.now();
+      try {
+        const batchRes = await this.storage.getAcceptance(queryIds.slice());
+        if (!this._isGenerationActive(gen, port)) {
+          return null;
+        }
+        const validated = validateBatchAcceptance(batchRes, queryIds);
+        if (!validated) {
+          throw new Error(`Invalid or incomplete getAcceptance batch response (${queryIds.length} ID(s) requested)`);
+        }
+        this._lookupFailureCount = 0;
+        this._nextLookupAllowedAt = 0;
+        return validated;
+      } catch (err) {
+        if (this._isGenerationActive(gen, port)) {
+          if (typeof onBeforeFailure === 'function') {
+            onBeforeFailure();
+          }
+          this._recordLookupFailure(queryIds, err, gen, port);
+        }
+        return null;
+      }
+    }
+
+    /**
      * Records a transient or malformed getAcceptance() failure without burning per-message acceptance retries:
      * re-queues unresolved IDs and schedules an automatic retry with capped exponential backoff.
      */
@@ -1455,24 +1496,11 @@
             continue;
           }
 
-          this._lastLookupStartedAt = Date.now();
-          let validatedBatch = null;
-          try {
-            const batchRes = await this.storage.getAcceptance(queryIds.slice());
+          const validatedBatch = await this._queryValidatedAcceptance(queryIds, gen, port);
+          if (!validatedBatch) {
             if (!this._isGenerationActive(gen, port)) return;
-            validatedBatch = validateBatchAcceptance(batchRes, queryIds);
-            if (!validatedBatch) {
-              throw new Error(`Invalid or incomplete getAcceptance batch response (${queryIds.length} ID(s) requested)`);
-            }
-          } catch (err) {
-            if (!this._isGenerationActive(gen, port)) return;
-            this._recordLookupFailure(queryIds, err, gen, port);
             break;
           }
-
-          // Batch lookup succeeded completely: reset lookup backoff state
-          this._lookupFailureCount = 0;
-          this._nextLookupAllowedAt = 0;
 
           const alreadyAccepted = [];
           const repeatedReceipts = Object.create(null);
@@ -1767,14 +1795,23 @@
       }
 
       if (isActiveGet) {
-        if (this._acceptingIds.size >= this.maxConcurrency) {
+        if (
+          this._acceptingIds.size >= this.maxConcurrency ||
+          this._incomingPutQueue.length >= this.maxConcurrency
+        ) {
           this.log('warn', `Ignored PUT for ${id}: acceptance concurrency full`);
           return;
         }
         this._inFlightGets.delete(id);
       } else {
-        // Late response after slot expiry: only admit if a concurrency slot is currently free
-        if ((this._inFlightGets.size + this._acceptingIds.size) >= this.maxConcurrency) {
+        // Late response after slot expiry: only admit if a concurrency slot is currently free.
+        // Note: when deferred here, recovery does not depend on a sender heartbeat—_pruneExpiredGets()
+        // already appended `id` to the tail of _pendingGetQueue (for attempts < MAX_AUTO_RETRIES),
+        // so the receiver automatically dispatches a fresh GET once active slots finish.
+        if (
+          (this._inFlightGets.size + this._acceptingIds.size) >= this.maxConcurrency ||
+          this._incomingPutQueue.length >= this.maxConcurrency
+        ) {
           this.log('info', `Deferred late PUT for ${id}: receive slot currently in use by another transfer`);
           return;
         }
@@ -1868,27 +1905,16 @@
           return;
         }
 
-        let validatedLookup = null;
-        try {
-          this._lastLookupStartedAt = Date.now();
-          const lookupRes = await this.storage.getAcceptance([id]);
-          if (!this._isGenerationActive(gen, port)) {
-            return;
-          }
-          validatedLookup = validateBatchAcceptance(lookupRes, [id]);
-          if (!validatedLookup) {
-            throw new Error(`Invalid or incomplete getAcceptance result for message ${id}`);
-          }
-        } catch (lookupErr) {
-          if (this._isGenerationActive(gen, port)) {
-            this._acceptingIds.delete(id);
-            this._recordLookupFailure([id], lookupErr, gen, port);
-          }
+        const validatedLookup = await this._queryValidatedAcceptance(
+          [id],
+          gen,
+          port,
+          () => { this._acceptingIds.delete(id); }
+        );
+        if (!validatedLookup) {
           return;
         }
 
-        this._lookupFailureCount = 0;
-        this._nextLookupAllowedAt = 0;
         const alreadyAcc = validatedLookup[id];
         if (alreadyAcc.accepted) {
           this._failedAttempts.delete(id);
