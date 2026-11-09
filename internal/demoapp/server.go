@@ -481,8 +481,19 @@ func (s *Server) handleListDocs(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *Server) handleUploadDoc(w http.ResponseWriter, r *http.Request) {
-	r.Body = http.MaxBytesReader(w, r.Body, s.cfg.MaxUploadSize+10*1024*1024)
-	if err := r.ParseMultipartForm(s.cfg.MaxUploadSize); err != nil {
+	maxUpload := s.cfg.MaxUploadSize
+	if maxUpload <= 0 {
+		maxUpload = umaispool.DefaultMaxUploadSize
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxUpload+umaispool.MultipartEnvelopeOverhead)
+	if err := r.ParseMultipartForm(umaispool.DefaultMultipartMemory); err != nil {
+		if r.MultipartForm != nil {
+			_ = r.MultipartForm.RemoveAll()
+		}
+		if umaispool.HTTPStatusForError(err) == http.StatusRequestEntityTooLarge {
+			writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": umaispool.ErrFileTooLarge.Error()})
+			return
+		}
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "failed to parse multipart form"})
 		return
 	}
@@ -504,13 +515,18 @@ func (s *Server) handleUploadDoc(w http.ResponseWriter, r *http.Request) {
 	for _, fh := range files {
 		f, err := fh.Open()
 		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal storage error"})
 			return
 		}
 		doc, err := s.docs.SaveDocument(fh.Filename, f)
 		_ = f.Close()
 		if err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			status := umaispool.HTTPStatusForError(err)
+			if status == http.StatusInternalServerError {
+				writeJSON(w, status, map[string]string{"error": "internal storage error"})
+				return
+			}
+			writeJSON(w, status, map[string]string{"error": err.Error()})
 			return
 		}
 		saved = append(saved, *doc)
@@ -570,13 +586,22 @@ func (s *Server) handleCreateOutbox(w http.ResponseWriter, r *http.Request) {
 	dec := json.NewDecoder(r.Body)
 	dec.UseNumber()
 	if err := dec.Decode(&req); err != nil {
+		if umaispool.HTTPStatusForError(err) == http.StatusRequestEntityTooLarge {
+			writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": "request body exceeds maximum allowed size"})
+			return
+		}
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json body"})
 		return
 	}
 
 	msg, err := s.CreateOutboxFromDocs(req.Payload, req.Documents)
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		status := umaispool.HTTPStatusForError(err)
+		if status == http.StatusInternalServerError {
+			writeJSON(w, status, map[string]string{"error": "internal storage error"})
+			return
+		}
+		writeJSON(w, status, map[string]string{"error": err.Error()})
 		return
 	}
 

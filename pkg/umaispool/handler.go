@@ -17,6 +17,16 @@ import (
 const (
 	// MaxAttachmentMetaBytes bounds the explicit JSON attachment_meta field in multipart POST /inbox requests.
 	MaxAttachmentMetaBytes = 64 * 1024
+
+	// DefaultMultipartMemory (4 MiB) bounds the multipart parser's in-memory file buffering
+	// (spilling larger uploaded file parts to temporary files cleaned up via MultipartForm.RemoveAll).
+	// Note: this bounds only the multipart parser's file-part RAM threshold, not total HTTP request
+	// or server memory; total request-size limits (MaxBytesReader) and concurrent activity still apply.
+	DefaultMultipartMemory = 4 << 20
+
+	// MultipartEnvelopeOverhead (10 MiB) bounds multipart framing, form fields, and JSON payload overhead
+	// on top of Storage.MaxUploadSize() when wrapping incoming POST bodies in http.MaxBytesReader.
+	MultipartEnvelopeOverhead = 10 << 20
 )
 
 // AttachmentMetaEntry declares explicit per-attachment metadata in multipart POST /inbox uploads,
@@ -282,7 +292,7 @@ func (h *Handler) isSameServerOrigin(origin string, r *http.Request) bool {
 func (h *Handler) handleListOutbox(w http.ResponseWriter, r *http.Request, principal Principal) {
 	msgs, err := h.storage.ListOutboxForSession(principal.SessionKey)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		writeSpoolError(w, err)
 		return
 	}
 	if msgs == nil {
@@ -299,7 +309,7 @@ func (h *Handler) handleGetOutboxMessage(w http.ResponseWriter, r *http.Request,
 			http.NotFound(w, r)
 			return
 		}
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		writeSpoolError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, msg)
@@ -314,7 +324,11 @@ func (h *Handler) handleGetOutboxAttachment(w http.ResponseWriter, r *http.Reque
 
 	path, err := h.storage.GetOutboxAttachmentPath(id, filename)
 	if err != nil {
-		http.NotFound(w, r)
+		if errors.Is(err, ErrNotFound) {
+			http.NotFound(w, r)
+			return
+		}
+		writeSpoolError(w, err)
 		return
 	}
 
@@ -334,6 +348,10 @@ func (h *Handler) handleAckOutbox(w http.ResponseWriter, r *http.Request, _ Prin
 	r.Body = http.MaxBytesReader(w, r.Body, 4*1024*1024)
 	var req ackRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		if isMaxBytesError(err) {
+			writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": "request body exceeds maximum allowed size"})
+			return
+		}
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json body"})
 		return
 	}
@@ -349,7 +367,7 @@ func (h *Handler) handleAckOutbox(w http.ResponseWriter, r *http.Request, _ Prin
 		err = h.storage.AcknowledgeMessages(req.IDs)
 	}
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		writeSpoolError(w, err)
 		return
 	}
 
@@ -363,7 +381,7 @@ func (h *Handler) handleAckOutbox(w http.ResponseWriter, r *http.Request, _ Prin
 func (h *Handler) handleListInbox(w http.ResponseWriter, r *http.Request, _ Principal) {
 	msgs, err := h.storage.ListInbox()
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		writeSpoolError(w, err)
 		return
 	}
 	if msgs == nil {
@@ -380,7 +398,7 @@ func (h *Handler) handleGetInboxMessage(w http.ResponseWriter, r *http.Request, 
 			http.NotFound(w, r)
 			return
 		}
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		writeSpoolError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, msg)
@@ -395,7 +413,11 @@ func (h *Handler) handleGetInboxAttachment(w http.ResponseWriter, r *http.Reques
 
 	path, err := h.storage.GetInboxAttachmentPath(id, filename)
 	if err != nil {
-		http.NotFound(w, r)
+		if errors.Is(err, ErrNotFound) {
+			http.NotFound(w, r)
+			return
+		}
+		writeSpoolError(w, err)
 		return
 	}
 
@@ -413,13 +435,17 @@ func (h *Handler) handleGetAcceptance(w http.ResponseWriter, r *http.Request, _ 
 		IDs []string `json:"ids"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.IDs == nil {
+		if isMaxBytesError(err) {
+			writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": "request body exceeds maximum allowed size"})
+			return
+		}
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json body; expected {\"ids\": [...]}"})
 		return
 	}
 
 	results, err := h.storage.GetAcceptance(req.IDs)
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		writeSpoolError(w, err)
 		return
 	}
 
@@ -443,8 +469,15 @@ func (h *Handler) handleListAcceptedReceipts(w http.ResponseWriter, _ *http.Requ
 
 func (h *Handler) handleAcceptMessage(w http.ResponseWriter, r *http.Request, _ Principal) {
 	maxUpload := h.storage.MaxUploadSize()
-	r.Body = http.MaxBytesReader(w, r.Body, maxUpload+10*1024*1024)
-	if err := r.ParseMultipartForm(maxUpload); err != nil {
+	r.Body = http.MaxBytesReader(w, r.Body, maxUpload+MultipartEnvelopeOverhead)
+	if err := r.ParseMultipartForm(DefaultMultipartMemory); err != nil {
+		if r.MultipartForm != nil {
+			_ = r.MultipartForm.RemoveAll()
+		}
+		if isMaxBytesError(err) {
+			writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": ErrFileTooLarge.Error()})
+			return
+		}
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "failed parsing multipart form"})
 		return
 	}
@@ -484,7 +517,7 @@ func (h *Handler) handleAcceptMessage(w http.ResponseWriter, r *http.Request, _ 
 
 	metaByName, err := parseAndValidateAttachmentMeta(r.MultipartForm.Value["attachment_meta"], len(fileHeaders))
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		writeSpoolError(w, err)
 		return
 	}
 
@@ -500,7 +533,7 @@ func (h *Handler) handleAcceptMessage(w http.ResponseWriter, r *http.Request, _ 
 	for _, fh := range fileHeaders {
 		cleanFileName, err := SanitizeFilename(fh.Filename)
 		if err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			writeSpoolError(w, err)
 			return
 		}
 		if seenUploads[cleanFileName] {
@@ -517,7 +550,7 @@ func (h *Handler) handleAcceptMessage(w http.ResponseWriter, r *http.Request, _ 
 
 		f, err := fh.Open()
 		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal storage error"})
 			return
 		}
 		openFiles = append(openFiles, f)
@@ -535,11 +568,7 @@ func (h *Handler) handleAcceptMessage(w http.ResponseWriter, r *http.Request, _ 
 		msg, err = h.storage.AcceptMessage(msgID, payload, attReaders)
 	}
 	if err != nil {
-		if errors.Is(err, ErrConflictingDuplicate) {
-			writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
-			return
-		}
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		writeSpoolError(w, err)
 		return
 	}
 
@@ -650,6 +679,54 @@ func serveBinaryAttachment(w http.ResponseWriter, r *http.Request, path string) 
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", filepath.Base(path)))
 	http.ServeFile(w, r, path)
+}
+
+func isMaxBytesError(err error) bool {
+	var maxBytesErr *http.MaxBytesError
+	return err != nil && errors.As(err, &maxBytesErr)
+}
+
+// HTTPStatusForError maps spool domain, limit, conflict, and storage/durability errors to HTTP status codes.
+func HTTPStatusForError(err error) int {
+	if err == nil {
+		return http.StatusOK
+	}
+	if isMaxBytesError(err) || errors.Is(err, ErrFileTooLarge) {
+		return http.StatusRequestEntityTooLarge
+	}
+	if errors.Is(err, ErrNotFound) {
+		return http.StatusNotFound
+	}
+	if errors.Is(err, ErrConflictingDuplicate) ||
+		errors.Is(err, ErrStorageCollision) ||
+		errors.Is(err, ErrAlreadyPublished) {
+		return http.StatusConflict
+	}
+	if errors.Is(err, ErrInvalidID) ||
+		errors.Is(err, ErrTraversal) ||
+		errors.Is(err, ErrDuplicateAttachment) ||
+		errors.Is(err, ErrTooManyAttachments) ||
+		errors.Is(err, ErrTooManyIDs) ||
+		errors.Is(err, ErrInvalidMediaType) ||
+		errors.Is(err, ErrInvalidAttachmentMeta) ||
+		errors.Is(err, ErrInvalidSignature) ||
+		errors.Is(err, ErrInvalidReceipt) {
+		return http.StatusBadRequest
+	}
+	return http.StatusInternalServerError
+}
+
+func writeSpoolError(w http.ResponseWriter, err error) {
+	status := HTTPStatusForError(err)
+	if status == http.StatusInternalServerError {
+		writeJSON(w, status, map[string]string{"error": "internal storage error"})
+		return
+	}
+	if status == http.StatusRequestEntityTooLarge {
+		writeJSON(w, status, map[string]string{"error": ErrFileTooLarge.Error()})
+		return
+	}
+	writeJSON(w, status, map[string]string{"error": err.Error()})
 }
 
 func writeJSON(w http.ResponseWriter, status int, data any) {

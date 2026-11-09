@@ -37,7 +37,7 @@ func NewDocStore(dataDir string, maxUploadSize int64) (*DocStore, error) {
 		return nil, fmt.Errorf("resolving data directory: %w", err)
 	}
 	if maxUploadSize <= 0 {
-		maxUploadSize = 100 * 1024 * 1024
+		maxUploadSize = umaispool.DefaultMaxUploadSize
 	}
 	docsDir := filepath.Join(absDataDir, "docs")
 	stagingDir := filepath.Join(absDataDir, ".docs-staging")

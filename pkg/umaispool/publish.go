@@ -78,7 +78,7 @@ func Publish(req PublishRequest) (*Message, error) {
 
 	maxSize := req.MaxAttachmentSize
 	if maxSize <= 0 {
-		maxSize = 100 * 1024 * 1024
+		maxSize = DefaultMaxUploadSize
 	}
 
 	payload := req.Payload

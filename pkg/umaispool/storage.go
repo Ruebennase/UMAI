@@ -20,6 +20,7 @@ import (
 const (
 	MaxAttachmentsPerMessage = 50
 	MaxBatchIDs              = 1000
+	DefaultMaxUploadSize     = 100 * 1024 * 1024
 	OutboxLeaseDuration      = 15 * time.Second
 )
 
@@ -127,7 +128,7 @@ func NewStorage(dataDir string, maxUploadSize int64) (*Storage, error) {
 		return nil, fmt.Errorf("resolving data directory: %w", err)
 	}
 	if maxUploadSize <= 0 {
-		maxUploadSize = 100 * 1024 * 1024
+		maxUploadSize = DefaultMaxUploadSize
 	}
 
 	stagingDir := filepath.Join(absDataDir, ".staging")
