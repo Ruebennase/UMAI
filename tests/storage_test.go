@@ -10,18 +10,19 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/umai-protocol/umai/pkg/umaiserver"
+	"github.com/umai-protocol/umai/internal/demoapp"
+	"github.com/umai-protocol/umai/pkg/umaispool"
 )
 
 func TestStorage_DocumentLifecycle(t *testing.T) {
 	tmpDir := t.TempDir()
-	store, err := umaiserver.NewStorage(tmpDir, 10*1024*1024)
+	docs, err := demoapp.NewDocStore(tmpDir, 10*1024*1024)
 	if err != nil {
-		t.Fatalf("Failed to init storage: %v", err)
+		t.Fatalf("Failed to init DocStore: %v", err)
 	}
 
 	content := []byte("Hello, UMAI world! Binary document test.")
-	docInfo, err := store.SaveDocument("test_doc.txt", bytes.NewReader(content))
+	docInfo, err := docs.SaveDocument("test_doc.txt", bytes.NewReader(content))
 	if err != nil {
 		t.Fatalf("Failed to save document: %v", err)
 	}
@@ -41,7 +42,7 @@ func TestStorage_DocumentLifecycle(t *testing.T) {
 	}
 
 	// Verify download path
-	path, err := store.GetDocumentPath("test_doc.txt")
+	path, err := docs.GetDocumentPath("test_doc.txt")
 	if err != nil {
 		t.Fatalf("Failed to get doc path: %v", err)
 	}
@@ -51,26 +52,25 @@ func TestStorage_DocumentLifecycle(t *testing.T) {
 	}
 
 	// Traversal attack protection
-	_, err = store.SaveDocument("../../../etc/passwd", bytes.NewReader(content))
+	_, err = docs.SaveDocument("../../../etc/passwd", bytes.NewReader(content))
 	if err == nil {
-		// Even if sanitized to 'passwd', verify it stays within docsDir
-		p, err := store.GetDocumentPath("passwd")
+		p, err := docs.GetDocumentPath("passwd")
 		if err == nil && !filepath.HasPrefix(p, filepath.Join(tmpDir, "docs")) {
 			t.Errorf("Path escaped docsDir: %s", p)
 		}
 	}
 
-	_, err = store.GetDocumentPath("../../outside.txt")
+	_, err = docs.GetDocumentPath("../../outside.txt")
 	if err == nil {
 		t.Errorf("Expected error on directory traversal query")
 	}
 
 	// Delete
-	if err := store.DeleteDocument("test_doc.txt"); err != nil {
+	if err := docs.DeleteDocument("test_doc.txt"); err != nil {
 		t.Fatalf("Failed to delete document: %v", err)
 	}
 
-	_, err = store.GetDocumentPath("test_doc.txt")
+	_, err = docs.GetDocumentPath("test_doc.txt")
 	if err == nil {
 		t.Errorf("Expected error retrieving deleted document")
 	}
@@ -78,21 +78,36 @@ func TestStorage_DocumentLifecycle(t *testing.T) {
 
 func TestStorage_ImmutabilityAndSnapshots(t *testing.T) {
 	tmpDir := t.TempDir()
-	store, err := umaiserver.NewStorage(tmpDir, 10*1024*1024)
+	store, err := umaispool.NewStorage(tmpDir, 10*1024*1024)
 	if err != nil {
 		t.Fatalf("Init storage: %v", err)
+	}
+	docs, err := demoapp.NewDocStore(tmpDir, 10*1024*1024)
+	if err != nil {
+		t.Fatalf("Init DocStore: %v", err)
 	}
 
 	// Create original document in docs/
 	initialContent := []byte("Original document v1")
-	_, err = store.SaveDocument("spec.pdf", bytes.NewReader(initialContent))
+	_, err = docs.SaveDocument("spec.pdf", bytes.NewReader(initialContent))
 	if err != nil {
 		t.Fatalf("Save document: %v", err)
 	}
 
-	// Create outbox message attaching spec.pdf
+	// Open spec.pdf and snapshot into immutable outbox message
+	docPath, err := docs.GetDocumentPath("spec.pdf")
+	if err != nil {
+		t.Fatalf("GetDocumentPath: %v", err)
+	}
+	docFile, err := os.Open(docPath)
+	if err != nil {
+		t.Fatalf("Open doc: %v", err)
+	}
 	payload := map[string]string{"title": "Proposal", "version": "1.0"}
-	msg, err := store.CreateOutboxMessage(payload, []string{"spec.pdf"})
+	msg, err := store.CreateOutboxMessage(payload, []umaispool.AttachmentReader{
+		{Name: "spec.pdf", Reader: docFile},
+	})
+	_ = docFile.Close()
 	if err != nil {
 		t.Fatalf("Create outbox message: %v", err)
 	}
@@ -107,7 +122,7 @@ func TestStorage_ImmutabilityAndSnapshots(t *testing.T) {
 
 	// Now MODIFY the original document in docs/
 	modifiedContent := []byte("Tampered / Modified document v2 !!!")
-	_, err = store.SaveDocument("spec.pdf", bytes.NewReader(modifiedContent))
+	_, err = docs.SaveDocument("spec.pdf", bytes.NewReader(modifiedContent))
 	if err != nil {
 		t.Fatalf("Overwrite document: %v", err)
 	}
@@ -123,7 +138,7 @@ func TestStorage_ImmutabilityAndSnapshots(t *testing.T) {
 	}
 
 	// Delete the original document completely from docs/
-	_ = store.DeleteDocument("spec.pdf")
+	_ = docs.DeleteDocument("spec.pdf")
 
 	// Snapshot must still exist
 	snapshotDataAfterDelete, err := os.ReadFile(attPath)
@@ -136,19 +151,20 @@ func TestStorage_ServerRestartPersistence(t *testing.T) {
 	tmpDir := t.TempDir()
 
 	// Instance 1
-	store1, err := umaiserver.NewStorage(tmpDir, 10*1024*1024)
+	store1, err := umaispool.NewStorage(tmpDir, 10*1024*1024)
 	if err != nil {
 		t.Fatalf("Init storage 1: %v", err)
 	}
 
-	_, _ = store1.SaveDocument("doc.txt", bytes.NewReader([]byte("persisted")))
-	msg, err := store1.CreateOutboxMessage(map[string]string{"foo": "bar"}, []string{"doc.txt"})
+	msg, err := store1.CreateOutboxMessage(map[string]string{"foo": "bar"}, []umaispool.AttachmentReader{
+		{Name: "doc.txt", Reader: bytes.NewReader([]byte("persisted"))},
+	})
 	if err != nil {
 		t.Fatalf("Create outbox message: %v", err)
 	}
 
 	// Accept an incoming message
-	_, err = store1.AcceptMessage("msg-incoming-42", "payload", []umaiserver.AttachmentReader{
+	_, err = store1.AcceptMessage("msg-incoming-42", "payload", []umaispool.AttachmentReader{
 		{Name: "data.bin", Reader: bytes.NewReader([]byte{0x01, 0x02, 0x03, 0x04})},
 	})
 	if err != nil {
@@ -156,7 +172,7 @@ func TestStorage_ServerRestartPersistence(t *testing.T) {
 	}
 
 	// "Restart": Initialize new storage instance pointing to the same dataDir
-	store2, err := umaiserver.NewStorage(tmpDir, 10*1024*1024)
+	store2, err := umaispool.NewStorage(tmpDir, 10*1024*1024)
 	if err != nil {
 		t.Fatalf("Init storage 2 (restart): %v", err)
 	}
@@ -184,7 +200,7 @@ func TestStorage_ServerRestartPersistence(t *testing.T) {
 
 func TestStorage_CrashRecoveryAndFailClosedAck(t *testing.T) {
 	tmpDir := t.TempDir()
-	store1, err := umaiserver.NewStorage(tmpDir, 10*1024*1024)
+	store1, err := umaispool.NewStorage(tmpDir, 10*1024*1024)
 	if err != nil {
 		t.Fatalf("Init storage 1: %v", err)
 	}
@@ -202,7 +218,7 @@ func TestStorage_CrashRecoveryAndFailClosedAck(t *testing.T) {
 	_ = os.MkdirAll(orphanTmp, 0700)
 
 	// Restart storage: NewStorage must purge .staging/ and reconcile inbox/msg-crash-99 into acceptedIDs
-	store2, err := umaiserver.NewStorage(tmpDir, 10*1024*1024)
+	store2, err := umaispool.NewStorage(tmpDir, 10*1024*1024)
 	if err != nil {
 		t.Fatalf("Init storage 2: %v", err)
 	}
@@ -217,9 +233,16 @@ func TestStorage_CrashRecoveryAndFailClosedAck(t *testing.T) {
 	}
 
 	// Verify fail-closed AcknowledgeMessagesVerified when outbox message.json is corrupt or unsigned
-	pubA, privA := umaiserver.DeriveDemoKeyPair("app-a")
-	pubB, _ := umaiserver.DeriveDemoKeyPair("app-b")
-	store2.SetKeys("app-a", pubA, privA, pubB)
+	_, privA := demoapp.DeriveDemoKeyPair("app-a")
+	pubB, _ := demoapp.DeriveDemoKeyPair("app-b")
+	if err := store2.SetSigningConfig(umaispool.SigningConfig{
+		LocalIdentity: "app-a",
+		PeerIdentity:  "app-b",
+		PrivateKey:    privA,
+		PeerPublicKey: pubB,
+	}); err != nil {
+		t.Fatalf("SetSigningConfig: %v", err)
+	}
 
 	outMsg, err := store2.CreateOutboxMessage(map[string]string{"hello": "world"}, nil)
 	if err != nil {
@@ -227,7 +250,7 @@ func TestStorage_CrashRecoveryAndFailClosedAck(t *testing.T) {
 	}
 
 	// Corrupt outbox/{dirKey}/message.json by stripping its signature on disk
-	outDirKey, err := umaiserver.StorageDirKey(outMsg.ID)
+	outDirKey, err := umaispool.StorageDirKey(outMsg.ID)
 	if err != nil {
 		t.Fatalf("StorageDirKey: %v", err)
 	}
@@ -242,7 +265,11 @@ func TestStorage_CrashRecoveryAndFailClosedAck(t *testing.T) {
 	}
 
 	// Verify D2: legitimate message IDs and document filenames containing ".tmp-" or starting with "." (e.g. ".tmp-1") survive restart and appear in listings
-	if _, err := store2.SaveDocument("contract.tmp-final.txt", bytes.NewReader([]byte("important contract"))); err != nil {
+	docs2, err := demoapp.NewDocStore(tmpDir, 10*1024*1024)
+	if err != nil {
+		t.Fatalf("NewDocStore: %v", err)
+	}
+	if _, err := docs2.SaveDocument("contract.tmp-final.txt", bytes.NewReader([]byte("important contract"))); err != nil {
 		t.Fatalf("SaveDocument(contract.tmp-final.txt): %v", err)
 	}
 	if _, err := store2.AcceptMessage(".tmp-1", map[string]string{"ok": "true"}, nil); err != nil {
@@ -253,7 +280,7 @@ func TestStorage_CrashRecoveryAndFailClosedAck(t *testing.T) {
 	}
 
 	// Verify D3: duplicate attachment filenames in a message are rejected via O_EXCL / exact deduplication
-	_, err = store2.AcceptMessage("msg-dup-collision", map[string]string{}, []umaiserver.AttachmentReader{
+	_, err = store2.AcceptMessage("msg-dup-collision", map[string]string{}, []umaispool.AttachmentReader{
 		{Name: "Invoice.txt", Reader: bytes.NewReader([]byte("first"))},
 		{Name: "Invoice.txt", Reader: bytes.NewReader([]byte("second"))},
 	})
@@ -262,11 +289,15 @@ func TestStorage_CrashRecoveryAndFailClosedAck(t *testing.T) {
 	}
 
 	// Restart into store3 and confirm .tmp-1, legit.tmp-message, and contract.tmp-final.txt are still intact and listed!
-	store3, err := umaiserver.NewStorage(tmpDir, 10*1024*1024)
+	store3, err := umaispool.NewStorage(tmpDir, 10*1024*1024)
 	if err != nil {
 		t.Fatalf("Init storage 3: %v", err)
 	}
-	if _, err := store3.GetDocumentPath("contract.tmp-final.txt"); err != nil {
+	docs3, err := demoapp.NewDocStore(tmpDir, 10*1024*1024)
+	if err != nil {
+		t.Fatalf("Init docs 3: %v", err)
+	}
+	if _, err := docs3.GetDocumentPath("contract.tmp-final.txt"); err != nil {
 		t.Errorf("Expected contract.tmp-final.txt to survive restart (D2), got: %v", err)
 	}
 	if _, err := store3.GetInboxMessage(".tmp-1"); err != nil {
@@ -292,20 +323,27 @@ func TestStorage_CrashRecoveryAndFailClosedAck(t *testing.T) {
 
 func TestStorage_IndexWriteFailure_CommitRecovery_And_HotFolderDeletion(t *testing.T) {
 	tmpDir := t.TempDir()
-	pubA, privA := umaiserver.DeriveDemoKeyPair("app-a")
-	pubB, privB := umaiserver.DeriveDemoKeyPair("app-b")
+	pubA, privA := demoapp.DeriveDemoKeyPair("app-a")
+	_, privB := demoapp.DeriveDemoKeyPair("app-b")
 
-	store, err := umaiserver.NewStorage(tmpDir, 10*1024*1024)
+	store, err := umaispool.NewStorage(tmpDir, 10*1024*1024)
 	if err != nil {
 		t.Fatalf("NewStorage: %v", err)
 	}
-	store.SetKeys("app-b", pubB, privB, pubA)
+	if err := store.SetSigningConfig(umaispool.SigningConfig{
+		LocalIdentity: "app-b",
+		PeerIdentity:  "app-a",
+		PrivateKey:    privB,
+		PeerPublicKey: pubA,
+	}); err != nil {
+		t.Fatalf("SetSigningConfig: %v", err)
+	}
 
 	msgID := "msg-idx-atomic-1"
 	payload := map[string]string{"doc": "atomic-index"}
 	attBytes := []byte("attachment payload")
 	attHash := sha256.Sum256(attBytes)
-	sigHex, err := umaiserver.SignPutMessage(privA, "app-a", "app-b", msgID, payload, []umaiserver.AttachmentInfo{
+	sigHex, err := umaispool.SignPutMessage(privA, "app-a", "app-b", msgID, payload, []umaispool.AttachmentInfo{
 		{Name: "doc.bin", Size: int64(len(attBytes)), SHA256: hex.EncodeToString(attHash[:])},
 	})
 	if err != nil {
@@ -319,7 +357,7 @@ func TestStorage_IndexWriteFailure_CommitRecovery_And_HotFolderDeletion(t *testi
 		t.Fatalf("MkdirAll blocker: %v", err)
 	}
 
-	_, err = store.AcceptSignedMessage(msgID, payload, []umaiserver.AttachmentReader{
+	_, err = store.AcceptSignedMessage(msgID, payload, []umaispool.AttachmentReader{
 		{Name: "doc.bin", Reader: bytes.NewReader(attBytes)},
 	}, sigHex)
 	if err == nil {
@@ -336,20 +374,25 @@ func TestStorage_IndexWriteFailure_CommitRecovery_And_HotFolderDeletion(t *testi
 
 	// Remove blocker and restart storage: state must be consistently unaccepted (IsAccepted == false && GetInboxMessage == ErrNotFound)
 	_ = os.RemoveAll(acceptedPath)
-	storeRestarted, err := umaiserver.NewStorage(tmpDir, 10*1024*1024)
+	storeRestarted, err := umaispool.NewStorage(tmpDir, 10*1024*1024)
 	if err != nil {
 		t.Fatalf("Restart NewStorage: %v", err)
 	}
-	storeRestarted.SetKeys("app-b", pubB, privB, pubA)
+	_ = storeRestarted.SetSigningConfig(umaispool.SigningConfig{
+		LocalIdentity: "app-b",
+		PeerIdentity:  "app-a",
+		PrivateKey:    privB,
+		PeerPublicKey: pubA,
+	})
 	if storeRestarted.IsAccepted(msgID) {
 		t.Fatalf("After restart following failed commit, IsAccepted(%s) must remain false", msgID)
 	}
-	if _, err := storeRestarted.GetInboxMessage(msgID); !errors.Is(err, umaiserver.ErrNotFound) {
+	if _, err := storeRestarted.GetInboxMessage(msgID); !errors.Is(err, umaispool.ErrNotFound) {
 		t.Fatalf("Expected ErrNotFound on GetInboxMessage(%s), got %v", msgID, err)
 	}
 
 	// 2. Retry acceptance now that accepted.json is writable -> must succeed and expose inbox/m-<sha256(id)>
-	acceptedMsg, err := storeRestarted.AcceptSignedMessage(msgID, payload, []umaiserver.AttachmentReader{
+	acceptedMsg, err := storeRestarted.AcceptSignedMessage(msgID, payload, []umaispool.AttachmentReader{
 		{Name: "doc.bin", Reader: bytes.NewReader(attBytes)},
 	}, sigHex)
 	if err != nil {
@@ -360,15 +403,20 @@ func TestStorage_IndexWriteFailure_CommitRecovery_And_HotFolderDeletion(t *testi
 	}
 
 	// 3. Simulate external hot-folder consumer immediately archiving & deleting inbox/m-<sha256(id)>, then server restart
-	dirKey, _ := umaiserver.StorageDirKey(msgID)
+	dirKey, _ := umaispool.StorageDirKey(msgID)
 	if err := os.RemoveAll(filepath.Join(tmpDir, "inbox", dirKey)); err != nil {
 		t.Fatalf("Failed to remove inbox dir in hot-folder simulation: %v", err)
 	}
-	storeAfterConsume, err := umaiserver.NewStorage(tmpDir, 10*1024*1024)
+	storeAfterConsume, err := umaispool.NewStorage(tmpDir, 10*1024*1024)
 	if err != nil {
 		t.Fatalf("Restart after hot-folder deletion: %v", err)
 	}
-	storeAfterConsume.SetKeys("app-b", pubB, privB, pubA)
+	_ = storeAfterConsume.SetSigningConfig(umaispool.SigningConfig{
+		LocalIdentity: "app-b",
+		PeerIdentity:  "app-a",
+		PrivateKey:    privB,
+		PeerPublicKey: pubA,
+	})
 	if !storeAfterConsume.IsAccepted(msgID) {
 		t.Fatalf("Expected IsAccepted(%s) == true after hot-folder consumer deleted inbox dir", msgID)
 	}
@@ -386,10 +434,10 @@ func TestStorage_IndexWriteFailure_CommitRecovery_And_HotFolderDeletion(t *testi
 
 	// 4. Simulate crash between accepted.json commit and final rename from .committing/ into inbox/
 	crashID := "msg-crash-after-index"
-	crashKey, _ := umaiserver.StorageDirKey(crashID)
+	crashKey, _ := umaispool.StorageDirKey(crashID)
 	commPath := filepath.Join(tmpDir, ".committing", crashKey)
 	_ = os.MkdirAll(filepath.Join(commPath, "attachments"), 0700)
-	crashMsgBytes, _ := json.Marshal(umaiserver.Message{
+	crashMsgBytes, _ := json.Marshal(umaispool.Message{
 		ID:         crashID,
 		Payload:    map[string]string{"recovered": "yes"},
 		AckReceipt: "rec-crash-1",
@@ -401,7 +449,7 @@ func TestStorage_IndexWriteFailure_CommitRecovery_And_HotFolderDeletion(t *testi
 	})
 	_ = os.WriteFile(filepath.Join(tmpDir, "accepted.json"), consolidatedBytes, 0600)
 
-	storeRecovered, err := umaiserver.NewStorage(tmpDir, 10*1024*1024)
+	storeRecovered, err := umaispool.NewStorage(tmpDir, 10*1024*1024)
 	if err != nil {
 		t.Fatalf("Restart for .committing recovery: %v", err)
 	}
@@ -422,20 +470,25 @@ func TestStorage_FailedDataDirSync_KeepsMessageUnconfirmedAndOutOfInbox(t *testi
 	if err != nil {
 		t.Fatalf("filepath.Abs: %v", err)
 	}
-	pubA, privA := umaiserver.DeriveDemoKeyPair("app-a")
-	pubB, privB := umaiserver.DeriveDemoKeyPair("app-b")
+	pubA, privA := demoapp.DeriveDemoKeyPair("app-a")
+	pubB, privB := demoapp.DeriveDemoKeyPair("app-b")
 
-	store, err := umaiserver.NewStorage(absTmpDir, 10*1024*1024)
+	store, err := umaispool.NewStorage(absTmpDir, 10*1024*1024)
 	if err != nil {
 		t.Fatalf("NewStorage: %v", err)
 	}
-	store.SetKeys("app-b", pubB, privB, pubA)
+	_ = store.SetSigningConfig(umaispool.SigningConfig{
+		LocalIdentity: "app-b",
+		PeerIdentity:  "app-a",
+		PrivateKey:    privB,
+		PeerPublicKey: pubA,
+	})
 
 	msgID := "msg-sync-fault-1"
 	payload := map[string]string{"case": "durability-flush"}
 	attBytes := []byte("important binary content")
 	attHash := sha256.Sum256(attBytes)
-	sigHex, err := umaiserver.SignPutMessage(privA, "app-a", "app-b", msgID, payload, []umaiserver.AttachmentInfo{
+	sigHex, err := umaispool.SignPutMessage(privA, "app-a", "app-b", msgID, payload, []umaispool.AttachmentInfo{
 		{Name: "evidence.bin", Size: int64(len(attBytes)), SHA256: hex.EncodeToString(attHash[:])},
 	})
 	if err != nil {
@@ -451,7 +504,7 @@ func TestStorage_FailedDataDirSync_KeepsMessageUnconfirmedAndOutOfInbox(t *testi
 	})
 
 	// 1. Initial acceptance must return the injected synchronization error.
-	_, err = store.AcceptSignedMessage(msgID, payload, []umaiserver.AttachmentReader{
+	_, err = store.AcceptSignedMessage(msgID, payload, []umaispool.AttachmentReader{
 		{Name: "evidence.bin", Reader: bytes.NewReader(attBytes)},
 	}, sigHex)
 	if err == nil {
@@ -463,7 +516,7 @@ func TestStorage_FailedDataDirSync_KeepsMessageUnconfirmedAndOutOfInbox(t *testi
 	if err != nil || len(inboxEntries) != 0 {
 		t.Fatalf("Expected 0 visible inbox/ directories after failed dataDir sync, got %d (err=%v)", len(inboxEntries), err)
 	}
-	dirKey, _ := umaiserver.StorageDirKey(msgID)
+	dirKey, _ := umaispool.StorageDirKey(msgID)
 	if _, err := os.Stat(filepath.Join(absTmpDir, ".committing", dirKey, "message.json")); err != nil {
 		t.Fatalf("Expected recovery copy to remain preserved in .committing/%s, got: %v", dirKey, err)
 	}
@@ -472,7 +525,7 @@ func TestStorage_FailedDataDirSync_KeepsMessageUnconfirmedAndOutOfInbox(t *testi
 	if store.IsAccepted(msgID) {
 		t.Fatalf("IsAccepted(%s) must remain false while dataDir sync is unresolved", msgID)
 	}
-	if _, err := store.GetInboxMessage(msgID); !errors.Is(err, umaiserver.ErrNotFound) {
+	if _, err := store.GetInboxMessage(msgID); !errors.Is(err, umaispool.ErrNotFound) {
 		t.Fatalf("GetInboxMessage(%s) must return ErrNotFound while unconfirmed, got: %v", msgID, err)
 	}
 	if _, err := store.GetAcceptance([]string{msgID}); err == nil {
@@ -480,12 +533,12 @@ func TestStorage_FailedDataDirSync_KeepsMessageUnconfirmedAndOutOfInbox(t *testi
 	}
 
 	// 4. Duplicate acceptance MUST also fail while the synchronization failure remains active (and reject forged signatures).
-	if _, err := store.AcceptSignedMessage(msgID, payload, []umaiserver.AttachmentReader{
+	if _, err := store.AcceptSignedMessage(msgID, payload, []umaispool.AttachmentReader{
 		{Name: "evidence.bin", Reader: bytes.NewReader(attBytes)},
 	}, sigHex); err == nil {
 		t.Fatalf("Duplicate AcceptSignedMessage must fail while dataDir sync failure remains active")
 	}
-	if _, err := store.AcceptSignedMessage(msgID, payload, nil, "deadbeef"); !errors.Is(err, umaiserver.ErrInvalidSignature) {
+	if _, err := store.AcceptSignedMessage(msgID, payload, nil, "deadbeef"); !errors.Is(err, umaispool.ErrInvalidSignature) {
 		t.Fatalf("Expected ErrInvalidSignature on forged duplicate PUT during pending commit, got: %v", err)
 	}
 
@@ -500,7 +553,7 @@ func TestStorage_FailedDataDirSync_KeepsMessageUnconfirmedAndOutOfInbox(t *testi
 	if !status.Accepted || status.AckReceipt == "" {
 		t.Fatalf("Expected confirmed acceptance with non-empty receipt after finalization, got: %+v", status)
 	}
-	if err := umaiserver.VerifyAckReceipt(pubB, "app-b", msgID, sigHex, status.AckReceipt); err != nil {
+	if err := umaispool.VerifyAckReceipt(pubB, "app-b", msgID, sigHex, status.AckReceipt); err != nil {
 		t.Fatalf("Expected valid Ed25519 AckReceipt after finalization: %v", err)
 	}
 	if !store.IsAccepted(msgID) {
@@ -516,14 +569,19 @@ func TestStorage_FailedDataDirSync_KeepsMessageUnconfirmedAndOutOfInbox(t *testi
 
 func TestStorage_CaseInsensitiveIDCollisions_And_WindowsProblematicIDs(t *testing.T) {
 	tmpDir := t.TempDir()
-	pubA, privA := umaiserver.DeriveDemoKeyPair("app-a")
-	pubB, privB := umaiserver.DeriveDemoKeyPair("app-b")
+	pubA, privA := demoapp.DeriveDemoKeyPair("app-a")
+	_, privB := demoapp.DeriveDemoKeyPair("app-b")
 
-	store, err := umaiserver.NewStorage(tmpDir, 10*1024*1024)
+	store, err := umaispool.NewStorage(tmpDir, 10*1024*1024)
 	if err != nil {
 		t.Fatalf("NewStorage: %v", err)
 	}
-	store.SetKeys("app-b", pubB, privB, pubA)
+	_ = store.SetSigningConfig(umaispool.SigningConfig{
+		LocalIdentity: "app-b",
+		PeerIdentity:  "app-a",
+		PrivateKey:    privB,
+		PeerPublicKey: pubA,
+	})
 
 	cases := []struct {
 		id      string
@@ -539,13 +597,13 @@ func TestStorage_CaseInsensitiveIDCollisions_And_WindowsProblematicIDs(t *testin
 	for _, tc := range cases {
 		h := sha256.Sum256(tc.content)
 		payload := map[string]string{"exact_id": tc.id}
-		sig, err := umaiserver.SignPutMessage(privA, "app-a", "app-b", tc.id, payload, []umaiserver.AttachmentInfo{
+		sig, err := umaispool.SignPutMessage(privA, "app-a", "app-b", tc.id, payload, []umaispool.AttachmentInfo{
 			{Name: "body.bin", Size: int64(len(tc.content)), SHA256: hex.EncodeToString(h[:])},
 		})
 		if err != nil {
 			t.Fatalf("SignPutMessage(%s): %v", tc.id, err)
 		}
-		if _, err := store.AcceptSignedMessage(tc.id, payload, []umaiserver.AttachmentReader{
+		if _, err := store.AcceptSignedMessage(tc.id, payload, []umaispool.AttachmentReader{
 			{Name: "body.bin", Reader: bytes.NewReader(tc.content)},
 		}, sig); err != nil {
 			t.Fatalf("AcceptSignedMessage(%s) failed: %v", tc.id, err)
@@ -553,7 +611,7 @@ func TestStorage_CaseInsensitiveIDCollisions_And_WindowsProblematicIDs(t *testin
 	}
 
 	// Restart storage and verify every case-colliding and OS-sensitive ID preserved its own distinct message & bytes
-	restarted, err := umaiserver.NewStorage(tmpDir, 10*1024*1024)
+	restarted, err := umaispool.NewStorage(tmpDir, 10*1024*1024)
 	if err != nil {
 		t.Fatalf("Restart NewStorage: %v", err)
 	}
@@ -597,7 +655,7 @@ func TestStorage_CaseInsensitiveIDCollisions_And_WindowsProblematicIDs(t *testin
 	if _, err := restarted.GetAcceptance([]string{"../bad"}); err == nil {
 		t.Errorf("Expected GetAcceptance to reject invalid message ID")
 	}
-	tooMany := make([]string, umaiserver.MaxBatchIDs+1)
+	tooMany := make([]string, umaispool.MaxBatchIDs+1)
 	for i := range tooMany {
 		tooMany[i] = "msg-ok"
 	}

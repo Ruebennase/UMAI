@@ -13,12 +13,13 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/umai-protocol/umai/pkg/umaiserver"
+	"github.com/umai-protocol/umai/internal/demoapp"
+	"github.com/umai-protocol/umai/pkg/umaispool"
 )
 
-// TestApp wraps a server instance and handles in-memory HTTP requests.
+// TestApp wraps a demo server instance and handles in-memory HTTP requests.
 type TestApp struct {
-	Server    *umaiserver.Server
+	Server    *demoapp.Server
 	SessionID string
 	Role      string
 }
@@ -26,7 +27,7 @@ type TestApp struct {
 // setupApp creates an in-memory application instance with active session.
 func setupApp(t *testing.T, role string, peerOrigin string) *TestApp {
 	dataDir := t.TempDir()
-	cfg := umaiserver.DefaultConfig(role)
+	cfg := demoapp.DefaultConfig(role)
 	cfg.DataDir = dataDir
 	cfg.PeerOrigin = peerOrigin
 	cfg.AllowDemoDefaults = true
@@ -34,7 +35,7 @@ func setupApp(t *testing.T, role string, peerOrigin string) *TestApp {
 	staticDir := t.TempDir()
 	_ = os.WriteFile(staticDir+"/index.html", []byte("<html></html>"), 0644)
 
-	server, err := umaiserver.NewServer(cfg, staticDir)
+	server, err := demoapp.NewServer(cfg, staticDir)
 	if err != nil {
 		t.Fatalf("NewServer error: %v", err)
 	}
@@ -65,7 +66,7 @@ func authenticatedRequest(method, url string, sessionID string, body io.Reader, 
 	}
 	req.Header.Set("X-UMAI-CSRF", "1")
 	req.AddCookie(&http.Cookie{
-		Name:  umaiserver.SessionCookieName,
+		Name:  demoapp.SessionCookieName,
 		Value: sessionID,
 	})
 	if contentType != "" {
@@ -82,11 +83,11 @@ func TestProtocol_BasicExchange_WithIntegrity(t *testing.T) {
 	file1Content := []byte("First attachment: binary executable data \x00\x01\x02\x03\xFF")
 	file2Content := []byte("Second attachment: utf-8 text file with special characters: üöä €")
 
-	_, err := appA.Server.Storage().SaveDocument("binary.bin", bytes.NewReader(file1Content))
+	_, err := appA.Server.Docs().SaveDocument("binary.bin", bytes.NewReader(file1Content))
 	if err != nil {
 		t.Fatalf("Save binary.bin: %v", err)
 	}
-	_, err = appA.Server.Storage().SaveDocument("report.txt", bytes.NewReader(file2Content))
+	_, err = appA.Server.Docs().SaveDocument("report.txt", bytes.NewReader(file2Content))
 	if err != nil {
 		t.Fatalf("Save report.txt: %v", err)
 	}
@@ -96,7 +97,7 @@ func TestProtocol_BasicExchange_WithIntegrity(t *testing.T) {
 		"subject":  "Confidential Package",
 		"priority": 1,
 	}
-	msgA, err := appA.Server.Storage().CreateOutboxMessage(payload, []string{"binary.bin", "report.txt"})
+	msgA, err := appA.Server.CreateOutboxFromDocs(payload, []string{"binary.bin", "report.txt"})
 	if err != nil {
 		t.Fatalf("Create outbox message: %v", err)
 	}
@@ -205,7 +206,7 @@ func TestProtocol_ZeroAttachmentsExchange(t *testing.T) {
 	appA := setupApp(t, "app-a", "http://127.0.0.1:8082")
 	appB := setupApp(t, "app-b", "http://127.0.0.1:8081")
 
-	msg, err := appA.Server.Storage().CreateOutboxMessage(map[string]string{"type": "ping"}, []string{})
+	msg, err := appA.Server.CreateOutboxFromDocs(map[string]string{"type": "ping"}, []string{})
 	if err != nil {
 		t.Fatalf("Create outbox message: %v", err)
 	}
@@ -234,8 +235,8 @@ func TestProtocol_DuplicatePrevention(t *testing.T) {
 	appA := setupApp(t, "app-a", "http://127.0.0.1:8082")
 	appB := setupApp(t, "app-b", "http://127.0.0.1:8081")
 
-	_, _ = appA.Server.Storage().SaveDocument("file.txt", bytes.NewReader([]byte("content")))
-	msgA, err := appA.Server.Storage().CreateOutboxMessage(map[string]string{"text": "First send"}, []string{"file.txt"})
+	_, _ = appA.Server.Docs().SaveDocument("file.txt", bytes.NewReader([]byte("content")))
+	msgA, err := appA.Server.CreateOutboxFromDocs(map[string]string{"text": "First send"}, []string{"file.txt"})
 	if err != nil {
 		t.Fatalf("CreateOutboxMessage: %v", err)
 	}
@@ -302,7 +303,7 @@ func TestProtocol_InterruptedTransfer_AllOrNothing(t *testing.T) {
 	msgID := "msg-interrupt-999"
 
 	// Simulate an interrupted network transfer mid-file
-	_, err := appB.Server.Storage().AcceptMessage(msgID, "payload", []umaiserver.AttachmentReader{
+	_, err := appB.Server.Storage().AcceptMessage(msgID, "payload", []umaispool.AttachmentReader{
 		{Name: "interrupted.bin", Reader: &errorReader{}},
 	})
 	if err == nil {
@@ -329,8 +330,8 @@ func TestSecurity_SignedMessages_TamperAndForgeryRejection(t *testing.T) {
 	appA := setupApp(t, "app-a", "http://127.0.0.1:8082")
 	appB := setupApp(t, "app-b", "http://127.0.0.1:8081")
 
-	_, _ = appA.Server.Storage().SaveDocument("invoice.pdf", bytes.NewReader([]byte("Original Amount: EUR 100")))
-	msgA, err := appA.Server.Storage().CreateOutboxMessage(map[string]any{"amount": 100}, []string{"invoice.pdf"})
+	_, _ = appA.Server.Docs().SaveDocument("invoice.pdf", bytes.NewReader([]byte("Original Amount: EUR 100")))
+	msgA, err := appA.Server.CreateOutboxFromDocs(map[string]any{"amount": 100}, []string{"invoice.pdf"})
 	if err != nil {
 		t.Fatalf("CreateOutboxMessage: %v", err)
 	}
@@ -392,9 +393,9 @@ func TestSecurity_SignedMessages_TamperAndForgeryRejection(t *testing.T) {
 		t.Fatalf("Outbox message on A must not be deleted on forged ACK receipt")
 	}
 
-	// 4. Verify receiver role binding in UMAI-PUT-V1: a message signed by app-a for "app-c" must be rejected by app-b
-	_, privA := umaiserver.DeriveDemoKeyPair("app-a")
-	sigForAppC, err := umaiserver.SignPutMessage(privA, "app-a", "app-c", msgA.ID, msgA.Payload, msgA.Attachments)
+	// 4. Verify receiver identity binding in UMAI-PUT-V1: a message signed by app-a for "app-c" must be rejected by app-b
+	_, privA := demoapp.DeriveDemoKeyPair("app-a")
+	sigForAppC, err := umaispool.SignPutMessage(privA, "app-a", "app-c", msgA.ID, msgA.Payload, msgA.Attachments)
 	if err != nil {
 		t.Fatalf("SignPutMessage for app-c: %v", err)
 	}
@@ -411,15 +412,15 @@ func TestSecurity_SignedMessages_TamperAndForgeryRejection(t *testing.T) {
 	resWrong := appB.Do(reqWrong)
 	defer resWrong.Body.Close()
 	if resWrong.StatusCode == http.StatusOK {
-		t.Fatalf("Expected B to reject message signed for different receiver role (app-c), got 200 OK")
+		t.Fatalf("Expected B to reject message signed for different receiver identity (app-c), got 200 OK")
 	}
 
-	// 5. Verify non-loopback address refuses deterministic demo keys unless AllowDemoDefaults (-demo) is enabled
-	nonLoopbackCfg := umaiserver.DefaultConfig("app-a")
+	// 5. Verify non-loopback address refuses deterministic demo keys unless explicit keys are supplied
+	nonLoopbackCfg := demoapp.DefaultConfig("app-a")
 	nonLoopbackCfg.ListenAddr = "0.0.0.0:8081"
 	nonLoopbackCfg.DataDir = t.TempDir()
-	if _, err := umaiserver.NewServer(nonLoopbackCfg, t.TempDir()); err == nil {
-		t.Fatalf("Expected NewServer on non-loopback 0.0.0.0:8081 without explicit keys or -demo to fail")
+	if _, err := demoapp.NewServer(nonLoopbackCfg, t.TempDir()); err == nil {
+		t.Fatalf("Expected NewServer on non-loopback 0.0.0.0:8081 without explicit keys to fail")
 	}
 }
 
@@ -458,8 +459,8 @@ func TestSecurity_CSRF_StatusLeak_And_DuplicateAttachment(t *testing.T) {
 	}
 
 	// 4. Duplicate attachment filename in a single message must be rejected
-	_, _ = appA.Server.Storage().SaveDocument("dup.txt", bytes.NewReader([]byte("hello")))
-	_, err := appA.Server.Storage().CreateOutboxMessage(map[string]string{}, []string{"dup.txt", "dup.txt"})
+	_, _ = appA.Server.Docs().SaveDocument("dup.txt", bytes.NewReader([]byte("hello")))
+	_, err := appA.Server.CreateOutboxFromDocs(map[string]string{}, []string{"dup.txt", "dup.txt"})
 	if err == nil {
 		t.Errorf("Expected error when creating message with duplicate attachment filenames")
 	}
@@ -528,7 +529,7 @@ func TestSecurity_StrictCSP_CookieCSRF_NilPayload_And_DuplicateProbe(t *testing.
 	}
 
 	// 3. Verify nil payload signing matches '{}' JSON payload in transit, and verify attachment download sandbox CSP
-	_, _ = appA.Server.Storage().SaveDocument("note.html", bytes.NewReader([]byte("<script>alert(1)</script>")))
+	_, _ = appA.Server.Docs().SaveDocument("note.html", bytes.NewReader([]byte("<script>alert(1)</script>")))
 	reqDl, _ := authenticatedRequest("GET", "/api/docs/note.html", appA.SessionID, nil, "")
 	resDl := appA.Do(reqDl)
 	defer resDl.Body.Close()
@@ -571,9 +572,9 @@ func TestSecurity_StrictCSP_CookieCSRF_NilPayload_And_DuplicateProbe(t *testing.
 	}
 
 	// 5. Verify static directory and DataDir overlap is rejected at startup (F1)
-	overlapCfg := umaiserver.DefaultConfig("app-a")
+	overlapCfg := demoapp.DefaultConfig("app-a")
 	overlapCfg.DataDir = filepath.Join(appA.Server.Config().DataDir, "sub")
-	if _, err := umaiserver.NewServer(overlapCfg, appA.Server.Config().DataDir); err == nil {
+	if _, err := demoapp.NewServer(overlapCfg, appA.Server.Config().DataDir); err == nil {
 		t.Errorf("Expected NewServer to reject overlapping staticDir and DataDir")
 	}
 
@@ -589,8 +590,8 @@ func TestSecurity_StrictCSP_CookieCSRF_NilPayload_And_DuplicateProbe(t *testing.
 	}
 
 	// 7. Verify exact 64-bit integer precision in CanonicalPutDigest (F5): 9007199254740992 vs 9007199254740993
-	d1, err1 := umaiserver.CanonicalPutDigest("app-a", "app-b", "msg-int", json.RawMessage(`{"n":9007199254740992}`), nil)
-	d2, err2 := umaiserver.CanonicalPutDigest("app-a", "app-b", "msg-int", json.RawMessage(`{"n":9007199254740993}`), nil)
+	d1, err1 := umaispool.CanonicalPutDigest("app-a", "app-b", "msg-int", json.RawMessage(`{"n":9007199254740992}`), nil)
+	d2, err2 := umaispool.CanonicalPutDigest("app-a", "app-b", "msg-int", json.RawMessage(`{"n":9007199254740993}`), nil)
 	if err1 != nil || err2 != nil || d1 == d2 {
 		t.Errorf("Expected distinct canonical digests for 9007199254740992 and 9007199254740993, got equal (%x)", d1)
 	}
@@ -616,15 +617,15 @@ func TestSecurity_StrictCSP_CookieCSRF_NilPayload_And_DuplicateProbe(t *testing.
 
 func TestProductionMode_RejectsDemoDefaults_And_NonLoopbackPeer(t *testing.T) {
 	// 1. Verify D4 protection: Production mode (AllowDemoDefaults: false) rejects demo defaults even on 127.0.0.1
-	prodCfg := umaiserver.DefaultConfig("app-a")
+	prodCfg := demoapp.DefaultConfig("app-a")
 	prodCfg.DataDir = t.TempDir()
 	prodCfg.AllowDemoDefaults = false
-	if _, err := umaiserver.NewServer(prodCfg, ""); err == nil {
+	if _, err := demoapp.NewServer(prodCfg, ""); err == nil {
 		t.Fatalf("Expected production mode (AllowDemoDefaults=false) to refuse built-in demo keys/password even on loopback (D4)")
 	}
 
 	// 2. Verify D4 protection: Even with AllowDemoDefaults=true, a non-loopback PeerOrigin refuses demo defaults
-	if _, err := umaiserver.NewServer(umaiserver.Config{
+	if _, err := demoapp.NewServer(demoapp.Config{
 		AppName:           "Public Peer Behind Reverse Proxy",
 		Role:              "app-a",
 		ListenAddr:        "127.0.0.1:8081",

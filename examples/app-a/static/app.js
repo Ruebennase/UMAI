@@ -406,89 +406,19 @@
 
   // --- UMAI Session Storage Adapter ---
   function createUmaiStorageAdapter() {
-    return {
-      async getOutboxIds() {
-        const res = await api('/api/outbox');
-        const list = await res.json();
-        return list.map(m => m.id);
+    return UMAI.createHttpSpoolAdapter({
+      baseUrl: '/api',
+      onUnauthorized() {
+        isAuthenticated = false;
+        showAuth();
       },
-
-      async getMessage(id) {
-        const res = await api(`/api/outbox/${encodeURIComponent(id)}`);
-        if (!res.ok) return null;
-        const meta = await res.json();
-
-        // Fetch attachment binary files as native File objects
-        const files = [];
-        for (const att of meta.attachments || []) {
-          const fileRes = await api(`/api/outbox/${encodeURIComponent(id)}/attachments/${encodeURIComponent(att.name)}`);
-          const blob = await fileRes.blob();
-          const file = new File([blob], att.name, { type: blob.type, lastModified: Date.now() });
-          files.push(file);
-        }
-
-        return {
-          id: meta.id,
-          payload: meta.payload,
-          attachments: files,
-          signature: meta.signature || ''
-        };
+      onAccepted() {
+        return loadInbox();
       },
-
-      async getAcceptance(ids) {
-        const res = await api('/api/inbox/acceptance', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ ids })
-        });
-        if (!res.ok) {
-          throw new Error(`Failed to query message acceptance (${res.status})`);
-        }
-        const data = await res.json();
-        if (!data || typeof data.results !== 'object' || data.results === null) {
-          throw new Error('Malformed acceptance lookup response');
-        }
-        return data.results;
-      },
-
-      async acceptMessage(putMsg) {
-        const formData = new FormData();
-        formData.append('id', putMsg.id);
-        const safePayload = (putMsg.payload !== undefined && putMsg.payload !== null) ? putMsg.payload : {};
-        formData.append('payload', JSON.stringify(safePayload));
-        if (putMsg.signature) {
-          formData.append('signature', putMsg.signature);
-        }
-
-        for (const file of putMsg.attachments || []) {
-          formData.append('attachments', file, file.name);
-        }
-
-        const res = await api('/api/inbox', {
-          method: 'POST',
-          body: formData
-        });
-
-        if (res.ok) {
-          const data = await res.json();
-          await loadInbox();
-          return { accepted: true, ackReceipt: data.ack_receipt || '' };
-        }
-        return { accepted: false };
-      },
-
-      async onAcknowledged(ids, receipts) {
-        const res = await api('/api/outbox/ack', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ ids, receipts: receipts || {} })
-        });
-        if (!res.ok) {
-          throw new Error('Failed to acknowledge outbox messages on server');
-        }
-        await loadOutbox();
+      onAcknowledged() {
+        return loadOutbox();
       }
-    };
+    });
   }
 
   // --- Initialize UMAI Session ---

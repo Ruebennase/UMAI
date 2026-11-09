@@ -3,28 +3,28 @@
 # Reverse-proxy setup for two independent domains hosting Application A and Application B
 # on a single VPS with automatic TLS certificate provisioning.
 #
-# Replace 'app-a.example.ch' and 'app-b.example.net' with your actual registered domain names.
+# Replace 'app-a.example.org' and 'app-b.example.net' with your actual registered domain names.
 #
-# IMPORTANT: When PeerOrigin or PeerEmbedURL is a non-loopback origin, pkg/umaiserver
-# refuses to start with built-in demo keys or the default demo password even when
-# listening on 127.0.0.1. Always supply explicit Ed25519 keys and credentials:
+# IMPORTANT: When PeerOrigin or PeerEmbedURL is a non-loopback origin, the demo servers
+# (internal/demoapp) refuse to start with built-in demo keys or the default demo password
+# even when listening on 127.0.0.1. Always supply explicit Ed25519 keys and credentials:
 #
 #   UMAI_SIGNING_PRIVATE_KEY=<app-a-priv-hex> \
 #   UMAI_PEER_PUBLIC_KEY=<app-b-pub-hex> \
 #   UMAI_AUTH_PASS=<strong-password-a> \
-#   ./bin/app-a -addr 127.0.0.1:8081 -peer-origin https://app-b.example.net
+#   ./bin/app-a -addr 127.0.0.1:8081 -peer https://app-b.example.net
 #
 #   UMAI_SIGNING_PRIVATE_KEY=<app-b-priv-hex> \
 #   UMAI_PEER_PUBLIC_KEY=<app-a-pub-hex> \
 #   UMAI_AUTH_PASS=<strong-password-b> \
 #   ./bin/app-b -addr 127.0.0.1:8082 \
-#     -peer-origin https://app-a.example.ch \
-#     -peer-embed-url https://app-a.example.ch/sync.html
+#     -peer https://app-a.example.org \
+#     -embed-url https://app-a.example.org/sync.html
 
 # ==============================================================================
 # Application A (Embedded Peer)
 # ==============================================================================
-app-a.example.ch {
+app-a.example.org {
     # Reverse proxy to local Go server for App A
     reverse_proxy 127.0.0.1:8081 {
         header_up Host {host}
@@ -69,7 +69,7 @@ app-b.example.net {
     # Security Headers:
     # Application B is the host and embeds App A via frame-src, but does not allow itself to be framed.
     header {
-        Content-Security-Policy "frame-ancestors 'none'; frame-src 'self' https://app-a.example.ch; default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'"
+        Content-Security-Policy "frame-ancestors 'none'; frame-src 'self' https://app-a.example.org; default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'"
         X-Content-Type-Options "nosniff"
         Referrer-Policy "no-referrer"
         Strict-Transport-Security "max-age=31536000; includeSubDomains"

@@ -4,13 +4,14 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 
-	"github.com/umai-protocol/umai/pkg/umaiserver"
+	"github.com/umai-protocol/umai/internal/demoapp"
 )
 
 func TestStaticAssets_ServingAndMimeTypes(t *testing.T) {
-	cfg := umaiserver.DefaultConfig("app-b")
+	cfg := demoapp.DefaultConfig("app-b")
 	cfg.AllowDemoDefaults = true
 	cfg.DataDir = t.TempDir()
 
@@ -19,7 +20,7 @@ func TestStaticAssets_ServingAndMimeTypes(t *testing.T) {
 		t.Fatalf("Failed to resolve static dir: %v", err)
 	}
 
-	server, err := umaiserver.NewServer(cfg, staticDir)
+	server, err := demoapp.NewServer(cfg, staticDir)
 	if err != nil {
 		t.Fatalf("Failed to create server: %v", err)
 	}
@@ -38,7 +39,6 @@ func TestStaticAssets_ServingAndMimeTypes(t *testing.T) {
 	reqCSS, _ := http.NewRequest("GET", "/style.css", nil)
 	recCSS := httptest.NewRecorder()
 	handler.ServeHTTP(recCSS, reqCSS)
-	t.Logf("style.css Status: %d, Content-Type: %s", recCSS.Code, recCSS.Header().Get("Content-Type"))
 	if recCSS.Code != http.StatusOK {
 		t.Errorf("Expected 200 for /style.css, got %d", recCSS.Code)
 	}
@@ -47,18 +47,21 @@ func TestStaticAssets_ServingAndMimeTypes(t *testing.T) {
 	reqJS, _ := http.NewRequest("GET", "/app.js", nil)
 	recJS := httptest.NewRecorder()
 	handler.ServeHTTP(recJS, reqJS)
-	t.Logf("app.js Status: %d, Content-Type: %s", recJS.Code, recJS.Header().Get("Content-Type"))
 	if recJS.Code != http.StatusOK {
 		t.Errorf("Expected 200 for /app.js, got %d", recJS.Code)
 	}
 
-	// 4. Request /js/umai.js
-	reqUmaiJS, _ := http.NewRequest("GET", "/js/umai.js", nil)
-	recUmaiJS := httptest.NewRecorder()
-	handler.ServeHTTP(recUmaiJS, reqUmaiJS)
-	t.Logf("/js/umai.js Status: %d, Content-Type: %s", recUmaiJS.Code, recUmaiJS.Header().Get("Content-Type"))
-	if recUmaiJS.Code != http.StatusOK {
-		t.Errorf("Expected 200 for /js/umai.js, got %d", recUmaiJS.Code)
+	// 4. Request /js/umai.js and /js/umai-spool.js
+	for _, scriptPath := range []string{"/js/umai.js", "/js/umai-spool.js"} {
+		reqScript, _ := http.NewRequest("GET", scriptPath, nil)
+		recScript := httptest.NewRecorder()
+		handler.ServeHTTP(recScript, reqScript)
+		if recScript.Code != http.StatusOK {
+			t.Errorf("Expected 200 for %s, got %d", scriptPath, recScript.Code)
+		}
+		if ct := recScript.Header().Get("Content-Type"); !strings.HasPrefix(ct, "application/javascript") {
+			t.Errorf("Expected application/javascript Content-Type for %s, got %q", scriptPath, ct)
+		}
 	}
 
 	// 5. Request /minimal.html
@@ -78,14 +81,14 @@ func TestStaticAssets_ServingAndMimeTypes(t *testing.T) {
 	}
 
 	// 7. Test App A serving /sync.html
-	cfgA := umaiserver.DefaultConfig("app-a")
+	cfgA := demoapp.DefaultConfig("app-a")
 	cfgA.AllowDemoDefaults = true
 	cfgA.DataDir = t.TempDir()
 	staticDirA, err := filepath.Abs("../examples/app-a/static")
 	if err != nil {
 		t.Fatalf("Failed to resolve App A static dir: %v", err)
 	}
-	serverA, err := umaiserver.NewServer(cfgA, staticDirA)
+	serverA, err := demoapp.NewServer(cfgA, staticDirA)
 	if err != nil {
 		t.Fatalf("Failed to create App A server: %v", err)
 	}

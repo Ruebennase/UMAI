@@ -2358,6 +2358,209 @@ function makeBatchAcceptance(fn) {
   }
   console.log('✓ Test 13: Shared-reference DAG bomb rejection, inter-continuation stop() guard, and generation-scoped reservation cleanup passed');
 
+  // Test 14: Reusable Browser HTTP Spool Adapter (js/umai-spool.js — createHttpSpoolAdapter):
+  //   14a) End-to-end UmaiSession transfer + receipt verification through createHttpSpoolAdapter
+  //   14b) Partial attachment failure (404/500 on 2nd attachment) and size mismatch abort getMessage(id) completely (Rule 3)
+  //   14c) Outbox metadata 404 -> null vs 500 -> throw; 401 invokes onUnauthorized; throwing UI hooks do not corrupt commit/ack results
+  {
+    const { createHttpSpoolAdapter } = require('../js/umai-spool.js');
+    assert.strictEqual(typeof createHttpSpoolAdapter, 'function', 'createHttpSpoolAdapter must be exported');
+
+    // --- 14a: End-to-end UmaiSession exchange via createHttpSpoolAdapter ---
+    const outboxStore14 = new Map([
+      ['msg-spool-1', {
+        id: 'msg-spool-1',
+        payload: { invoice: 'INV-100', amount: 250 },
+        signature: 'sig-100',
+        attachments: [
+          { name: 'a.txt', size: 5, bytes: Buffer.from('hello') },
+          { name: 'b.bin', size: 4, bytes: Buffer.from([1, 2, 3, 4]) }
+        ]
+      }]
+    ]);
+    const inboxStore14 = new Map();
+    const seenMutatingHeaders = [];
+    let uiAcceptedCount = 0;
+    let uiAckCount = 0;
+
+    const mockFetchA = async (url, init) => {
+      if (init && init.method && init.method !== 'GET') {
+        seenMutatingHeaders.push(init.headers['X-UMAI-CSRF']);
+      }
+      if (url === '/api/outbox' && init.method === 'GET') {
+        return new Response(JSON.stringify(Array.from(outboxStore14.values())), { status: 200 });
+      }
+      if (url === '/api/outbox/msg-spool-1' && init.method === 'GET') {
+        const m = outboxStore14.get('msg-spool-1');
+        if (!m) return new Response('not found', { status: 404 });
+        return new Response(JSON.stringify({
+          id: m.id,
+          payload: m.payload,
+          signature: m.signature,
+          attachments: m.attachments.map(a => ({ name: a.name, size: a.size }))
+        }), { status: 200 });
+      }
+      if (url.startsWith('/api/outbox/msg-spool-1/attachments/') && init.method === 'GET') {
+        const name = decodeURIComponent(url.split('/').pop());
+        const m = outboxStore14.get('msg-spool-1');
+        const att = m && m.attachments.find(a => a.name === name);
+        if (!att) return new Response('missing', { status: 404 });
+        return new Response(att.bytes, { status: 200, headers: { 'Content-Type': 'application/octet-stream' } });
+      }
+      if (url === '/api/outbox/ack' && init.method === 'POST') {
+        const body = JSON.parse(init.body);
+        for (const id of body.ids) {
+          assert.strictEqual(body.receipts[id], 'receipt-' + id, 'Receipt must be forwarded to /outbox/ack');
+          outboxStore14.delete(id);
+        }
+        return new Response(JSON.stringify({ acknowledged: true }), { status: 200 });
+      }
+      if (url === '/api/inbox/acceptance' && init.method === 'POST') {
+        const body = JSON.parse(init.body);
+        const results = {};
+        for (const id of body.ids) results[id] = { accepted: false };
+        return new Response(JSON.stringify({ results }), { status: 200 });
+      }
+      throw new Error('Unexpected fetch URL on A: ' + url);
+    };
+
+    const mockFetchB = async (url, init) => {
+      if (url === '/api/outbox' && init.method === 'GET') {
+        return new Response('[]', { status: 200 });
+      }
+      if (url === '/api/inbox/acceptance' && init.method === 'POST') {
+        const body = JSON.parse(init.body);
+        const results = {};
+        for (const id of body.ids) {
+          if (inboxStore14.has(id)) {
+            results[id] = { accepted: true, ack_receipt: 'receipt-' + id };
+          } else {
+            results[id] = { accepted: false };
+          }
+        }
+        return new Response(JSON.stringify({ results }), { status: 200 });
+      }
+      if (url === '/api/inbox' && init.method === 'POST') {
+        const form = init.body;
+        const id = form.get('id');
+        const payload = JSON.parse(form.get('payload'));
+        const signature = form.get('signature');
+        const files = form.getAll('attachments');
+        assert.strictEqual(files.length, 2, 'Both attachments must arrive intact in FormData');
+        inboxStore14.set(id, { id, payload, signature, fileCount: files.length });
+        return new Response(JSON.stringify({ accepted: true, ack_receipt: 'receipt-' + id }), { status: 200 });
+      }
+      throw new Error('Unexpected fetch URL on B: ' + url);
+    };
+
+    const adapterA = createHttpSpoolAdapter({
+      baseUrl: '/api/',
+      fetchImpl: mockFetchA,
+      onAcknowledged() {
+        uiAckCount++;
+        throw new Error('Simulated UI render glitch in onAcknowledged');
+      }
+    });
+    const adapterB = createHttpSpoolAdapter({
+      baseUrl: '/api',
+      fetchImpl: mockFetchB,
+      onAccepted() {
+        uiAcceptedCount++;
+        return Promise.reject(new Error('Simulated UI render glitch in onAccepted'));
+      }
+    });
+
+    const chan14 = createMockChannel();
+    const sess14A = new UmaiSession({ peerOrigin: 'http://b.example', role: 'embedded', storage: adapterA });
+    const sess14B = new UmaiSession({ peerOrigin: 'http://a.example', role: 'host', storage: adapterB });
+    sess14A.port = chan14.port1;
+    chan14.port1.onmessage = sess14A._portListener;
+    sess14A.state = 'connected';
+    sess14B.port = chan14.port2;
+    chan14.port2.onmessage = sess14B._portListener;
+    sess14B.state = 'connected';
+
+    await sess14A.reconcile();
+    await new Promise(r => setTimeout(r, 40));
+
+    assert.strictEqual(inboxStore14.has('msg-spool-1'), true, 'Receiver spool must accept msg-spool-1');
+    assert.strictEqual(outboxStore14.size, 0, 'Sender spool must remove msg-spool-1 upon verified ACK');
+    assert.strictEqual(uiAcceptedCount, 1, 'onAccepted UI hook must be invoked');
+    assert.strictEqual(uiAckCount, 1, 'onAcknowledged UI hook must be invoked');
+    assert.ok(seenMutatingHeaders.every(v => v === '1'), 'X-UMAI-CSRF must be attached to state-changing requests');
+    sess14A.stop();
+    sess14B.stop();
+
+    // --- 14b: Failed or truncated attachment download MUST abort getMessage(id) completely (Rule 3) ---
+    let failMode = 'second-404';
+    const faultAdapter = createHttpSpoolAdapter({
+      baseUrl: '/api',
+      fetchImpl: async (url) => {
+        if (url === '/api/outbox/msg-missing') {
+          return new Response('not found', { status: 404 });
+        }
+        if (url === '/api/outbox/msg-500') {
+          return new Response('internal error', { status: 500 });
+        }
+        if (url === '/api/outbox/msg-2att') {
+          return new Response(JSON.stringify({
+            id: 'msg-2att',
+            payload: { ok: true },
+            attachments: [
+              { name: 'first.txt', size: 5 },
+              { name: 'second.txt', size: 6 }
+            ]
+          }), { status: 200 });
+        }
+        if (url.endsWith('/attachments/first.txt')) {
+          return new Response(Buffer.from('12345'), { status: 200 });
+        }
+        if (url.endsWith('/attachments/second.txt')) {
+          if (failMode === 'second-404') {
+            return new Response('missing attachment', { status: 404 });
+          }
+          if (failMode === 'second-size-mismatch') {
+            return new Response(Buffer.from('short'), { status: 200 }); // 5 bytes instead of declared 6
+          }
+          return new Response(Buffer.from('123456'), { status: 200 });
+        }
+        return new Response('unauthorized', { status: 401 });
+      }
+    });
+
+    assert.strictEqual(await faultAdapter.getMessage('msg-missing'), null, '404 on message metadata must return null');
+    await assert.rejects(() => faultAdapter.getMessage('msg-500'), /500/, '500 on message metadata must throw');
+    await assert.rejects(
+      () => faultAdapter.getMessage('msg-2att'),
+      /Attachment download failed for second\.txt/,
+      '404 on second attachment must abort getMessage rather than omitting it or wrapping the error body'
+    );
+
+    failMode = 'second-size-mismatch';
+    await assert.rejects(
+      () => faultAdapter.getMessage('msg-2att'),
+      /Attachment size mismatch for second\.txt/,
+      'Truncated attachment bytes must abort getMessage'
+    );
+
+    failMode = 'ok';
+    const completeMsg = await faultAdapter.getMessage('msg-2att');
+    assert.strictEqual(completeMsg.attachments.length, 2, 'Complete message must return both File objects');
+
+    // --- 14c: 401 triggers onUnauthorized callback and throws status=401 ---
+    let unauthTriggered = 0;
+    const unauthAdapter = createHttpSpoolAdapter({
+      baseUrl: '/api',
+      fetchImpl: async () => new Response('unauth', { status: 401 }),
+      onUnauthorized() {
+        unauthTriggered++;
+      }
+    });
+    await assert.rejects(() => unauthAdapter.getOutboxIds(), /Unauthorized \(401\)/);
+    assert.strictEqual(unauthTriggered, 1, 'onUnauthorized callback must run on 401 response');
+  }
+  console.log('✓ Test 14: Reusable HTTP spool adapter (js/umai-spool.js) end-to-end, complete-attachment abort, and hook isolation passed');
+
   senderPoison.stop();
   receiverPoison.stop();
   secSession.stop();

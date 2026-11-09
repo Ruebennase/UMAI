@@ -10,7 +10,7 @@ A minimal, vendor-neutral open-source protocol for exchanging immutable messages
 
 ## 1. What UMAI Is
 
-**UMAI** stands for **User-Mediated Application Interoperability** *(and is a nod to the Japanese **うまい** — meaning both "clever / skillful" and "delicious")*.
+**UMAI** stands for **User-Mediated Application Interoperability** *(Japanese **うまい**)*.
 
 It enables two completely independent web applications running on different domains to securely exchange structured data and binary files (PDFs, spreadsheets, contracts, images) without requiring direct server-to-server network integrations, API gateways, VPNs, or cloud message brokers.
 
@@ -26,15 +26,15 @@ It enables two completely independent web applications running on different doma
 
 ### Core Protocol vs. Implementer Choices (What This Repository Demonstrates)
 
-To keep the protocol minimal and adaptable, UMAI cleanly separates **what the protocol itself defines** from **architectural choices left to each implementer** (for which our Go reference server `pkg/umaiserver` provides ready-to-run best-practice examples):
+To keep the protocol minimal and adaptable, UMAI cleanly separates **what the protocol itself defines** from **reusable file-spool components** (`pkg/umaispool` + `js/umai-spool.js`) and **demo application glue** (`internal/demoapp`):
 
-| Layer | Provided by UMAI Core (`js/umai.js` & `SPEC.md`) | Implementer's Choice (Demonstrated as Best Practices in `pkg/umaiserver`) |
+| Layer | Provided by UMAI Core (`js/umai.js` & `SPEC.md`) | Implementer's Choice (With Optional Reusable Spool in `pkg/umaispool` & `js/umai-spool.js`) |
 |---|---|---|
-| **Transport & State Machine** | `READY`/`INIT`/`INIT_ACK` handshake, private `MessagePort`, `OFFER`/`GET`/`PUT`/`ACK` state machine, and the 5-method JS storage adapter. | How the frontend talks to its own backend (REST, GraphQL, WebSockets, or pure client-side IndexedDB). |
-| **Authenticity & Integrity** | Carries opaque `signature` (on `PUT`) and `receipts` (on `ACK`) fields through the browser without touching them. | **Recommended Best Practice (Implemented in `pkg/umaiserver`):** Server-side `Ed25519` message signing and signed `ACK` receipt verification so the browser mediator cannot alter messages or forge acknowledgements. |
+| **Transport & State Machine** | `READY`/`INIT`/`INIT_ACK` handshake, private `MessagePort`, `OFFER`/`GET`/`PUT`/`ACK` state machine, and the 5-method JS storage adapter. | Custom backend (SQL, REST, GraphQL, IndexedDB) **or** drop-in HTTP spool via `pkg/umaispool` + `UMAI.createHttpSpoolAdapter` (`js/umai-spool.js`). |
+| **Authenticity & Integrity** | Carries opaque `signature` (on `PUT`) and `receipts` (on `ACK`) fields through the browser without touching them. | **Recommended Best Practice (Implemented in `pkg/umaispool`):** Server-side `Ed25519` message signing and signed `ACK` receipt verification with explicit sender/receiver identities so the browser mediator cannot alter messages or forge acknowledgements. |
 | **Payload Confidentiality** | Transfers opaque `payload` JSON and binary `File` objects over `MessagePort`. | **Optional Best Practice (Documented in `SECURITY.md`):** Server-to-server asymmetric encryption ("Blind Courier" mode) when the mediating user's browser should not read sensitive data in transit. |
-| **Channel Scoping & Multi-User Concurrency** | Guaranteed idempotent reconciliation (Rules 4 & 5) so concurrent deliveries never cause duplicate imports. | **Implementer's Choice (Implemented in `pkg/umaiserver`):** Scoping a channel to *only the logged-in user's messages* vs. pooling *all online users' channels* to transfer system-wide messages (using soft in-flight leases and per-session rotation). |
-| **User Authentication & Storage** | Agnostic—operates inside whatever session the user has established in each application. | Production apps use their own IAM (OIDC, SAML, MFA, Passkeys) and databases; `pkg/umaiserver` includes a self-contained demo login and atomic filesystem store for zero-dependency evaluation. |
+| **Channel Scoping & Multi-User Concurrency** | Guaranteed idempotent reconciliation (Rules 4 & 5) so concurrent deliveries never cause duplicate imports. | **Implementer's Choice (Supported in `pkg/umaispool`):** Scoping a channel to *only the logged-in user's messages* vs. pooling *all online users' channels* to transfer system-wide messages (using soft in-flight leases and per-session rotation). |
+| **User Authentication & Storage** | Agnostic—operates inside whatever session the user has established in each application. | Production apps plug their own IAM (OIDC, SAML, MFA, Passkeys) into `umaispool.HandlerConfig.Authorizer` or their own database; `internal/demoapp` provides a self-contained demo login and sample document UI for zero-dependency evaluation. |
 
 ---
 
@@ -95,9 +95,9 @@ Because UMAI leaves backend storage and queuing policy to the implementer, appli
 2. **Option B — System-Wide Opportunistic Pool ("Crowdsourced System Bridge"):**
    - The backend uses *any* authenticated user's open UMAI channel to transfer **all pending messages** relevant between System A and System B.
    - If 10 users are online simultaneously, the two systems can use all 10 open browser channels in parallel to drain the shared queue.
-   - **Best-Practice Hardening Demonstrated in `pkg/umaiserver`:**
+   - **Best-Practice Hardening Demonstrated in `pkg/umaispool`:**
      - *Protocol-Level Safety Against Double Efforts:* Even if two browsers transfer the same message concurrently, UMAI's Rule 4 and Rule 5 ensure the receiver commits the message once and returns the stored `ack_receipt` to both.
-     - *Server-Side Next-Best Message Selection (Bandwidth-Optimization Lease):* As a best-practice example in `pkg/umaiserver`, fetching an outbox message (`GET /api/outbox/{id}`) places a 15-second soft in-flight lease on it and rotates the unclaimed queue per session. Rather than acting as a hard mutual-exclusion lock, this soft priority hint steers concurrent browsers toward unclaimed messages first to save bandwidth—and if a browser tab closes mid-transfer, the soft lease expires after 15 seconds so another online browser seamlessly takes over.
+     - *Server-Side Next-Best Message Selection (Bandwidth-Optimization Lease):* As a best-practice feature in `pkg/umaispool`, fetching an outbox message (`GET /api/outbox/{id}`) places a 15-second soft in-flight lease on it and rotates the unclaimed queue per session. Rather than acting as a hard mutual-exclusion lock, this soft priority hint steers concurrent browsers toward unclaimed messages first to save bandwidth—and if a browser tab closes mid-transfer, the soft lease expires after 15 seconds so another online browser seamlessly takes over.
      - *Server-Side Signing & Optional Encryption:* Combining our reference server's `Ed25519` signing with optional asymmetric encryption ensures a mediating user's browser cannot modify—or even inspect—another user's message while ferrying it.
 
 ### Beyond Bilateral: Multi-Server Application Meshes (N ≥ 3)
@@ -197,21 +197,26 @@ umai/
 ├── SECURITY.md             # Security model, threat analysis, and limitations
 ├── LICENSE                 # MIT License
 ├── js/
-│   └── umai.js             # Standalone, framework-free JavaScript library
+│   ├── umai.js             # Standalone, framework-free JavaScript protocol library
+│   └── umai-spool.js       # Reusable browser HTTP spool adapter (UMAI.createHttpSpoolAdapter)
 ├── pkg/
-│   └── umaiserver/         # Shared Go server package (Storage, Auth, HTTP)
+│   └── umaispool/          # Reusable Go file-spool package (Storage, Ed25519 signing, HTTP Handler)
+├── internal/
+│   └── demoapp/            # Demo application server (demo login, local docs/ CRUD, UI serving)
 ├── examples/
-│   ├── app-a/              # Independent Go executable (App A, default port 8081)
+│   ├── app-a/              # Independent Go demo executable (App A, default port 8081)
 │   │   ├── main.go
-│   │   └── static/         # HTML/CSS/JS frontend
-│   └── app-b/              # Independent Go executable (App B, default port 8082, side-by-side host)
+│   │   └── static/         # HTML/CSS/JS frontend & embedded sync worker (/sync.html)
+│   └── app-b/              # Independent Go demo executable (App B, default port 8082, host)
 │       ├── main.go
-│       └── static/         # Host page embedding App A in an iframe
+│       └── static/         # Dual inspector & minimal single-app production view (/minimal.html)
 ├── tests/
-│   ├── storage_test.go     # Go tests for atomic storage, crash recovery, immutability
-│   ├── protocol_test.go    # Protocol exchange, binary integrity, duplicate rejection
-│   ├── lost_ack_test.go    # Real end-to-end test for repeated-ACK recovery
-│   └── umai_js_test.js     # JavaScript unit tests running in Node.js
+│   ├── spool_contract_test.go # Security & boundary tests for standalone pkg/umaispool
+│   ├── storage_test.go        # Go tests for atomic storage, crash recovery, immutability
+│   ├── protocol_test.go       # Protocol exchange, binary integrity, duplicate rejection
+│   ├── lost_ack_test.go       # Real end-to-end test for repeated-ACK recovery
+│   ├── server_test.go         # Demo static asset & client script serving tests
+│   └── umai_js_test.js        # JavaScript protocol & HTTP spool adapter tests in Node.js
 └── deploy/
     └── Caddyfile.example   # Production reverse-proxy config with HTTPS and CSP
 ```
@@ -325,20 +330,20 @@ To demonstrate fault tolerance and Rule 5 (repeated acknowledgements), `tests/lo
 
 ---
 
-## 9. Security Architecture: Protocol Guarantees vs. Reference Server Best Practices
+## 9. Security Architecture: Protocol Guarantees vs. Reusable Spool Best Practices
 
-UMAI clearly separates **what the browser protocol enforces directly** from **server-side best practices** implemented in `pkg/umaiserver`:
+UMAI clearly separates **what the browser protocol enforces directly** from **server-side best practices** implemented in `pkg/umaispool` (and mounted by `internal/demoapp`):
 
 ### Guaranteed by the UMAI Browser Protocol (`js/umai.js`)
 1. **Zero CORS Exposure:** Because Application A's frontend only calls Application A's backend, and Application B's frontend only calls Application B's backend, neither server needs to expose cross-origin CORS headers (`Access-Control-Allow-Origin` / `Access-Control-Allow-Credentials`). All cross-origin exchange happens over a private browser `MessagePort` pinned via `Content-Security-Policy: frame-ancestors`, `event.origin`, and `event.source`.
 2. **Receiver-Controlled State Machine:** `js/umai.js` strictly drops any unsolicited `PUT` not preceded by an in-flight `GET` and ignores any `ACK` for unoffered IDs.
 
-### Demonstrated as Server-Side Best Practices (`pkg/umaiserver`)
+### Provided in Reusable Spool (`pkg/umaispool` & `js/umai-spool.js`)
 3. **End-to-End Signed Messages & Signed `ACK` Receipts (`crypto/ed25519`):**
    - UMAI's `PUT` and `ACK` wire schemas provide optional opaque fields (`signature` on `PUT`, and `receipts` on `ACK`) so implementers can verify authenticity server-to-server without browser cryptography.
-   - Our reference server (`pkg/umaiserver`) demonstrates this best practice out of the box: the sending server signs the sender role, intended receiver role, message ID, canonical JSON payload hash, and attachment SHA-256 digests (`UMAI-PUT-V1`). The receiving server verifies this signature before atomic commit and returns a signed receipt (`UMAI-ACK-V1`), which the sending server verifies before deleting its outbox copy.
-4. **Same-Origin CSRF & Endpoint Hardening:**
-   - `pkg/umaiserver` demonstrates standard web hardening: same-origin `Origin` header checks on state-changing routes, strict `Content-Type: application/json` enforcement, and keeping pending message IDs restricted to authenticated sessions.
+   - `pkg/umaispool` implements this out of the box with explicit sender/receiver identities and zero demo key fallbacks: the sending server signs the sender identity, intended receiver identity, message ID, canonical JSON payload hash, and attachment SHA-256 digests (`UMAI-PUT-V1`). The receiving server verifies this signature before atomic commit and returns a signed receipt (`UMAI-ACK-V1`), which the sending server verifies before deleting its outbox copy.
+4. **Fail-Closed Authorization & Same-Origin CSRF Hardening:**
+   - `umaispool.Handler` requires a mandatory `Authorizer` hook (failing closed on unauthenticated or unauthorized requests before touching storage), enforces same-origin `Origin` / `X-UMAI-CSRF` checks on state-changing routes, serves attachment downloads strictly as `application/octet-stream` under `Content-Security-Policy: default-src 'none'; sandbox`, and pairs with `js/umai-spool.js` to enforce all-or-nothing attachment retrieval.
 5. **Optional Asymmetric Encryption ("Blind Courier" Mode):**
    - Because `js/umai.js` treats payloads and attachments as opaque objects, implementers who want to hide sensitive content from the mediating browser in transit can encrypt outgoing snapshots on the sending server using the peer server's public key (e.g., `X25519` + `AES-256-GCM`) and decrypt upon inbox ingestion with zero changes to `js/umai.js`.
 
@@ -348,7 +353,7 @@ UMAI clearly separates **what the browser protocol enforces directly** from **se
 
 ## 10. Production Deployment Behind Caddy
 
-For deployment over the public internet with TLS termination on two separate domains (e.g. `https://app-a.example.org` and `https://app-b.example.net`), `pkg/umaiserver` requires explicit `Ed25519` signing keys and non-default credentials unless `-demo` (or `UMAI_DEMO=1`) is explicitly passed for local loopback evaluation:
+For deployment over the public internet with TLS termination on two separate domains (e.g. `https://app-a.example.org` and `https://app-b.example.net`), the demo servers (`internal/demoapp`) require explicit `Ed25519` signing keys and non-default credentials unless `-demo` (or `UMAI_DEMO=1`) is explicitly passed for local loopback evaluation:
 
 1. Copy `deploy/Caddyfile.example` to your Caddy configuration.
 2. Start Application A with its private signing key, Peer B's public key, and a strong password:

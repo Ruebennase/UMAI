@@ -27,13 +27,13 @@ func TestMandatory_LostACKVerification(t *testing.T) {
 
 	// --- Step 1: A prepares a message with attachment ---
 	fileContent := []byte("Contract terms: UMAI 0.1 repeated-ACK test verification")
-	_, err := appA.Server.Storage().SaveDocument("contract.pdf", bytes.NewReader(fileContent))
+	_, err := appA.Server.Docs().SaveDocument("contract.pdf", bytes.NewReader(fileContent))
 	if err != nil {
 		t.Fatalf("Step 1 failed: could not save document on A: %v", err)
 	}
 
 	payload := map[string]string{"type": "contract", "title": "Agreement v1"}
-	msgA, err := appA.Server.Storage().CreateOutboxMessage(payload, []string{"contract.pdf"})
+	msgA, err := appA.Server.CreateOutboxFromDocs(payload, []string{"contract.pdf"})
 	if err != nil {
 		t.Fatalf("Step 1 failed: could not create outbox message on A: %v", err)
 	}
@@ -45,7 +45,6 @@ func TestMandatory_LostACKVerification(t *testing.T) {
 	}
 
 	// --- Step 2: B successfully accepts and records the message ---
-	// Transfer PUT to B
 	attPath, _ := appA.Server.Storage().GetOutboxAttachmentPath(msgA.ID, "contract.pdf")
 	fileData, _ := os.ReadFile(attPath)
 
@@ -77,7 +76,6 @@ func TestMandatory_LostACKVerification(t *testing.T) {
 
 	// --- Step 3: Deliberately suppress B's first ACK ---
 	t.Logf("Step 3: Deliberately suppressing initial ACK from B to A for message %s", msgA.ID)
-	// (We do not call A's /api/outbox/ack endpoint)
 
 	// --- Step 4: A retains the message in its outbox ---
 	outboxAAfterSuppress, _ := appA.Server.Storage().ListOutbox()
@@ -86,8 +84,6 @@ func TestMandatory_LostACKVerification(t *testing.T) {
 	}
 
 	// --- Step 5: On the next synchronisation, A offers the same message again ---
-	// Simulating UMAI OFFER message sent from A to B:
-	// { protocol: "UMAI", version: 1, type: "OFFER", ids: [msgA.ID] }
 	offeredIDs := []string{msgA.ID}
 	t.Logf("Step 5: App A reconnects and re-OFFERs IDs: %v", offeredIDs)
 
@@ -97,7 +93,6 @@ func TestMandatory_LostACKVerification(t *testing.T) {
 
 	for _, id := range offeredIDs {
 		if appB.Server.Storage().IsAccepted(id) {
-			// B recognizes it has already accepted this ID!
 			repeatedAcks = append(repeatedAcks, id)
 		} else {
 			toGet = append(toGet, id)

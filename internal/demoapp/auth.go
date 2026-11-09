@@ -1,4 +1,4 @@
-package umaiserver
+package demoapp
 
 import (
 	"crypto/rand"
@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 )
@@ -17,7 +18,7 @@ const (
 	MaxActiveSessions = 10000
 )
 
-// Session represents an active authenticated user session.
+// Session represents an active authenticated demo user session.
 type Session struct {
 	ID        string
 	Username  string
@@ -25,7 +26,7 @@ type Session struct {
 	ExpiresAt time.Time
 }
 
-// AuthManager manages server-side sessions with scoped HttpOnly cookies.
+// AuthManager manages server-side demo sessions with scoped HttpOnly cookies.
 type AuthManager struct {
 	mu            sync.RWMutex
 	sessions      map[string]*Session
@@ -34,7 +35,7 @@ type AuthManager struct {
 	validPassword string
 }
 
-// NewAuthManager initializes session management.
+// NewAuthManager initializes demo session management.
 func NewAuthManager(cookieName, username, password string) *AuthManager {
 	if cookieName == "" {
 		cookieName = SessionCookieName
@@ -65,7 +66,7 @@ func (am *AuthManager) Authenticate(username, password string) (string, bool) {
 		return "", false
 	}
 
-	now := time.Now()
+	now := time.Now().UTC()
 	sessionID := generateSessionID()
 	sess := &Session{
 		ID:        sessionID,
@@ -81,7 +82,6 @@ func (am *AuthManager) Authenticate(username, password string) (string, bool) {
 		}
 	}
 	if len(am.sessions) >= MaxActiveSessions {
-		// Evict oldest session if cap reached
 		var oldestID string
 		var oldestTime time.Time
 		for id, existing := range am.sessions {
@@ -114,7 +114,7 @@ func (am *AuthManager) ValidateSession(sessionID string) (*Session, bool) {
 		return nil, false
 	}
 
-	if time.Now().After(sess.ExpiresAt) {
+	if time.Now().UTC().After(sess.ExpiresAt) {
 		am.mu.Lock()
 		delete(am.sessions, sessionID)
 		am.mu.Unlock()
@@ -135,7 +135,6 @@ func isHTTPSRequest(r *http.Request) bool {
 	if r.TLS != nil {
 		return true
 	}
-	// Only trust X-Forwarded-Proto when request arrives from a local reverse proxy (loopback)
 	if r.Header.Get("X-Forwarded-Proto") == "https" && isLoopbackHostPort(r.RemoteAddr) {
 		return true
 	}
@@ -150,7 +149,7 @@ func isLoopbackHostPort(addr string) bool {
 	if err != nil {
 		host = addr
 	}
-	if host == "localhost" {
+	if strings.EqualFold(host, "localhost") {
 		return true
 	}
 	ip := net.ParseIP(host)
@@ -169,7 +168,7 @@ func (am *AuthManager) SetSessionCookie(w http.ResponseWriter, r *http.Request, 
 		Name:        am.cookieName,
 		Value:       sessionID,
 		Path:        "/",
-		Expires:     time.Now().Add(SessionDuration),
+		Expires:     time.Now().UTC().Add(SessionDuration),
 		HttpOnly:    true,
 		Secure:      isSecure,
 		SameSite:    sameSite,
@@ -189,7 +188,7 @@ func (am *AuthManager) ClearSessionCookie(w http.ResponseWriter, r *http.Request
 		Name:        am.cookieName,
 		Value:       "",
 		Path:        "/",
-		Expires:     time.Unix(0, 0),
+		Expires:     time.Unix(0, 0).UTC(),
 		MaxAge:      -1,
 		HttpOnly:    true,
 		Secure:      isSecure,
@@ -201,16 +200,12 @@ func (am *AuthManager) ClearSessionCookie(w http.ResponseWriter, r *http.Request
 
 // GetSessionID extracts the session ID strictly from the HttpOnly session cookie.
 func (am *AuthManager) GetSessionID(r *http.Request) string {
-	// Scoped HttpOnly cookie (e.g. umai_session_a or umai_session_b)
 	if c, err := r.Cookie(am.cookieName); err == nil && c.Value != "" {
 		return c.Value
 	}
-
-	// Fallback to default cookie name
 	if c, err := r.Cookie(SessionCookieName); err == nil && c.Value != "" {
 		return c.Value
 	}
-
 	return ""
 }
 

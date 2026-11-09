@@ -6,11 +6,11 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/umai-protocol/umai/pkg/umaiserver"
+	"github.com/umai-protocol/umai/internal/demoapp"
 )
 
 func main() {
-	cfg := umaiserver.DefaultConfig("app-a")
+	cfg := demoapp.DefaultConfig("app-a")
 
 	flag.StringVar(&cfg.ListenAddr, "addr", cfg.ListenAddr, "HTTP listen address")
 	flag.StringVar(&cfg.PeerOrigin, "peer", cfg.PeerOrigin, "Allowed peer origin (App B)")
@@ -36,7 +36,7 @@ func main() {
 	}
 	absStatic, _ := filepath.Abs(staticDir)
 
-	server, err := umaiserver.NewServer(cfg, absStatic)
+	server, err := demoapp.NewServer(cfg, absStatic)
 	if err != nil {
 		log.Fatalf("Failed to initialize Application A: %v", err)
 	}

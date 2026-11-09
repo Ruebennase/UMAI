@@ -169,7 +169,8 @@ In Application A's web page (preferably placing the initialization script in an 
 // /js/app-a-umai.js
   // 1. Implement the 5 storage methods connecting to your own backend routes.
   //    Note: The paths below (/custom-api/...) illustrate a custom application backend;
-  //    see Pattern 4 below for the exact HTTP endpoints exposed by `pkg/umaiserver`.
+  //    if your backend mounts `pkg/umaispool`, you can use `UMAI.createHttpSpoolAdapter`
+  //    from `js/umai-spool.js` directly instead of writing this adapter by hand (see Pattern 4).
   const storage = {
     async getOutboxIds() {
       const res = await fetch('/custom-api/outbox/ids');
@@ -424,15 +425,29 @@ The 5-method adapter simply calls your application's existing client services. N
 
 ---
 
-### Pattern 4: Dedicated Internal HTTP Endpoints (Shipped `pkg/umaiserver` Routes)
+### Pattern 4: Reusable HTTP Spool Endpoints (`pkg/umaispool` + `js/umai-spool.js`)
 
-If you are developing or extending an application backend and want a dedicated set of internal routes matching the UMAI reference server (`pkg/umaiserver`, used by `examples/app-a` and `examples/app-b`), `pkg/umaiserver` exposes:
+If you are integrating a Go backend (or mounting `pkg/umaispool` as a sidecar) and want ready-made spool endpoints, `umaispool.Handler` exposes a clean HTTP surface gated by your application's `Authorizer` hook (`func(r *http.Request, op umaispool.Operation) (umaispool.Principal, error)`), paired with the zero-dependency browser client `UMAI.createHttpSpoolAdapter` (`js/umai-spool.js`, used verbatim by `examples/app-a` and `examples/app-b`):
 
-1. `GET /api/outbox`: Returns pending outbox message objects (`[{ id, ... }]`).
-2. `GET /api/outbox/{id}` & `GET /api/outbox/{id}/attachments/{filename}`: Fetches message metadata and streams each attachment to the browser (every attachment declared in metadata must succeed as a complete download before assembling a `PUT`).
-3. `POST /api/inbox/acceptance`: Checks a batch of `{ "ids": [...] }` against the durable Accepted Set in one call, returning `{ "results": { [id]: { "accepted": boolean, "ack_receipt"?: string } } }` for every requested ID.
-4. `POST /api/inbox`: Receives a `multipart/form-data` upload (`id`, JSON string `payload`, optional `signature`, and `attachments` file parts) and persists it atomically, returning `{ "accepted": true, "ack_receipt": "..." }`.
-5. `POST /api/outbox/ack`: Verifies `{ "ids": [...], "receipts": { ... } }` and removes acknowledged messages from the outbox.
+```html
+<script src="/js/umai.js"></script>
+<script src="/js/umai-spool.js"></script>
+```
+```javascript
+const storage = UMAI.createHttpSpoolAdapter({
+  baseUrl: '/api',
+  onAccepted(msg, serverResponse) { /* optional UI refresh */ },
+  onAcknowledged(ids, receipts)   { /* optional UI refresh */ }
+});
+```
+
+Under `<RoutePrefix>` (default `/api`), `umaispool.Handler` serves:
+1. `GET /api/outbox` (`OpOutboxList`): Returns pending outbox message objects (`[{ id, ... }]`), rotated per `Principal.SessionKey`.
+2. `GET /api/outbox/{id}` & `GET /api/outbox/{id}/attachments/{filename}` (`OpOutboxRead`): Fetches message metadata and streams each attachment as `application/octet-stream` (`js/umai-spool.js` aborts `getMessage(id)` if any attachment fails or mismatches its declared byte size).
+3. `POST /api/inbox/acceptance` (`OpAcceptanceLookup`): Checks a batch of `{ "ids": [...] }` against the durable Accepted Set in one call, returning `{ "results": { [id]: { "accepted": boolean, "ack_receipt"?: string } } }` for every requested ID.
+4. `POST /api/inbox` (`OpInboxAccept`): Receives a `multipart/form-data` upload (`id`, JSON string `payload`, optional `signature`, and `attachments` file parts) and persists it atomically, returning `{ "accepted": true, "ack_receipt": "..." }`.
+5. `POST /api/outbox/ack` (`OpOutboxAck`): Verifies `{ "ids": [...], "receipts": { ... } }` and removes acknowledged messages from the outbox.
+6. `GET /api/inbox`, `GET /api/inbox/{id}`, `GET /api/inbox/{id}/attachments/{filename}`, `GET /api/accepted`, `GET /api/accepted/receipts` (`OpInboxRead`): Authenticated read endpoints for inbox inspection.
 
 > [!NOTE]
 > Even in this pattern, these endpoints **only talk to the user's existing, authenticated browser session** via standard internal cookies or headers. They never talk directly to the peer server over the network. Zero firewall rules, zero public exposure, and zero cross-network tunnels.
@@ -441,7 +456,7 @@ If you are developing or extending an application backend and want a dedicated s
 
 ### Pattern 5: Relational Database (SQL) & The "Incoming Tray" Pattern
 
-If your specialty application already uses a relational database (PostgreSQL, MySQL, SQL Server, Oracle, SQLite), **you do not need to write custom filesystem staging or crash-recovery code like `pkg/umaiserver/storage.go`**. A single database transaction with a `UNIQUE` constraint on `umai_message_id` gives you atomic commit (Rule 3), durable acceptance (Rule 4), and idempotent duplicate detection (Rule 5) automatically:
+If your specialty application already uses a relational database (PostgreSQL, MySQL, SQL Server, Oracle, SQLite), **you do not need to write custom filesystem staging or crash-recovery code like `pkg/umaispool/storage.go`**. A single database transaction with a `UNIQUE` constraint on `umai_message_id` gives you atomic commit (Rule 3), durable acceptance (Rule 4), and idempotent duplicate detection (Rule 5) automatically:
 
 ```sql
 -- 1. Durable incoming tray table (technical acceptance is decoupled from business case assignment)
@@ -477,20 +492,20 @@ When `POST /api/inbox/accept` is called by `acceptMessage(msg)`:
 
 ---
 
-### Pattern 6: Standalone File-Spool / Sidecar Bridge (Running `pkg/umaiserver` Alongside Your Application)
+### Pattern 6: Standalone File-Spool / Sidecar Bridge (Using `pkg/umaispool`)
 
-Many existing specialty or packaged applications already exchange data via local "hot folders" (file spools) or local REST calls and prefer not to add UMAI endpoints directly to their core web application. You can run our Go server (`pkg/umaiserver`) as a **standalone sidecar / file-spool bridge**:
+Many existing specialty or packaged applications already exchange data via local "hot folders" (file spools) or local REST calls and prefer not to add UMAI database tables directly to their core web application. You can embed `pkg/umaispool` inside a lightweight Go HTTP wrapper (or run a sidecar server like `examples/app-a` / `examples/app-b`) as a **file-spool bridge**:
 
-- **How It Works:** Your application embeds `pkg/umaiserver`'s `/sync.html` (or opens it as a companion window) and interacts with `pkg/umaiserver`'s local data directory (`./data/outbox/` and `./data/inbox/`) or localhost HTTP API.
+- **How It Works:** Your application embeds a sync page backed by `pkg/umaispool` + `js/umai-spool.js` (or opens it as a companion window) and interacts with `pkg/umaispool`'s local data directory (`./data/outbox/` and `./data/inbox/`).
 - **Directory Ownership, Direct Filesystem Publication & Inbox Consumption Rules:**
-  1. **Collision-Resistant Internal Directory Keys (`m-<sha256(id)>`):** Because valid protocol Message IDs are case-sensitive (`CaseID` vs `caseid`) and may coincide with OS-reserved names on Windows (`CON`, `NUL`, trailing dots), `pkg/umaiserver` stores all messages under collision-resistant internal directory keys `inbox/m-<sha256(id)>/` and `outbox/m-<sha256(id)>/` (`StorageDirKey(id)`), keeping the exact protocol `id` inside `message.json` and verifying `msg.ID == id` on every read.
-  2. **Server-Owned Internal Directories (`.staging/` & `.committing/` — Hands Off!):** `.staging/` and `.committing/` inside `dataDir` belong exclusively to `pkg/umaiserver`. On startup (`NewStorage`), the server **deletes `.staging/` completely** and reconciles/cleans `.committing/`. External producers and consumers MUST NEVER stage, read, modify, or delete files inside `.staging/`, `.committing/`, or `accepted.json`.
-  3. **Direct Filesystem Publication Contract (`outbox/`):** When an external process publishes an outgoing message:
-     - **Via HTTP:** Call `POST /api/docs` + `POST /api/outbox`, which snapshots attachments, computes SHA-256 digests and `UMAI-PUT-V1` signatures, `fsync`s files, and atomically publishes `outbox/m-<sha256(id)>/`.
-     - **Direct Filesystem Publication:** Prepare the complete message directory (`attachments/<sanitized_name>` + `message.json` with exact byte sizes, SHA-256 hashes, and required `UMAI-PUT-V1` signature) inside a **separate producer-owned staging directory on the same filesystem** (outside `outbox/`, `inbox/`, `.staging/`, and `.committing/`). Close and `fsync` all files and their parent directories according to your filesystem durability model, verify `outbox/m-<sha256(id)>/` does not already exist (never overwrite or modify a published message in place), publish via a single atomic directory `rename()` into `outbox/m-<sha256(id)>/`, and `fsync(outbox/)`. Only published messages may be offered (`pkg/umaiserver`'s attachment existence and size checks in `ListOutboxForSession` supplement atomic publication; they do not replace it).
+  1. **Collision-Resistant Internal Directory Keys (`m-<sha256(id)>`):** Because valid protocol Message IDs are case-sensitive (`CaseID` vs `caseid`) and may coincide with OS-reserved names on Windows (`CON`, `NUL`, trailing dots), `pkg/umaispool` stores all messages under collision-resistant internal directory keys `inbox/m-<sha256(id)>/` and `outbox/m-<sha256(id)>/` (`StorageDirKey(id)`), keeping the exact protocol `id` inside `message.json` and verifying `msg.ID == id` on every read.
+  2. **Server-Owned Internal Directories (`.staging/` & `.committing/` — Hands Off!):** `.staging/` and `.committing/` inside `dataDir` belong exclusively to the single `pkg/umaispool` server process. On startup (`NewStorage`), the server **deletes `.staging/` completely** and reconciles/cleans `.committing/`. External producers and consumers MUST NEVER stage, read, modify, or delete files inside `.staging/`, `.committing/`, or `accepted.json`.
+  3. **Outbox Publication Contract (`outbox/`):** When publishing an outgoing message:
+     - **In-Process Go API:** Call `storage.CreateOutboxMessage(payload, attachments)` or `storage.CreateOutboxMessageWithID(id, payload, attachments)` (used by the demo server's `POST /api/outbox` route), which snapshots attachments, computes SHA-256 digests and `UMAI-PUT-V1` signatures, `fsync`s files, and atomically publishes `outbox/m-<sha256(id)>/`.
+     - **Direct Filesystem Publication:** Prepare the complete message directory (`attachments/<sanitized_name>` + `message.json` with exact byte sizes, SHA-256 hashes, and required `UMAI-PUT-V1` signature) inside a **separate producer-owned staging directory on the same filesystem** (outside `outbox/`, `inbox/`, `.staging/`, and `.committing/`). Close and `fsync` all files and their parent directories according to your filesystem durability model, verify `outbox/m-<sha256(id)>/` does not already exist (never overwrite or modify a published message in place), publish via a single atomic directory `rename()` into `outbox/m-<sha256(id)>/`, and `fsync(outbox/)`. Only published messages may be offered (`pkg/umaispool`'s attachment existence and size checks in `ListOutboxForSession` supplement atomic publication; they do not replace it).
   4. **Incoming Messages & Idempotent Inbox Consumption (`inbox/`):**
-     - `pkg/umaiserver` commits incoming messages in four stages: `.staging/` → `.committing/m-<sha256(id)>/` → `accepted.json` (`id -> ack_receipt`) + `fsync(dataDir)` → `inbox/m-<sha256(id)>/` + `fsync(inbox/)`. External consumers polling `inbox/` never observe partial or un-flushed commits.
-     - Consumers **may archive or delete `inbox/m-<sha256(id)>/` after successful import or deliberate discard**, while leaving `accepted.json` intact so `pkg/umaiserver` continues to recognize the accepted ID and repeat `ACK`s (Rule 5).
+     - `pkg/umaispool` commits incoming messages in four stages: `.staging/` → `.committing/m-<sha256(id)>/` → `accepted.json` (`id -> ack_receipt`) + `fsync(dataDir)` → `inbox/m-<sha256(id)>/` + `fsync(inbox/)`. External consumers polling `inbox/` never observe partial or un-flushed commits.
+     - Consumers **may archive or delete `inbox/m-<sha256(id)>/` after successful import or deliberate discard**, while leaving `accepted.json` intact so `pkg/umaispool` continues to recognize the accepted ID and repeat `ACK`s (Rule 5).
      - **Downstream business imports MUST be idempotent by `message.id`:** UMAI deduplicates transport delivery, not distributed transactions in an external business database. If your consumer crashes *after* importing a message into its database *before* deleting `inbox/m-<sha256(id)>/`, the directory will still be present on restart.
      - **Single-Consumer or Atomic Claiming:** Operate either a single inbox consumer process or claim each directory atomically (`rename("inbox/m-<sha256(id)>", "<consumer-processing-dir>/m-<sha256(id)>")` on the same filesystem) before importing so concurrent workers cannot import the same message twice.
 
@@ -556,7 +571,7 @@ const umai = new UMAI.UmaiSession({
 
 ## 7. Handling Oversized Documents: Small Notification & Manual Authenticated Pickup
 
-UMAI transfers complete logical messages in memory over a browser `MessagePort` (`50 MiB` default combined payload + attachment limit in `js/umai.js`; `100 MiB` default `MaxUploadSize` in `pkg/umaiserver`). Rather than raising in-memory limits arbitrarily for rare multi-hundred-megabyte or multi-gigabyte files, applications should use the **Small Notification + Manual Authenticated Pickup** pattern:
+UMAI transfers complete logical messages in memory over a browser `MessagePort` (`50 MiB` default combined payload + attachment limit in `js/umai.js`; `100 MiB` default `MaxUploadSize` in `pkg/umaispool`). Rather than raising in-memory limits arbitrarily for rare multi-hundred-megabyte or multi-gigabyte files, applications should use the **Small Notification + Manual Authenticated Pickup** pattern:
 
 1. **Transfer Ordinary Messages Directly:** Send standard documents and structured records within configured size limits directly as UMAI messages.
 2. **Keep Oversized Files at the Source & Send a Small Notification Message:**
