@@ -238,14 +238,14 @@
   }
 
   /**
-   * Normalizes an adapter acceptance response ({ accepted: boolean, ackReceipt?: string } or boolean).
+   * Normalizes an adapter acceptMessage(msg) response ({ accepted: boolean, ackReceipt?: string } or boolean).
    * Requires an explicit boolean `true` or `{ accepted: true }` (never truthy strings or numbers).
    */
   function parseAcceptanceResult(res) {
     if (typeof res === 'boolean') {
       return { accepted: res, ackReceipt: '' };
     }
-    if (res && typeof res === 'object' && typeof res.accepted === 'boolean') {
+    if (res && typeof res === 'object' && !Array.isArray(res) && typeof res.accepted === 'boolean') {
       const rawReceipt = typeof res.ackReceipt === 'string'
         ? res.ackReceipt
         : (typeof res.ack_receipt === 'string' ? res.ack_receipt : '');
@@ -256,6 +256,62 @@
       accepted: false,
       ackReceipt: ''
     };
+  }
+
+  /**
+   * Strictly validates a single ID's entry from getAcceptance(ids):
+   * Must be a plain object with an explicit boolean `accepted` field and optional string `ackReceipt` / `ack_receipt`.
+   * Missing or malformed entries return { valid: false } so they never trigger a false ACK or false GET.
+   */
+  function parseAcceptanceEntry(entry) {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry) || typeof entry.accepted !== 'boolean') {
+      return { valid: false, accepted: false, ackReceipt: '' };
+    }
+    const proto = Object.getPrototypeOf(entry);
+    if (proto !== Object.prototype && proto !== null) {
+      return { valid: false, accepted: false, ackReceipt: '' };
+    }
+    let ackReceipt = '';
+    if (entry.ackReceipt !== undefined) {
+      if (typeof entry.ackReceipt !== 'string' || entry.ackReceipt.length > MAX_SIGNATURE_LEN) {
+        return { valid: false, accepted: false, ackReceipt: '' };
+      }
+      ackReceipt = entry.ackReceipt;
+    } else if (entry.ack_receipt !== undefined) {
+      if (typeof entry.ack_receipt !== 'string' || entry.ack_receipt.length > MAX_SIGNATURE_LEN) {
+        return { valid: false, accepted: false, ackReceipt: '' };
+      }
+      ackReceipt = entry.ack_receipt;
+    }
+    return {
+      valid: true,
+      accepted: entry.accepted,
+      ackReceipt: entry.accepted ? ackReceipt : ''
+    };
+  }
+
+  /**
+   * Looks up and strictly validates the acceptance entry for `id` inside a batch result
+   * returned by storage.getAcceptance(ids) (supports plain Objects or Map instances).
+   */
+  function getBatchAcceptanceEntry(batchRes, id) {
+    if (!batchRes || typeof batchRes !== 'object' || Array.isArray(batchRes)) {
+      return { valid: false, accepted: false, ackReceipt: '' };
+    }
+    if (typeof Map !== 'undefined' && batchRes instanceof Map) {
+      if (!batchRes.has(id)) {
+        return { valid: false, accepted: false, ackReceipt: '' };
+      }
+      return parseAcceptanceEntry(batchRes.get(id));
+    }
+    const proto = Object.getPrototypeOf(batchRes);
+    if (proto !== Object.prototype && proto !== null) {
+      return { valid: false, accepted: false, ackReceipt: '' };
+    }
+    if (!Object.prototype.hasOwnProperty.call(batchRes, id)) {
+      return { valid: false, accepted: false, ackReceipt: '' };
+    }
+    return parseAcceptanceEntry(batchRes[id]);
   }
 
   /**
@@ -275,7 +331,7 @@
      * @param {Object} options.storage Handlers for reading/writing local messages:
      *   - getOutboxIds(): Promise<string[]>
      *   - getMessage(id): Promise<{ id: string, payload: any, attachments: File[], signature?: string }>
-     *   - isAccepted(id): Promise<{ accepted: boolean, ackReceipt?: string } | boolean>
+     *   - getAcceptance(ids: string[]): Promise<Record<string, { accepted: boolean, ackReceipt?: string }> | Map<string, { accepted: boolean, ackReceipt?: string }>>
      *   - acceptMessage(msg: { id: string, payload: any, attachments: File[], signature?: string }): Promise<{ accepted: boolean, ackReceipt?: string } | boolean>
      *   - onAcknowledged(ids: string[], receipts?: Record<string, string>): Promise<void>
      * @param {Function} [options.onStatusChange] Callback: ({ state, detail }) => void
@@ -291,8 +347,8 @@
       if (!parsedPeerOrigin) {
         throw new Error('UMAI: peerOrigin must be a valid concrete http:// or https:// origin (wildcards are forbidden)');
       }
-      if (!options.storage) {
-        throw new Error('UMAI: storage interface is required');
+      if (!options.storage || typeof options.storage.getAcceptance !== 'function') {
+        throw new Error('UMAI: storage interface with getAcceptance(ids) is required');
       }
 
       this.peerOrigin = parsedPeerOrigin.origin;
@@ -1068,14 +1124,41 @@
     }
 
     /**
+     * Returns true if `id` is already queued for GET, currently requested, currently being accepted,
+     * or has reached the automatic retry ceiling in this session.
+     */
+    _shouldSkipOfferLookup(id) {
+      if (
+        this._inFlightGets.has(id) ||
+        this._acceptingIds.has(id) ||
+        this._pendingGetQueue.includes(id)
+      ) {
+        return true;
+      }
+      const failCount = this._failedAttempts.get(id) || 0;
+      const timeoutCount = this._timedOutGets.get(id) || 0;
+      if (failCount >= MAX_AUTO_RETRIES || timeoutCount >= MAX_AUTO_RETRIES) {
+        this.log(
+          'warn',
+          `Skipping automatic acceptance lookup/GET for message ${id} after ${Math.max(failCount, timeoutCount)} unsuccessful attempts in this session`
+        );
+        return true;
+      }
+      return false;
+    }
+
+    /**
      * Handles incoming OFFER:
-     * - Coalesces offered IDs into a bounded set (_pendingOfferIds) so repeated OFFER frames
-     *   never spawn unbounded parallel isAccepted() loops.
+     * - Coalesces eligible offered IDs into a bounded set (_pendingOfferIds) so repeated OFFER frames
+     *   never spawn unbounded parallel getAcceptance() calls.
+     * - Skips IDs already queued for GET, currently requested, or currently being accepted before lookup.
      */
     async _handleOffer(offer, gen = this._generation, port = this.port) {
       if (!this._isGenerationActive(gen, port) || !offer || !Array.isArray(offer.ids)) {
         return;
       }
+      this._pruneExpiredGets();
+
       const offeredIds = offer.ids
         .filter(isValidMessageId)
         .slice(0, MAX_BATCH_IDS);
@@ -1100,15 +1183,25 @@
         if (this._pendingOfferIds.size >= MAX_BATCH_IDS) {
           break;
         }
+        if (this._shouldSkipOfferLookup(id)) {
+          continue;
+        }
         this._pendingOfferIds.add(id);
+      }
+
+      // Dispatch any already-ready GET work before starting a new acceptance lookup batch
+      this._dispatchNextGets(gen, port);
+      if (!this._isGenerationActive(gen, port)) {
+        return;
       }
 
       await this._drainPendingOffers(gen, port);
     }
 
     /**
-     * Single-worker loop per generation that drains coalesced _pendingOfferIds,
-     * sends repeated ACKs for already-accepted IDs (Rule 5), and enqueues unaccepted IDs for bounded GETs (Rule 2).
+     * Single-worker loop per generation that drains coalesced _pendingOfferIds using a single
+     * bounded storage.getAcceptance(ids) batch call per iteration, sends repeated ACKs for
+     * already-accepted IDs (Rule 5), and enqueues unaccepted IDs for bounded GETs (Rule 2).
      */
     async _drainPendingOffers(gen = this._generation, port = this.port) {
       if (!this._isGenerationActive(gen, port) || this._processingOffers || this._pendingOfferIds.size === 0) {
@@ -1119,32 +1212,86 @@
       try {
         while (this._isGenerationActive(gen, port) && this._pendingOfferIds.size > 0) {
           this._pruneExpiredGets();
-          const batch = Array.from(this._pendingOfferIds).slice(0, MAX_BATCH_IDS);
-          for (const id of batch) {
+          // Ensure any already-queued GETs are not held behind a batch lookup
+          this._dispatchNextGets(gen, port);
+          if (!this._isGenerationActive(gen, port)) return;
+
+          const rawBatch = Array.from(this._pendingOfferIds).slice(0, MAX_BATCH_IDS);
+          for (const id of rawBatch) {
             this._pendingOfferIds.delete(id);
           }
+
+          const queryIds = [];
+          const seen = new Set();
+          for (const id of rawBatch) {
+            if (!isValidMessageId(id) || seen.has(id)) {
+              continue;
+            }
+            seen.add(id);
+            if (this._shouldSkipOfferLookup(id)) {
+              continue;
+            }
+            queryIds.push(id);
+          }
+
+          if (queryIds.length === 0) {
+            this._dispatchNextGets(gen, port);
+            continue;
+          }
+
+          let batchRes;
+          try {
+            batchRes = await this.storage.getAcceptance(queryIds.slice());
+          } catch (err) {
+            if (!this._isGenerationActive(gen, port)) return;
+            for (const id of queryIds) {
+              const fails = (this._failedAttempts.get(id) || 0) + 1;
+              this._failedAttempts.set(id, fails);
+            }
+            this.log('error', `Failed batch acceptance lookup for ${queryIds.length} message(s)`, err.message);
+            this._emitError(err);
+            if (!this._isGenerationActive(gen, port)) return;
+            continue;
+          }
+
+          if (!this._isGenerationActive(gen, port)) return;
 
           const alreadyAccepted = [];
           const repeatedReceipts = Object.create(null);
 
-          for (const id of batch) {
+          for (const id of queryIds) {
             if (!this._isGenerationActive(gen, port)) return;
-            const acc = parseAcceptanceResult(await this.storage.isAccepted(id));
-            if (!this._isGenerationActive(gen, port)) return;
+            if (
+              this._inFlightGets.has(id) ||
+              this._acceptingIds.has(id) ||
+              this._pendingGetQueue.includes(id)
+            ) {
+              continue;
+            }
 
-            if (acc.accepted) {
+            const parsed = getBatchAcceptanceEntry(batchRes, id);
+            if (!parsed.valid) {
+              const fails = (this._failedAttempts.get(id) || 0) + 1;
+              this._failedAttempts.set(id, fails);
+              const err = new Error(`Invalid or missing getAcceptance result for message ${id} (attempt ${fails}/${MAX_AUTO_RETRIES})`);
+              this.log('error', err.message);
+              this._emitError(err);
+              if (!this._isGenerationActive(gen, port)) return;
+              continue;
+            }
+
+            if (parsed.accepted) {
               this._failedAttempts.delete(id);
               this._timedOutGets.delete(id);
               this._expiredGets.delete(id);
               alreadyAccepted.push(id);
-              if (acc.ackReceipt) {
-                repeatedReceipts[id] = acc.ackReceipt;
+              if (parsed.ackReceipt) {
+                repeatedReceipts[id] = parsed.ackReceipt;
               }
             } else {
               const failCount = this._failedAttempts.get(id) || 0;
               const timeoutCount = this._timedOutGets.get(id) || 0;
               if (failCount >= MAX_AUTO_RETRIES || timeoutCount >= MAX_AUTO_RETRIES) {
-                this.log('warn', `Skipping automatic GET for message ${id} after ${Math.max(failCount, timeoutCount)} unsuccessful attempts in this session`);
                 continue;
               }
               const totalOutstanding =
@@ -1484,9 +1631,13 @@
         }
 
         // Duplicate check: if already accepted, send ACK again and do not import twice
-        const alreadyAcc = parseAcceptanceResult(await this.storage.isAccepted(id));
+        const lookupRes = await this.storage.getAcceptance([id]);
         if (!this._isGenerationActive(gen, port)) {
           return;
+        }
+        const alreadyAcc = getBatchAcceptanceEntry(lookupRes, id);
+        if (!alreadyAcc.valid) {
+          throw new Error(`Invalid or missing getAcceptance result for message ${id}`);
         }
         if (alreadyAcc.accepted) {
           this._failedAttempts.delete(id);

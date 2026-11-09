@@ -486,13 +486,20 @@
         };
       },
 
-      async isAccepted(id) {
-        const res = await api('/api/accepted/receipts');
-        const receiptsMap = await res.json();
-        if (receiptsMap && Object.prototype.hasOwnProperty.call(receiptsMap, id)) {
-          return { accepted: true, ackReceipt: receiptsMap[id] || '' };
+      async getAcceptance(ids) {
+        const res = await api('/api/inbox/acceptance', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ids })
+        });
+        if (!res.ok) {
+          throw new Error(`Failed to query message acceptance (${res.status})`);
         }
-        return { accepted: false };
+        const data = await res.json();
+        if (!data || typeof data.results !== 'object' || data.results === null) {
+          throw new Error('Malformed acceptance lookup response');
+        }
+        return data.results;
       },
 
       async acceptMessage(putMsg) {

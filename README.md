@@ -226,9 +226,9 @@ UMAI is designed so that developers can integrate existing or legacy application
 2. **The 5-Method Storage Contract:** Any web application connects to `umai.js` by providing five simple asynchronous methods:
    - `getOutboxIds()`
    - `getMessage(id)`
-   - `isAccepted(id)`
+   - `getAcceptance(ids)`
    - `acceptMessage(msg)`
-   - `onAcknowledged(ids)`
+   - `onAcknowledged(ids, receipts)`
 3. **Legacy-Friendly:** Zero backend requirements. Legacy applications (PHP, Java, ASP.NET, Rails, static HTML) can bridge data using their existing forms, DOM elements, existing internal APIs, pure client-side storage (IndexedDB), or dedicated internal endpoints. Zero server-to-server APIs required.
 
 👉 **See the complete [Developer Integration Guide](INTEGRATION_GUIDE.md) for architecture patterns, step-by-step code samples, and legacy modernization recipes.**

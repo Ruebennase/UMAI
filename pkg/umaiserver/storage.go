@@ -18,6 +18,7 @@ import (
 
 const (
 	MaxAttachmentsPerMessage = 50
+	MaxBatchIDs              = 1000
 	OutboxLeaseDuration      = 15 * time.Second
 )
 
@@ -29,6 +30,7 @@ var (
 	ErrFileTooLarge        = errors.New("file exceeds maximum allowed size")
 	ErrDuplicateAttachment = errors.New("duplicate attachment filename in message")
 	ErrTooManyAttachments  = errors.New("too many attachments in message")
+	ErrTooManyIDs          = errors.New("batch exceeds maximum allowed message IDs")
 	ErrStorageCollision    = errors.New("storage directory collision detected")
 )
 
@@ -841,6 +843,12 @@ func (s *Storage) AcknowledgeMessagesVerified(ids []string, receipts map[string]
 // Inbox & Acceptance Management (Rules 3, 4, 5)
 // -----------------------------------------------------------------------------
 
+// AcceptanceStatus represents the durable acceptance status and optional signed receipt for a message ID.
+type AcceptanceStatus struct {
+	Accepted   bool   `json:"accepted"`
+	AckReceipt string `json:"ack_receipt,omitempty"`
+}
+
 // IsAccepted returns true if the message ID has already been accepted.
 func (s *Storage) IsAccepted(id string) bool {
 	cleanID, err := sanitizeID(id)
@@ -850,6 +858,48 @@ func (s *Storage) IsAccepted(id string) bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.acceptedIDs[cleanID]
+}
+
+// GetAcceptance checks a bounded batch of message IDs in a single lock acquisition
+// and returns an explicit AcceptanceStatus for every requested ID.
+func (s *Storage) GetAcceptance(ids []string) (map[string]AcceptanceStatus, error) {
+	if len(ids) > MaxBatchIDs {
+		return nil, ErrTooManyIDs
+	}
+
+	cleanIDs := make([]string, 0, len(ids))
+	for _, rawID := range ids {
+		cleanID, err := sanitizeID(rawID)
+		if err != nil {
+			return nil, err
+		}
+		cleanIDs = append(cleanIDs, cleanID)
+	}
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	results := make(map[string]AcceptanceStatus, len(cleanIDs))
+	for _, id := range cleanIDs {
+		if _, exists := results[id]; exists {
+			continue
+		}
+		if !s.acceptedIDs[id] {
+			results[id] = AcceptanceStatus{Accepted: false}
+			continue
+		}
+		receipt := s.acceptedReceipts[id]
+		if receipt == "" {
+			if _, m, err := s.resolveInboxDirLocked(id); err == nil && m != nil && m.AckReceipt != "" {
+				receipt = m.AckReceipt
+			}
+		}
+		results[id] = AcceptanceStatus{
+			Accepted:   true,
+			AckReceipt: receipt,
+		}
+	}
+	return results, nil
 }
 
 // ListAccepted returns all accepted message IDs.

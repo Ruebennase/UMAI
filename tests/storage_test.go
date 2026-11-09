@@ -482,4 +482,34 @@ func TestStorage_CaseInsensitiveIDCollisions_And_WindowsProblematicIDs(t *testin
 			t.Fatalf("Message %q attachment overwritten or corrupted: got %q, want %q", tc.id, string(gotBytes), string(tc.content))
 		}
 	}
+
+	// Verify batch GetAcceptance returns explicit status + ackReceipt for accepted IDs and accepted: false for unaccepted IDs
+	batchRes, err := restarted.GetAcceptance([]string{"CaseID", "caseid", "unaccepted-id-1"})
+	if err != nil {
+		t.Fatalf("GetAcceptance failed: %v", err)
+	}
+	if !batchRes["CaseID"].Accepted || batchRes["CaseID"].AckReceipt == "" {
+		t.Errorf("Expected CaseID to be accepted with non-empty AckReceipt, got %+v", batchRes["CaseID"])
+	}
+	if !batchRes["caseid"].Accepted || batchRes["caseid"].AckReceipt == "" {
+		t.Errorf("Expected caseid to be accepted with non-empty AckReceipt, got %+v", batchRes["caseid"])
+	}
+	if batchRes["CaseID"].AckReceipt == batchRes["caseid"].AckReceipt {
+		t.Errorf("Distinct messages CaseID and caseid must have distinct AckReceipts")
+	}
+	if uStatus, exists := batchRes["unaccepted-id-1"]; !exists || uStatus.Accepted || uStatus.AckReceipt != "" {
+		t.Errorf("Expected explicit {Accepted: false} for unaccepted-id-1, got exists=%v status=%+v", exists, uStatus)
+	}
+
+	// Verify invalid IDs and >MaxBatchIDs batches are rejected
+	if _, err := restarted.GetAcceptance([]string{"../bad"}); err == nil {
+		t.Errorf("Expected GetAcceptance to reject invalid message ID")
+	}
+	tooMany := make([]string, umaiserver.MaxBatchIDs+1)
+	for i := range tooMany {
+		tooMany[i] = "msg-ok"
+	}
+	if _, err := restarted.GetAcceptance(tooMany); err == nil {
+		t.Errorf("Expected GetAcceptance to reject batch exceeding MaxBatchIDs")
+	}
 }

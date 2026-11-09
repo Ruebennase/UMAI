@@ -317,6 +317,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /api/inbox", s.requireAuth(s.handleListInbox))
 	s.mux.HandleFunc("GET /api/inbox/{id}", s.requireAuth(s.handleGetInboxMessage))
 	s.mux.HandleFunc("GET /api/inbox/{id}/attachments/{filename}", s.requireAuth(s.handleGetInboxAttachment))
+	s.mux.HandleFunc("POST /api/inbox/acceptance", s.requireAuth(s.handleGetAcceptance))
 	s.mux.HandleFunc("GET /api/accepted", s.requireAuth(s.handleListAccepted))
 	s.mux.HandleFunc("GET /api/accepted/receipts", s.requireAuth(s.handleListAcceptedReceipts))
 	s.mux.HandleFunc("POST /api/inbox", s.requireAuth(s.handleAcceptMessage))
@@ -657,6 +658,32 @@ func (s *Server) handleGetInboxAttachment(w http.ResponseWriter, r *http.Request
 	w.Header().Set("Content-Security-Policy", "default-src 'none'; sandbox")
 	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", filepath.Base(path)))
 	http.ServeFile(w, r, path)
+}
+
+func (s *Server) handleGetAcceptance(w http.ResponseWriter, r *http.Request) {
+	if !isJSONContentType(r) {
+		writeJSON(w, http.StatusUnsupportedMediaType, map[string]string{"error": "Content-Type must be application/json"})
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 256*1024)
+
+	var req struct {
+		IDs []string `json:"ids"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.IDs == nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json body; expected {\"ids\": [...]}"})
+		return
+	}
+
+	results, err := s.storage.GetAcceptance(req.IDs)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"results": results,
+	})
 }
 
 func (s *Server) handleListAccepted(w http.ResponseWriter, r *http.Request) {

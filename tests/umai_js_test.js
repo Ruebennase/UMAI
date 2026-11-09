@@ -52,6 +52,17 @@ function createMockChannel() {
   return { port1: p1, port2: p2 };
 }
 
+// Helper to build a simple getAcceptance(ids) function from a predicate or map
+function makeBatchAcceptance(fn) {
+  return async (ids) => {
+    const out = Object.create(null);
+    for (const id of ids) {
+      out[id] = await fn(id);
+    }
+    return out;
+  };
+}
+
 // Test 2: Handshake & Reconnection Reconcile
 (async () => {
   const channel = createMockChannel();
@@ -68,7 +79,7 @@ function createMockChannel() {
     storage: {
       getOutboxIds: async () => outboxA,
       getMessage: async (id) => ({ id, payload: { title: 'Test' }, attachments: [] }),
-      isAccepted: async () => false,
+      getAcceptance: makeBatchAcceptance(() => ({ accepted: false })),
       acceptMessage: async () => true,
       onAcknowledged: async (ids) => { ackReceivedOnA.push(...ids); }
     }
@@ -80,7 +91,7 @@ function createMockChannel() {
     storage: {
       getOutboxIds: async () => [],
       getMessage: async (id) => null,
-      isAccepted: async (id) => acceptedB.has(id),
+      getAcceptance: makeBatchAcceptance((id) => ({ accepted: acceptedB.has(id) })),
       acceptMessage: async (msg) => {
         acceptedB.add(msg.id);
         return true;
@@ -133,7 +144,7 @@ function createMockChannel() {
         if (id === 'msg-never-offered') unofferedGetFetched = true;
         return { id, payload: {}, attachments: [] };
       },
-      isAccepted: async () => false,
+      getAcceptance: makeBatchAcceptance(() => ({ accepted: false })),
       acceptMessage: async () => {
         unsolicitedAccepted = true;
         return true;
@@ -193,7 +204,7 @@ function createMockChannel() {
     storage: {
       getOutboxIds: async () => ['msg-poison-1'],
       getMessage: async (id) => ({ id, payload: { bad: true }, attachments: [] }),
-      isAccepted: async () => false,
+      getAcceptance: makeBatchAcceptance(() => ({ accepted: false })),
       acceptMessage: async () => true,
       onAcknowledged: async () => {}
     }
@@ -204,7 +215,7 @@ function createMockChannel() {
     storage: {
       getOutboxIds: async () => [],
       getMessage: async () => null,
-      isAccepted: async () => ({ accepted: false }),
+      getAcceptance: makeBatchAcceptance(() => ({ accepted: false })),
       acceptMessage: async () => {
         poisonAttempts++;
         return { accepted: false }; // Reject acceptance via structured object
@@ -247,7 +258,7 @@ function createMockChannel() {
     storage: {
       getOutboxIds: async () => ['msg-slow-1'],
       getMessage: async (id) => ({ id, payload: false, attachments: [] }),
-      isAccepted: async () => ({ accepted: false }),
+      getAcceptance: makeBatchAcceptance(() => ({ accepted: false })),
       acceptMessage: async () => ({ accepted: true }),
       onAcknowledged: async (ids, receipts) => {
         if (receipts) Object.assign(ackReceiptsOnSenderSlow, receipts);
@@ -261,7 +272,7 @@ function createMockChannel() {
     storage: {
       getOutboxIds: async () => [],
       getMessage: async () => null,
-      isAccepted: async () => ({ accepted: slowMsgAccepted, ackReceipt: slowMsgAccepted ? 'receipt-slow-1' : '' }),
+      getAcceptance: makeBatchAcceptance(() => ({ accepted: slowMsgAccepted, ackReceipt: slowMsgAccepted ? 'receipt-slow-1' : '' })),
       acceptMessage: async (msg) => {
         acceptCallsForSlowMsg++;
         assert.strictEqual(msg.payload, false, 'Falsy scalar payload (false) must be preserved');
@@ -330,7 +341,7 @@ function createMockChannel() {
     storage: {
       getOutboxIds: async () => [],
       getMessage: async () => null,
-      isAccepted: async () => false,
+      getAcceptance: makeBatchAcceptance(() => ({ accepted: false })),
       acceptMessage: async () => true,
       onAcknowledged: async () => {}
     }
@@ -366,7 +377,7 @@ function createMockChannel() {
     storage: {
       getOutboxIds: async () => [],
       getMessage: async () => null,
-      isAccepted: async () => false,
+      getAcceptance: makeBatchAcceptance(() => ({ accepted: false })),
       acceptMessage: async () => true,
       onAcknowledged: async () => {}
     }
@@ -391,7 +402,7 @@ function createMockChannel() {
     assert.throws(() => new UmaiSession({ peerOrigin: 'javascript:alert(1)', storage: {} }), /valid concrete http/);
 
     // C1: Pending getMessage() from an old channel must NOT leak onto a replacement channel,
-    // and stop() during isAccepted() must NOT invoke acceptMessage()
+    // and stop() during getAcceptance() must NOT invoke acceptMessage()
     let releaseOldGetMessage = null;
     const oldChan = createMockChannel();
     const newChan = createMockChannel();
@@ -404,7 +415,7 @@ function createMockChannel() {
           await new Promise(r => { releaseOldGetMessage = r; });
           return { id, payload: { secret: 'old-account' }, attachments: [] };
         },
-        isAccepted: async () => false,
+        getAcceptance: makeBatchAcceptance(() => ({ accepted: false })),
         acceptMessage: async () => true,
         onAcknowledged: async () => {}
       }
@@ -428,8 +439,8 @@ function createMockChannel() {
     assert.strictEqual(leakedPuts.length, 0, 'Pending getMessage from old generation must NOT transmit over replacement channel (C1)');
     genSender.stop();
 
-    // Also verify stop() during isAccepted() prevents acceptMessage() from being called (C1)
-    let releaseIsAccepted = null;
+    // Also verify stop() during getAcceptance() prevents acceptMessage() from being called (C1)
+    let releaseGetAcceptance = null;
     let acceptCalledAfterStop = false;
     const stopRecChan = createMockChannel();
     const stopReceiver = new UmaiSession({
@@ -438,9 +449,11 @@ function createMockChannel() {
       storage: {
         getOutboxIds: async () => [],
         getMessage: async () => null,
-        isAccepted: async () => {
-          await new Promise(r => { releaseIsAccepted = r; });
-          return { accepted: false };
+        getAcceptance: async (ids) => {
+          await new Promise(r => { releaseGetAcceptance = r; });
+          const out = {};
+          for (const id of ids) out[id] = { accepted: false };
+          return out;
         },
         acceptMessage: async () => {
           acceptCalledAfterStop = true;
@@ -463,7 +476,7 @@ function createMockChannel() {
     });
     await new Promise(r => setTimeout(r, 10));
     stopReceiver.stop();
-    releaseIsAccepted();
+    releaseGetAcceptance();
     await new Promise(r => setTimeout(r, 20));
     assert.strictEqual(acceptCalledAfterStop, false, 'acceptMessage must not be called after stop() (C1)');
 
@@ -480,7 +493,7 @@ function createMockChannel() {
       storage: {
         getOutboxIds: async () => batchIds.filter(id => !acceptedBatch.has(id)),
         getMessage: async (id) => ({ id, payload: { n: id }, attachments: [] }),
-        isAccepted: async () => false,
+        getAcceptance: makeBatchAcceptance(() => ({ accepted: false })),
         acceptMessage: async () => true,
         onAcknowledged: async () => {}
       }
@@ -492,7 +505,7 @@ function createMockChannel() {
       storage: {
         getOutboxIds: async () => [],
         getMessage: async () => null,
-        isAccepted: async (id) => ({ accepted: acceptedBatch.has(id) }),
+        getAcceptance: makeBatchAcceptance((id) => ({ accepted: acceptedBatch.has(id) })),
         acceptMessage: async (msg) => {
           currentConcurrentAccepts++;
           if (currentConcurrentAccepts > maxObservedConcurrentAccepts) {
@@ -530,7 +543,7 @@ function createMockChannel() {
       storage: {
         getOutboxIds: async () => [],
         getMessage: async () => null,
-        isAccepted: async () => ({ accepted: false }),
+        getAcceptance: makeBatchAcceptance(() => ({ accepted: false })),
         acceptMessage: async (msg) => {
           if (msg.id === 'msg-bad-att') badPutAccepted = true;
           return { accepted: 'false' }; // Invalid string instead of boolean true
@@ -587,7 +600,7 @@ function createMockChannel() {
       storage: {
         getOutboxIds: async () => [],
         getMessage: async () => null,
-        isAccepted: async () => ({ accepted: false }),
+        getAcceptance: makeBatchAcceptance(() => ({ accepted: false })),
         acceptMessage: async () => {
           oversizedPayloadAccepted = true;
           return { accepted: true };
@@ -633,7 +646,7 @@ function createMockChannel() {
       storage: {
         getOutboxIds: async () => (acceptedReceiptOnSender ? [] : ['msg-ack-flood']),
         getMessage: async (id) => ({ id, payload: {}, attachments: [] }),
-        isAccepted: async () => false,
+        getAcceptance: makeBatchAcceptance(() => ({ accepted: false })),
         acceptMessage: async () => true,
         onAcknowledged: async (ids, receipts) => {
           totalAckCalls++;
@@ -693,7 +706,7 @@ function createMockChannel() {
           payload: { sneaky: new Blob([new Uint8Array(1024)]) },
           attachments: []
         }),
-        isAccepted: async () => false,
+        getAcceptance: makeBatchAcceptance(() => ({ accepted: false })),
         acceptMessage: async () => {
           nestedBlobAccepted = true;
           return true;
@@ -761,7 +774,7 @@ function createMockChannel() {
           }
           return { id, payload: { id }, attachments: [] };
         },
-        isAccepted: async () => false,
+        getAcceptance: makeBatchAcceptance(() => ({ accepted: false })),
         acceptMessage: async () => true,
         onAcknowledged: async () => {}
       }
@@ -834,7 +847,7 @@ function createMockChannel() {
       storage: {
         getOutboxIds: async () => ['msg-cb-stop'],
         getMessage: async (id) => ({ id, payload: {}, attachments: [] }),
-        isAccepted: async () => false,
+        getAcceptance: makeBatchAcceptance(() => ({ accepted: false })),
         acceptMessage: async () => true,
         onAcknowledged: async () => {
           onAckCalledAfterCallbackStop = true;
@@ -874,7 +887,7 @@ function createMockChannel() {
       storage: {
         getOutboxIds: async () => [],
         getMessage: async () => null,
-        isAccepted: async (id) => ({ accepted: acceptedLateSet.has(id) }),
+        getAcceptance: makeBatchAcceptance((id) => ({ accepted: acceptedLateSet.has(id) })),
         acceptMessage: async (msg) => {
           if (msg.id === 'msg-healthy' && !releaseHealthyAccept) {
             await new Promise(r => { releaseHealthyAccept = r; });
@@ -942,7 +955,7 @@ function createMockChannel() {
       storage: {
         getOutboxIds: async () => [],
         getMessage: async () => null,
-        isAccepted: async (id) => ({ accepted: acceptedLateSet.has(id) }),
+        getAcceptance: makeBatchAcceptance((id) => ({ accepted: acceptedLateSet.has(id) })),
         acceptMessage: async (msg) => {
           acceptedLateSet.add(msg.id);
           return { accepted: true };
@@ -984,6 +997,173 @@ function createMockChannel() {
     timeoutReceiver.stop();
   }
   console.log('✓ Test 8: Bounded ACK coalescing, strict JSON payload, >1,000 outbox progress, callback stop() isolation, and late-PUT timeout handling passed');
+
+  // Test 9: Batch getAcceptance(ids) Contract & Reviewer Section 6 Verification Suite:
+  //   9a) Large initial offer (250 IDs: 100 accepted with receipts, 150 unaccepted) uses 1 batch call, emits 1 ACK with receipts, and skips already-queued/transferring IDs on repeated OFFERs
+  //   9b) Missing, malformed, and failed lookup results produce no false ACKs or false GETs, and obey MAX_AUTO_RETRIES=3
+  //   9c) Concurrent acceptance by another session between OFFER lookup and PUT arrival is caught by pre-acceptMessage getAcceptance([id])
+  {
+    const initial250 = Array.from({ length: 250 }, (_, i) => `msg-b250-${i + 1}`);
+    const batchCalls = [];
+    const chan9a = createMockChannel();
+
+    const rec9a = new UmaiSession({
+      peerOrigin: 'http://host.example',
+      role: 'embedded',
+      maxConcurrency: 2,
+      storage: {
+        getOutboxIds: async () => [],
+        getMessage: async () => null,
+        getAcceptance: async (ids) => {
+          batchCalls.push(ids.slice());
+          const out = Object.create(null);
+          for (let i = 0; i < ids.length; i++) {
+            const id = ids[i];
+            const num = parseInt(id.split('-').pop(), 10);
+            if (num <= 100) {
+              out[id] = { accepted: true, ackReceipt: `rec-${id}` };
+            } else {
+              out[id] = { accepted: false };
+            }
+          }
+          return out;
+        },
+        acceptMessage: async () => ({ accepted: true }),
+        onAcknowledged: async () => {}
+      }
+    });
+    rec9a.port = chan9a.port1;
+    chan9a.port1.onmessage = rec9a._portListener;
+    rec9a.state = 'connected';
+
+    await rec9a._handleOffer({
+      protocol: PROTOCOL_NAME,
+      version: PROTOCOL_VERSION,
+      type: 'OFFER',
+      ids: initial250
+    });
+
+    assert.strictEqual(batchCalls.length, 1, 'Large initial offer of 250 IDs must execute exactly 1 batch getAcceptance(ids) call');
+    assert.strictEqual(batchCalls[0].length, 250, 'Batch lookup must receive all 250 unique valid IDs');
+
+    const sentAcks = chan9a.port1.sent.filter(m => m.type === 'ACK');
+    assert.strictEqual(sentAcks.length, 1, 'All 100 accepted IDs must be acknowledged in a single batched ACK');
+    assert.strictEqual(sentAcks[0].ids.length, 100, 'Batched ACK must contain all 100 accepted IDs');
+    assert.strictEqual(sentAcks[0].receipts['msg-b250-1'], 'rec-msg-b250-1', 'Batched ACK must preserve receipts');
+    assert.strictEqual(sentAcks[0].receipts['msg-b250-100'], 'rec-msg-b250-100', 'Batched ACK must preserve all receipts');
+
+    const sentGets = chan9a.port1.sent.filter(m => m.type === 'GET');
+    assert.strictEqual(sentGets.length, 1, 'Initial GET window must be dispatched');
+    assert.strictEqual(sentGets[0].ids.length, 2, 'Initial GET window must respect maxConcurrency=2');
+    assert.strictEqual(rec9a._pendingGetQueue.length, 148, 'Remaining 148 unaccepted IDs must be queued in _pendingGetQueue');
+
+    // Now send a repeated OFFER for the exact 150 unaccepted IDs (2 in _inFlightGets, 148 in _pendingGetQueue)
+    await rec9a._handleOffer({
+      protocol: PROTOCOL_NAME,
+      version: PROTOCOL_VERSION,
+      type: 'OFFER',
+      ids: initial250.slice(100)
+    });
+    assert.strictEqual(batchCalls.length, 1, 'Repeated OFFER for IDs already queued or in-flight must be skipped before getAcceptance() (0 new lookups)');
+    rec9a.stop();
+
+    // --- 9b: Missing, malformed, and failed lookup results produce no false ACKs and no false GETs ---
+    let lookupAttempts = 0;
+    const chan9b = createMockChannel();
+    const rec9b = new UmaiSession({
+      peerOrigin: 'http://host.example',
+      role: 'embedded',
+      storage: {
+        getOutboxIds: async () => [],
+        getMessage: async () => null,
+        getAcceptance: async () => {
+          lookupAttempts++;
+          return {
+            // 'msg-missing' is omitted completely (simulating SQL WHERE IN missing-key bug)
+            'msg-malformed-bool': { accepted: 'yes' },
+            'msg-malformed-rec': { accepted: true, ackReceipt: 12345 },
+            'msg-valid-acc': { accepted: true, ackReceipt: 'sig-ok' },
+            'msg-valid-unacc': { accepted: false }
+          };
+        },
+        acceptMessage: async () => ({ accepted: true }),
+        onAcknowledged: async () => {}
+      }
+    });
+    rec9b.port = chan9b.port1;
+    chan9b.port1.onmessage = rec9b._portListener;
+    rec9b.state = 'connected';
+
+    await rec9b._handleOffer({
+      protocol: PROTOCOL_NAME,
+      version: PROTOCOL_VERSION,
+      type: 'OFFER',
+      ids: ['msg-missing', 'msg-malformed-bool', 'msg-malformed-rec', 'msg-valid-acc', 'msg-valid-unacc']
+    });
+
+    const acks9b = chan9b.port1.sent.filter(m => m.type === 'ACK');
+    assert.strictEqual(acks9b.length, 1);
+    assert.deepStrictEqual(acks9b[0].ids, ['msg-valid-acc'], 'Only explicitly valid accepted entry may produce ACK');
+    const gets9b = chan9b.port1.sent.filter(m => m.type === 'GET');
+    assert.strictEqual(gets9b.length, 1);
+    assert.deepStrictEqual(gets9b[0].ids, ['msg-valid-unacc'], 'Missing or malformed entries must NOT trigger false GETs');
+
+    // Verify bounded retry backoff (MAX_AUTO_RETRIES=3) for missing/malformed entries
+    for (let i = 0; i < 5; i++) {
+      await rec9b._handleOffer({
+        protocol: PROTOCOL_NAME,
+        version: PROTOCOL_VERSION,
+        type: 'OFFER',
+        ids: ['msg-missing']
+      });
+    }
+    assert.strictEqual(lookupAttempts, 3, 'Missing/malformed getAcceptance entry must back off after MAX_AUTO_RETRIES=3');
+    rec9b.stop();
+
+    // --- 9c: Concurrent acceptance by another session between OFFER lookup and PUT arrival ---
+    let acceptMessageCalledOnDup = false;
+    const chan9c = createMockChannel();
+    const rec9c = new UmaiSession({
+      peerOrigin: 'http://host.example',
+      role: 'embedded',
+      storage: {
+        getOutboxIds: async () => [],
+        getMessage: async () => null,
+        getAcceptance: async (ids) => {
+          // By the time PUT arrives and checks getAcceptance([id]), another session has accepted it!
+          const out = {};
+          for (const id of ids) {
+            out[id] = { accepted: true, ackReceipt: 'concurrent-session-receipt' };
+          }
+          return out;
+        },
+        acceptMessage: async () => {
+          acceptMessageCalledOnDup = true;
+          return { accepted: true };
+        },
+        onAcknowledged: async () => {}
+      }
+    });
+    rec9c.port = chan9c.port1;
+    chan9c.port1.onmessage = rec9c._portListener;
+    rec9c.state = 'connected';
+    rec9c._inFlightGets.set('msg-concurrent-tab', Date.now());
+    await rec9c._handlePut({
+      protocol: PROTOCOL_NAME,
+      version: PROTOCOL_VERSION,
+      type: 'PUT',
+      id: 'msg-concurrent-tab',
+      payload: { hello: 'world' },
+      attachments: []
+    });
+    await new Promise(r => setTimeout(r, 20));
+    assert.strictEqual(acceptMessageCalledOnDup, false, 'Concurrent acceptance detected by getAcceptance([id]) must skip acceptMessage');
+    const acks9c = chan9c.port1.sent.filter(m => m.type === 'ACK');
+    assert.strictEqual(acks9c.length, 1);
+    assert.strictEqual(acks9c[0].receipts['msg-concurrent-tab'], 'concurrent-session-receipt', 'Duplicate PUT check must forward stored ackReceipt');
+    rec9c.stop();
+  }
+  console.log('✓ Test 9: Batch getAcceptance(ids) contract, pre-lookup skip, malformed-entry safety, and concurrent session dedup passed');
 
   senderPoison.stop();
   receiverPoison.stop();
