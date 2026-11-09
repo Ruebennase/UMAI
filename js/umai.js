@@ -29,6 +29,9 @@
   const MAX_BATCH_IDS = 1000;
   const MAX_AUTO_RETRIES = 3;
   const DEFAULT_GET_TIMEOUT_MS = 120000;
+  const DEFAULT_LOOKUP_MIN_INTERVAL_MS = 20;
+  const DEFAULT_LOOKUP_RETRY_BASE_MS = 500;
+  const DEFAULT_LOOKUP_RETRY_MAX_MS = 30000;
   const DEFAULT_MAX_CONCURRENCY = 1;
   const MAX_CONCURRENCY_CAP = 16;
   const DEFAULT_MAX_ATTACHMENTS = 50;
@@ -291,27 +294,36 @@
   }
 
   /**
-   * Looks up and strictly validates the acceptance entry for `id` inside a batch result
-   * returned by storage.getAcceptance(ids) (supports plain Objects or Map instances).
+   * Validates the complete batch response from storage.getAcceptance(queryIds).
+   * Requires `batchRes` to be a plain ID-keyed object (Object.prototype or null prototype) containing
+   * an explicit `{ accepted: boolean, ackReceipt?: string }` own-property entry for EVERY requested ID.
+   * If `batchRes` is not a plain object, or ANY requested ID is missing or malformed, the entire batch
+   * fails validation (returning null) so partial/corrupt responses never trigger false ACKs or false GETs.
    */
-  function getBatchAcceptanceEntry(batchRes, id) {
+  function validateBatchAcceptance(batchRes, queryIds) {
     if (!batchRes || typeof batchRes !== 'object' || Array.isArray(batchRes)) {
-      return { valid: false, accepted: false, ackReceipt: '' };
-    }
-    if (typeof Map !== 'undefined' && batchRes instanceof Map) {
-      if (!batchRes.has(id)) {
-        return { valid: false, accepted: false, ackReceipt: '' };
-      }
-      return parseAcceptanceEntry(batchRes.get(id));
+      return null;
     }
     const proto = Object.getPrototypeOf(batchRes);
     if (proto !== Object.prototype && proto !== null) {
-      return { valid: false, accepted: false, ackReceipt: '' };
+      return null;
     }
-    if (!Object.prototype.hasOwnProperty.call(batchRes, id)) {
-      return { valid: false, accepted: false, ackReceipt: '' };
+    const normalized = Object.create(null);
+    for (let i = 0; i < queryIds.length; i++) {
+      const id = queryIds[i];
+      if (!Object.prototype.hasOwnProperty.call(batchRes, id)) {
+        return null;
+      }
+      const parsed = parseAcceptanceEntry(batchRes[id]);
+      if (!parsed.valid) {
+        return null;
+      }
+      normalized[id] = {
+        accepted: parsed.accepted,
+        ackReceipt: parsed.ackReceipt
+      };
     }
-    return parseAcceptanceEntry(batchRes[id]);
+    return normalized;
   }
 
   /**
@@ -328,10 +340,13 @@
      * @param {number} [options.maxAttachments=50] Maximum attachments permitted per message
      * @param {number} [options.maxMessageBytes=52428800] Maximum total message byte size (JSON payload + attachments, default 50 MB)
      * @param {number} [options.getTimeoutMs=120000] Timeout (ms) before an unanswered GET releases its active slot for other messages
+     * @param {number} [options.lookupMinIntervalMs=20] Minimum pacing interval (ms) between consecutive getAcceptance() batches under offer floods
+     * @param {number} [options.lookupRetryBaseMs=500] Initial retry delay (ms) for transient getAcceptance() lookup failures
+     * @param {number} [options.lookupRetryMaxMs=30000] Maximum capped backoff delay (ms) for repeated getAcceptance() lookup failures
      * @param {Object} options.storage Handlers for reading/writing local messages:
      *   - getOutboxIds(): Promise<string[]>
      *   - getMessage(id): Promise<{ id: string, payload: any, attachments: File[], signature?: string }>
-     *   - getAcceptance(ids: string[]): Promise<Record<string, { accepted: boolean, ackReceipt?: string }> | Map<string, { accepted: boolean, ackReceipt?: string }>>
+     *   - getAcceptance(ids: string[]): Promise<Record<string, { accepted: boolean, ackReceipt?: string }>>
      *   - acceptMessage(msg: { id: string, payload: any, attachments: File[], signature?: string }): Promise<{ accepted: boolean, ackReceipt?: string } | boolean>
      *   - onAcknowledged(ids: string[], receipts?: Record<string, string>): Promise<void>
      * @param {Function} [options.onStatusChange] Callback: ({ state, detail }) => void
@@ -364,6 +379,15 @@
       this.getTimeoutMs = (typeof options.getTimeoutMs === 'number' && Number.isFinite(options.getTimeoutMs) && options.getTimeoutMs >= 10)
         ? Math.floor(options.getTimeoutMs)
         : DEFAULT_GET_TIMEOUT_MS;
+      this.lookupMinIntervalMs = (typeof options.lookupMinIntervalMs === 'number' && Number.isFinite(options.lookupMinIntervalMs) && options.lookupMinIntervalMs >= 0)
+        ? Math.floor(options.lookupMinIntervalMs)
+        : DEFAULT_LOOKUP_MIN_INTERVAL_MS;
+      this.lookupRetryBaseMs = (typeof options.lookupRetryBaseMs === 'number' && Number.isFinite(options.lookupRetryBaseMs) && options.lookupRetryBaseMs >= 10)
+        ? Math.floor(options.lookupRetryBaseMs)
+        : DEFAULT_LOOKUP_RETRY_BASE_MS;
+      this.lookupRetryMaxMs = (typeof options.lookupRetryMaxMs === 'number' && Number.isFinite(options.lookupRetryMaxMs) && options.lookupRetryMaxMs >= this.lookupRetryBaseMs)
+        ? Math.floor(options.lookupRetryMaxMs)
+        : Math.max(this.lookupRetryBaseMs, DEFAULT_LOOKUP_RETRY_MAX_MS);
 
       this.storage = options.storage;
       this.onStatusChange = options.onStatusChange || (() => {});
@@ -400,9 +424,14 @@
       this._reconcileForcePending = false;
       this._reconcilePromise = null;
 
-      // Coalesced incoming OFFER queue and single-worker flag
+      // Coalesced incoming OFFER queue, deferred unaccepted overflow, lookup pacing, and single-worker state
       this._pendingOfferIds = new Set();
+      this._deferredOfferIds = new Set();
       this._processingOffers = false;
+      this._lastLookupStartedAt = 0;
+      this._lookupFailureCount = 0;
+      this._nextLookupAllowedAt = 0;
+      this._lookupTimer = null;
 
       // Receiver GET windowing queue, active reservations, and bounded expired reservation history
       this._pendingGetQueue = [];
@@ -419,7 +448,7 @@
       // Track message IDs offered to the peer (bounded to MAX_BATCH_IDS)
       this._offeredIds = new Set();
 
-      // Track per-ID acceptance failures in this session to prevent poison-pill retry loops
+      // Bounded per-ID session retry cutoff counter for rejected/corrupt PUT messages (<= MAX_BATCH_IDS)
       this._failedAttempts = new Map();
     }
 
@@ -517,6 +546,21 @@
     }
 
     /**
+     * Inserts or updates an entry in a Map bounded to MAX_BATCH_IDS (evicting the oldest entry if full).
+     */
+    _setBoundedMap(map, key, value) {
+      if (map.has(key)) {
+        map.delete(key);
+      } else if (map.size >= MAX_BATCH_IDS) {
+        const oldestKey = map.keys().next().value;
+        if (oldestKey !== undefined) {
+          map.delete(oldestKey);
+        }
+      }
+      map.set(key, value);
+    }
+
+    /**
      * Closes the current MessagePort (if any), increments the connection generation to invalidate
      * any in-flight async work from the prior channel, and clears per-channel state.
      */
@@ -525,6 +569,10 @@
       if (this._getExpiryTimer) {
         clearTimeout(this._getExpiryTimer);
         this._getExpiryTimer = null;
+      }
+      if (this._lookupTimer) {
+        clearTimeout(this._lookupTimer);
+        this._lookupTimer = null;
       }
       if (this.port) {
         try {
@@ -547,11 +595,16 @@
       this._reconcileForcePending = false;
       this._reconcilePromise = null;
       this._pendingOfferIds.clear();
+      this._deferredOfferIds.clear();
       this._processingOffers = false;
+      this._lastLookupStartedAt = 0;
+      this._lookupFailureCount = 0;
+      this._nextLookupAllowedAt = 0;
       this._pendingGetQueue = [];
       this._inFlightGets.clear();
       this._expiredGets.clear();
       this._timedOutGets.clear();
+      this._failedAttempts.clear();
       this._acceptingIds.clear();
       this._incomingPutQueue = [];
       this._activeAcceptCount = 0;
@@ -621,7 +674,7 @@
           }
 
           const timeouts = (this._timedOutGets.get(id) || 0) + 1;
-          this._timedOutGets.set(id, timeouts);
+          this._setBoundedMap(this._timedOutGets, id, timeouts);
 
           const totalOutstanding = this._pendingGetQueue.length + this._inFlightGets.size + this._acceptingIds.size;
           if (
@@ -666,7 +719,13 @@
       this._pruneExpiredGets();
       const ackPending = this._pendingAcks.size + this._activeAckBatchSet.size;
       const pendingOutgoing = this._putQueue.length + this._activeSendCount + ackPending;
-      const pendingIncoming = this._pendingOfferIds.size + this._pendingGetQueue.length + this._inFlightGets.size + this._acceptingIds.size;
+      const pendingIncoming =
+        this._pendingOfferIds.size +
+        this._deferredOfferIds.size +
+        (this._processingOffers ? 1 : 0) +
+        this._pendingGetQueue.length +
+        this._inFlightGets.size +
+        this._acceptingIds.size;
       const isSyncing = pendingOutgoing > 0 || pendingIncoming > 0;
       const info = {
         isSyncing: isSyncing,
@@ -685,7 +744,13 @@
       this._pruneExpiredGets();
       const ackPending = this._pendingAcks.size + this._activeAckBatchSet.size;
       const pendingOutgoing = this._putQueue.length + this._activeSendCount + ackPending;
-      const pendingIncoming = this._pendingOfferIds.size + this._pendingGetQueue.length + this._inFlightGets.size + this._acceptingIds.size;
+      const pendingIncoming =
+        this._pendingOfferIds.size +
+        this._deferredOfferIds.size +
+        (this._processingOffers ? 1 : 0) +
+        this._pendingGetQueue.length +
+        this._inFlightGets.size +
+        this._acceptingIds.size;
       const isSyncing = pendingOutgoing > 0 || pendingIncoming > 0;
       return {
         isSyncing: isSyncing,
@@ -994,6 +1059,9 @@
       if (force) {
         this._failedAttempts.clear();
         this._timedOutGets.clear();
+        this._lookupFailureCount = 0;
+        this._nextLookupAllowedAt = 0;
+        this._lastLookupStartedAt = 0;
       }
 
       if (this._reconciling && this._reconcilePromise) {
@@ -1018,6 +1086,12 @@
           if (nextForce) {
             this._failedAttempts.clear();
             this._timedOutGets.clear();
+            this._lookupFailureCount = 0;
+            this._nextLookupAllowedAt = 0;
+            this._lastLookupStartedAt = 0;
+            if (this._pendingOfferIds.size > 0) {
+              this._drainPendingOffers(gen, port);
+            }
           }
 
           const outboxIds = await this.storage.getOutboxIds();
@@ -1124,8 +1198,84 @@
     }
 
     /**
+     * Schedules a generation-scoped timer to drain _pendingOfferIds after lookup pacing or backoff delay.
+     */
+    _schedulePendingOfferDrain(delayMs, gen = this._generation, port = this.port) {
+      if (!this._isGenerationActive(gen, port) || this._pendingOfferIds.size === 0) {
+        return;
+      }
+      if (this._lookupTimer) {
+        clearTimeout(this._lookupTimer);
+        this._lookupTimer = null;
+      }
+      const waitMs = Math.max(1, Math.ceil(delayMs));
+      const timer = setTimeout(() => {
+        this._lookupTimer = null;
+        if (!this._isGenerationActive(gen, port)) {
+          return;
+        }
+        this._drainPendingOffers(gen, port);
+      }, waitMs);
+      if (timer && typeof timer.unref === 'function') {
+        timer.unref();
+      }
+      this._lookupTimer = timer;
+    }
+
+    /**
+     * Records a transient or malformed getAcceptance() failure without burning per-message acceptance retries:
+     * re-queues unresolved IDs into bounded _pendingOfferIds and schedules an automatic retry with capped exponential backoff.
+     */
+    _recordLookupFailure(failedIds, err, gen = this._generation, port = this.port) {
+      if (!this._isGenerationActive(gen, port)) return;
+      for (const id of failedIds) {
+        if (this._pendingOfferIds.size >= MAX_BATCH_IDS) {
+          break;
+        }
+        if (!this._shouldSkipOfferLookup(id)) {
+          this._pendingOfferIds.add(id);
+        }
+      }
+      this._lookupFailureCount++;
+      const shift = Math.min(this._lookupFailureCount - 1, 16);
+      const backoffMs = Math.min(this.lookupRetryMaxMs, this.lookupRetryBaseMs * Math.pow(2, shift));
+      this._nextLookupAllowedAt = Date.now() + backoffMs;
+
+      this.log(
+        'error',
+        `Acceptance lookup failed (attempt ${this._lookupFailureCount}, retrying in ${backoffMs}ms): ${err.message}`
+      );
+      this._emitError(err);
+      if (!this._isGenerationActive(gen, port)) return;
+      this._schedulePendingOfferDrain(backoffMs, gen, port);
+    }
+
+    /**
+     * Promotes previously verified unaccepted IDs from bounded _deferredOfferIds into _pendingGetQueue
+     * whenever incoming transfer capacity (< MAX_BATCH_IDS) opens up.
+     */
+    _promoteDeferredOffers(gen = this._generation, port = this.port) {
+      if (!this._isGenerationActive(gen, port) || this._deferredOfferIds.size === 0) {
+        return;
+      }
+      for (const id of Array.from(this._deferredOfferIds)) {
+        const totalOutstanding =
+          this._pendingGetQueue.length +
+          this._inFlightGets.size +
+          this._acceptingIds.size;
+        if (totalOutstanding >= MAX_BATCH_IDS) {
+          break;
+        }
+        this._deferredOfferIds.delete(id);
+        if (!this._shouldSkipOfferLookup(id)) {
+          this._pendingGetQueue.push(id);
+        }
+      }
+    }
+
+    /**
      * Returns true if `id` is already queued for GET, currently requested, currently being accepted,
-     * or has reached the automatic retry ceiling in this session.
+     * or has reached the per-message session retry cutoff (`_failedAttempts` / `_timedOutGets`).
      */
     _shouldSkipOfferLookup(id) {
       if (
@@ -1140,7 +1290,7 @@
       if (failCount >= MAX_AUTO_RETRIES || timeoutCount >= MAX_AUTO_RETRIES) {
         this.log(
           'warn',
-          `Skipping automatic acceptance lookup/GET for message ${id} after ${Math.max(failCount, timeoutCount)} unsuccessful attempts in this session`
+          `Skipping automatic GET for message ${id}: reached session retry cutoff (${Math.max(failCount, timeoutCount)}/${MAX_AUTO_RETRIES})`
         );
         return true;
       }
@@ -1199,18 +1349,44 @@
     }
 
     /**
-     * Single-worker loop per generation that drains coalesced _pendingOfferIds using a single
-     * bounded storage.getAcceptance(ids) batch call per iteration, sends repeated ACKs for
-     * already-accepted IDs (Rule 5), and enqueues unaccepted IDs for bounded GETs (Rule 2).
+     * Single-worker loop per generation that drains coalesced _pendingOfferIds independently of GET capacity:
+     * - Enforces lookup rate pacing (`lookupMinIntervalMs`) and capped exponential backoff on lookup outages.
+     * - Immediately emits batched repeated ACKs for already-accepted IDs (Rule 5) even if the GET queue is full.
+     * - Enqueues unaccepted IDs into _pendingGetQueue when capacity permits, or retains overflow in bounded _deferredOfferIds.
      */
     async _drainPendingOffers(gen = this._generation, port = this.port) {
       if (!this._isGenerationActive(gen, port) || this._processingOffers || this._pendingOfferIds.size === 0) {
         return;
       }
 
+      const now = Date.now();
+      const earliestByPacing = this._lastLookupStartedAt > 0
+        ? (this._lastLookupStartedAt + this.lookupMinIntervalMs)
+        : 0;
+      const allowedAt = Math.max(this._nextLookupAllowedAt, earliestByPacing);
+      if (now < allowedAt) {
+        this._schedulePendingOfferDrain(allowedAt - now, gen, port);
+        return;
+      }
+
+      if (this._lookupTimer) {
+        clearTimeout(this._lookupTimer);
+        this._lookupTimer = null;
+      }
+
       this._processingOffers = true;
       try {
         while (this._isGenerationActive(gen, port) && this._pendingOfferIds.size > 0) {
+          const loopNow = Date.now();
+          const loopEarliest = this._lastLookupStartedAt > 0
+            ? (this._lastLookupStartedAt + this.lookupMinIntervalMs)
+            : 0;
+          const loopAllowedAt = Math.max(this._nextLookupAllowedAt, loopEarliest);
+          if (loopNow < loopAllowedAt) {
+            this._schedulePendingOfferDrain(loopAllowedAt - loopNow, gen, port);
+            break;
+          }
+
           this._pruneExpiredGets();
           // Ensure any already-queued GETs are not held behind a batch lookup
           this._dispatchNextGets(gen, port);
@@ -1239,22 +1415,24 @@
             continue;
           }
 
-          let batchRes;
+          this._lastLookupStartedAt = Date.now();
+          let validatedBatch = null;
           try {
-            batchRes = await this.storage.getAcceptance(queryIds.slice());
+            const batchRes = await this.storage.getAcceptance(queryIds.slice());
+            if (!this._isGenerationActive(gen, port)) return;
+            validatedBatch = validateBatchAcceptance(batchRes, queryIds);
+            if (!validatedBatch) {
+              throw new Error(`Invalid or incomplete getAcceptance batch response (${queryIds.length} ID(s) requested)`);
+            }
           } catch (err) {
             if (!this._isGenerationActive(gen, port)) return;
-            for (const id of queryIds) {
-              const fails = (this._failedAttempts.get(id) || 0) + 1;
-              this._failedAttempts.set(id, fails);
-            }
-            this.log('error', `Failed batch acceptance lookup for ${queryIds.length} message(s)`, err.message);
-            this._emitError(err);
-            if (!this._isGenerationActive(gen, port)) return;
-            continue;
+            this._recordLookupFailure(queryIds, err, gen, port);
+            break;
           }
 
-          if (!this._isGenerationActive(gen, port)) return;
+          // Batch lookup succeeded completely: reset lookup backoff state
+          this._lookupFailureCount = 0;
+          this._nextLookupAllowedAt = 0;
 
           const alreadyAccepted = [];
           const repeatedReceipts = Object.create(null);
@@ -1269,24 +1447,15 @@
               continue;
             }
 
-            const parsed = getBatchAcceptanceEntry(batchRes, id);
-            if (!parsed.valid) {
-              const fails = (this._failedAttempts.get(id) || 0) + 1;
-              this._failedAttempts.set(id, fails);
-              const err = new Error(`Invalid or missing getAcceptance result for message ${id} (attempt ${fails}/${MAX_AUTO_RETRIES})`);
-              this.log('error', err.message);
-              this._emitError(err);
-              if (!this._isGenerationActive(gen, port)) return;
-              continue;
-            }
-
-            if (parsed.accepted) {
+            const entry = validatedBatch[id];
+            if (entry.accepted) {
               this._failedAttempts.delete(id);
               this._timedOutGets.delete(id);
               this._expiredGets.delete(id);
+              this._deferredOfferIds.delete(id);
               alreadyAccepted.push(id);
-              if (parsed.ackReceipt) {
-                repeatedReceipts[id] = parsed.ackReceipt;
+              if (entry.ackReceipt) {
+                repeatedReceipts[id] = entry.ackReceipt;
               }
             } else {
               const failCount = this._failedAttempts.get(id) || 0;
@@ -1298,20 +1467,18 @@
                 this._pendingGetQueue.length +
                 this._inFlightGets.size +
                 this._acceptingIds.size;
-              if (
-                !this._inFlightGets.has(id) &&
-                !this._acceptingIds.has(id) &&
-                !this._pendingGetQueue.includes(id) &&
-                totalOutstanding < MAX_BATCH_IDS
-              ) {
+              if (totalOutstanding < MAX_BATCH_IDS) {
+                this._deferredOfferIds.delete(id);
                 this._pendingGetQueue.push(id);
+              } else if (!this._deferredOfferIds.has(id) && this._deferredOfferIds.size < MAX_BATCH_IDS) {
+                this._deferredOfferIds.add(id);
               }
             }
           }
 
           if (!this._isGenerationActive(gen, port)) return;
 
-          // Rule 5: Repeated acknowledgements
+          // Rule 5: Repeated acknowledgements (never gated on GET transfer capacity)
           if (alreadyAccepted.length > 0) {
             this.log('info', `Rule 5: Sending repeated ACK for already accepted ID(s)`, alreadyAccepted);
             if (!this._isGenerationActive(gen, port)) return;
@@ -1335,17 +1502,27 @@
       } finally {
         if (this._isGenerationActive(gen, port)) {
           this._processingOffers = false;
+          if (this._pendingOfferIds.size > 0 && !this._lookupTimer) {
+            const remNow = Date.now();
+            const remEarliest = this._lastLookupStartedAt > 0
+              ? (this._lastLookupStartedAt + this.lookupMinIntervalMs)
+              : 0;
+            const remAllowedAt = Math.max(this._nextLookupAllowedAt, remEarliest);
+            this._schedulePendingOfferDrain(Math.max(1, remAllowedAt - remNow), gen, port);
+          }
           this._notifySyncStatus();
         }
       }
     }
 
     /**
-     * Dispatches GET requests from _pendingGetQueue up to the configured maxConcurrency window.
+     * Dispatches GET requests from _pendingGetQueue up to the configured maxConcurrency window,
+     * first promoting any deferred unaccepted IDs if queue capacity has opened up.
      */
     _dispatchNextGets(gen = this._generation, port = this.port) {
       if (!this._isGenerationActive(gen, port)) return;
       this._pruneExpiredGets();
+      this._promoteDeferredOffers(gen, port);
 
       const activeReceives = this._inFlightGets.size + this._acceptingIds.size;
       const availableSlots = this.maxConcurrency - activeReceives;
@@ -1567,7 +1744,7 @@
         !validated
       ) {
         const fails = (this._failedAttempts.get(id) || 0) + 1;
-        this._failedAttempts.set(id, fails);
+        this._setBoundedMap(this._failedAttempts, id, fails);
         const err = new Error(`Rejected PUT for message ${id}: invalid JSON payload/attachments or exceeded size/count bounds`);
         this.log('error', err.message);
         this._emitError(err);
@@ -1631,18 +1808,32 @@
         }
 
         // Duplicate check: if already accepted, send ACK again and do not import twice
-        const lookupRes = await this.storage.getAcceptance([id]);
-        if (!this._isGenerationActive(gen, port)) {
+        let validatedLookup = null;
+        try {
+          const lookupRes = await this.storage.getAcceptance([id]);
+          if (!this._isGenerationActive(gen, port)) {
+            return;
+          }
+          validatedLookup = validateBatchAcceptance(lookupRes, [id]);
+          if (!validatedLookup) {
+            throw new Error(`Invalid or incomplete getAcceptance result for message ${id}`);
+          }
+        } catch (lookupErr) {
+          if (this._isGenerationActive(gen, port)) {
+            this._acceptingIds.delete(id);
+            this._recordLookupFailure([id], lookupErr, gen, port);
+          }
           return;
         }
-        const alreadyAcc = getBatchAcceptanceEntry(lookupRes, id);
-        if (!alreadyAcc.valid) {
-          throw new Error(`Invalid or missing getAcceptance result for message ${id}`);
-        }
+
+        this._lookupFailureCount = 0;
+        this._nextLookupAllowedAt = 0;
+        const alreadyAcc = validatedLookup[id];
         if (alreadyAcc.accepted) {
           this._failedAttempts.delete(id);
           this._timedOutGets.delete(id);
           this._expiredGets.delete(id);
+          this._deferredOfferIds.delete(id);
           this.log('info', `Message ${id} already accepted; sending ACK without re-importing`);
           if (!this._isGenerationActive(gen, port)) {
             return;
@@ -1680,6 +1871,7 @@
           this._failedAttempts.delete(id);
           this._timedOutGets.delete(id);
           this._expiredGets.delete(id);
+          this._deferredOfferIds.delete(id);
           this.log('info', `Successfully accepted message ${id}. Sending ACK.`);
           if (!this._isGenerationActive(gen, port)) {
             return;
@@ -1700,14 +1892,14 @@
           }
         } else {
           const fails = (this._failedAttempts.get(id) || 0) + 1;
-          this._failedAttempts.set(id, fails);
+          this._setBoundedMap(this._failedAttempts, id, fails);
           this.log('error', `Acceptance rejected by local storage for message ${id} (attempt ${fails}/${MAX_AUTO_RETRIES}); NO ACK sent`);
         }
       } catch (err) {
         if (this._isGenerationActive(gen, port)) {
           // Transfer failure or storage error: do not send ACK
           const fails = (this._failedAttempts.get(id) || 0) + 1;
-          this._failedAttempts.set(id, fails);
+          this._setBoundedMap(this._failedAttempts, id, fails);
           this.log('error', `Failed to accept message ${id} (attempt ${fails}/${MAX_AUTO_RETRIES}): ${err.message}; NO ACK sent`);
           this._emitError(err);
         }

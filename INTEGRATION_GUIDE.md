@@ -108,11 +108,10 @@ interface UmaiStorageAdapter {
   } | null>;
 
   // 3. Checks a batch of message IDs for durable past acceptance (Rule 5).
-  // Must return an explicit { accepted: boolean, ackReceipt?: string } entry for EVERY requested ID in `ids`.
-  getAcceptance(ids: string[]): Promise<
-    Record<string, { accepted: boolean; ackReceipt?: string }> |
-    Map<string, { accepted: boolean; ackReceipt?: string }>
-  >;
+  // Must return a plain ID-keyed object containing an explicit { accepted: boolean, ackReceipt?: string }
+  // own-property entry for EVERY requested ID in `ids`. If the call throws or ANY requested ID is missing
+  // or malformed, the entire batch fails validation (zero ACKs, zero GETs) and retries with capped backoff.
+  getAcceptance(ids: string[]): Promise<Record<string, { accepted: boolean; ackReceipt?: string }>>;
 
   // 4. Commits an incoming complete message and its File attachments (Rule 3 & 4).
   // Returns { accepted: boolean, ackReceipt?: string } (or a plain boolean for simple unsigned adapters).
@@ -445,8 +444,8 @@ CREATE TABLE umai_incoming_tray (
 ```
 
 When `POST /api/inbox/acceptance` is called by `getAcceptance(ids)`:
-1. Query matching rows in a single batch (`SELECT umai_message_id, ack_receipt FROM umai_incoming_tray WHERE umai_message_id = ANY($1)`).
-2. Populate an explicit entry for **every** requested `id` in `ids` (`{ "accepted": true, "ack_receipt": row.ack_receipt }` for hits, and `{ "accepted": false }` for any `id` not returned by the `SELECT` query) so `js/umai.js` receives an unambiguous status for every ID in the batch.
+1. Execute a single batch query scoped to the authenticated user/tenant/storage identity (e.g., `SELECT umai_message_id, ack_receipt FROM umai_incoming_tray WHERE tenant_id = $1 AND umai_message_id = ANY($2)`).
+2. **Only after a complete, successful database query in that correct identity scope**, populate an explicit plain-object entry for **every** requested `id` in `ids`: `{ "accepted": true, "ack_receipt": row.ack_receipt }` for returned rows, and `{ "accepted": false }` for requested IDs absent from the result set. A failed, timed-out, or truncated query MUST return an HTTP `5xx` error (never negative `{ "accepted": false }` entries) so `js/umai.js` backs off and retries safely once the database recovers.
 
 When `POST /api/inbox/accept` is called by `acceptMessage(msg)`:
 1. Begin an SQL transaction (`BEGIN`).

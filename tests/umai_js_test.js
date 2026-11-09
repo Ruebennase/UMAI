@@ -195,7 +195,7 @@ function makeBatchAcceptance(fn) {
 
   console.log('✓ Test 3: State-machine security (unsolicited PUT, unoffered GET, & unoffered ACK rejection) passed');
 
-  // Test 4: Poison-pill retry backoff (stops auto-GET after MAX_AUTO_RETRIES=3 failed acceptMessage attempts, resets on reconcile(true))
+  // Test 4: Poison-pill session retry cutoff (stops auto-GET after MAX_AUTO_RETRIES=3 failed acceptMessage attempts, resets on reconcile(true))
   let poisonAttempts = 0;
   const poisonChannel = createMockChannel();
   const senderPoison = new UmaiSession({
@@ -234,15 +234,15 @@ function makeBatchAcceptance(fn) {
     await senderPoison.reconcile(false);
     await new Promise(r => setTimeout(r, 30));
   }
-  assert.strictEqual(poisonAttempts, 3, 'Poison-pill message should back off after 3 failed automatic acceptance attempts');
+  assert.strictEqual(poisonAttempts, 3, 'Poison-pill message should hit session retry cutoff after 3 failed automatic acceptance attempts');
 
   // Manual reconcile(true) on receiver resets failure counter
   await receiverPoison.reconcile(true);
   await senderPoison.reconcile(false);
   await new Promise(r => setTimeout(r, 30));
-  assert.strictEqual(poisonAttempts, 4, 'Manual reconcile(true) should reset failure counter and allow retry');
+  assert.strictEqual(poisonAttempts, 4, 'Manual reconcile(true) should reset session retry cutoff and allow retry');
 
-  console.log('✓ Test 4: Poison-pill retry backoff and manual reconcile reset passed');
+  console.log('✓ Test 4: Poison-pill session retry cutoff and manual reconcile reset passed');
 
   // Test 5: Concurrent OFFER deduplication while acceptMessage is pending (F4),
   // accurate getSyncStatus().isSyncing during acceptMessage (F8), and READY reload / expired GET recovery (F3)
@@ -998,10 +998,11 @@ function makeBatchAcceptance(fn) {
   }
   console.log('✓ Test 8: Bounded ACK coalescing, strict JSON payload, >1,000 outbox progress, callback stop() isolation, and late-PUT timeout handling passed');
 
-  // Test 9: Batch getAcceptance(ids) Contract & Reviewer Section 6 Verification Suite:
-  //   9a) Large initial offer (250 IDs: 100 accepted with receipts, 150 unaccepted) uses 1 batch call, emits 1 ACK with receipts, and skips already-queued/transferring IDs on repeated OFFERs
-  //   9b) Missing, malformed, and failed lookup results produce no false ACKs or false GETs, and obey MAX_AUTO_RETRIES=3
-  //   9c) Concurrent acceptance by another session between OFFER lookup and PUT arrival is caught by pre-acceptMessage getAcceptance([id])
+  // Test 9: Batch getAcceptance(ids) Scheduling, Pacing, Outage Recovery, & Whole-Batch Validation Suite:
+  //   9a) Large initial offer (250 IDs), pre-lookup skip of queued/in-flight IDs, and lookupMinIntervalMs flood pacing
+  //   9b) Decisive Test 1: Full GET queue (1,000 items) does NOT block repeated ACKs for accepted IDs, and deferred overflow unaccepted IDs advance automatically once capacity opens
+  //   9c) Decisive Test 2: Temporary getAcceptance outage (> MAX_AUTO_RETRIES=3 failures, including thrown 503, Map, missing key, malformed entry) paces retries via backoff without false ACKs/GETs and recovers automatically
+  //   9d) Concurrent acceptance caught by pre-acceptMessage getAcceptance([id]) & bounded _failedAttempts map (<= 1,000)
   {
     const initial250 = Array.from({ length: 250 }, (_, i) => `msg-b250-${i + 1}`);
     const batchCalls = [];
@@ -1011,6 +1012,7 @@ function makeBatchAcceptance(fn) {
       peerOrigin: 'http://host.example',
       role: 'embedded',
       maxConcurrency: 2,
+      lookupMinIntervalMs: 50,
       storage: {
         getOutboxIds: async () => [],
         getMessage: async () => null,
@@ -1057,80 +1059,254 @@ function makeBatchAcceptance(fn) {
     assert.strictEqual(sentGets[0].ids.length, 2, 'Initial GET window must respect maxConcurrency=2');
     assert.strictEqual(rec9a._pendingGetQueue.length, 148, 'Remaining 148 unaccepted IDs must be queued in _pendingGetQueue');
 
-    // Now send a repeated OFFER for the exact 150 unaccepted IDs (2 in _inFlightGets, 148 in _pendingGetQueue)
+    // Repeated OFFER for the exact 150 unaccepted IDs (2 in _inFlightGets, 148 in _pendingGetQueue)
     await rec9a._handleOffer({
       protocol: PROTOCOL_NAME,
       version: PROTOCOL_VERSION,
       type: 'OFFER',
       ids: initial250.slice(100)
     });
-    assert.strictEqual(batchCalls.length, 1, 'Repeated OFFER for IDs already queued or in-flight must be skipped before getAcceptance() (0 new lookups)');
+    assert.strictEqual(batchCalls.length, 1, 'Repeated OFFER for IDs already queued or in-flight must be skipped before getAcceptance()');
+
+    // Sustained OFFER flood of already-accepted IDs must be paced by lookupMinIntervalMs=50
+    for (let f = 0; f < 15; f++) {
+      await rec9a._handleOffer({
+        protocol: PROTOCOL_NAME,
+        version: PROTOCOL_VERSION,
+        type: 'OFFER',
+        ids: [`msg-b250-${(f % 10) + 1}`]
+      });
+    }
+    assert.strictEqual(batchCalls.length, 1, 'Immediate OFFER flood within lookupMinIntervalMs must be coalesced and held until pacing interval elapses');
+    await new Promise(r => setTimeout(r, 70));
+    assert.strictEqual(batchCalls.length, 2, 'Coalesced OFFER flood must execute exactly 1 paced batch lookup after lookupMinIntervalMs');
+    assert.strictEqual(batchCalls[1].length, 10, 'Coalesced flood lookup must batch all 10 distinct offered IDs');
     rec9a.stop();
 
-    // --- 9b: Missing, malformed, and failed lookup results produce no false ACKs and no false GETs ---
-    let lookupAttempts = 0;
+    // --- 9b (Decisive Test 1): Full GET queue (1,000 items) does NOT prevent repeated ACKs, and deferred overflow unaccepted IDs advance automatically ---
     const chan9b = createMockChannel();
-    const rec9b = new UmaiSession({
-      peerOrigin: 'http://host.example',
-      role: 'embedded',
+    const acceptedIn9b = new Set(['msg-already-1', 'msg-already-2']);
+    const receiptsIn9b = { 'msg-already-1': 'sig-a1', 'msg-already-2': 'sig-a2' };
+
+    const sender9b = new UmaiSession({
+      peerOrigin: 'http://peer.example',
+      role: 'host',
       storage: {
-        getOutboxIds: async () => [],
-        getMessage: async () => null,
-        getAcceptance: async () => {
-          lookupAttempts++;
-          return {
-            // 'msg-missing' is omitted completely (simulating SQL WHERE IN missing-key bug)
-            'msg-malformed-bool': { accepted: 'yes' },
-            'msg-malformed-rec': { accepted: true, ackReceipt: 12345 },
-            'msg-valid-acc': { accepted: true, ackReceipt: 'sig-ok' },
-            'msg-valid-unacc': { accepted: false }
-          };
-        },
-        acceptMessage: async () => ({ accepted: true }),
+        getOutboxIds: async () => ['msg-fill-0', 'msg-overflow-1001', 'msg-overflow-1002'],
+        getMessage: async (id) => ({ id, payload: { item: id }, attachments: [] }),
+        getAcceptance: makeBatchAcceptance(() => ({ accepted: false })),
+        acceptMessage: async () => true,
         onAcknowledged: async () => {}
       }
     });
-    rec9b.port = chan9b.port1;
-    chan9b.port1.onmessage = rec9b._portListener;
-    rec9b.state = 'connected';
 
+    const rec9b = new UmaiSession({
+      peerOrigin: 'http://host.example',
+      role: 'embedded',
+      maxConcurrency: 1,
+      lookupMinIntervalMs: 0,
+      storage: {
+        getOutboxIds: async () => [],
+        getMessage: async () => null,
+        getAcceptance: async (ids) => {
+          const out = Object.create(null);
+          for (const id of ids) {
+            if (acceptedIn9b.has(id)) {
+              out[id] = { accepted: true, ackReceipt: receiptsIn9b[id] || '' };
+            } else {
+              out[id] = { accepted: false };
+            }
+          }
+          return out;
+        },
+        acceptMessage: async (msg) => {
+          acceptedIn9b.add(msg.id);
+          return { accepted: true, ackReceipt: `rec-${msg.id}` };
+        },
+        onAcknowledged: async () => {}
+      }
+    });
+
+    sender9b.port = chan9b.port1;
+    chan9b.port1.onmessage = sender9b._portListener;
+    sender9b.state = 'connected';
+    sender9b._offeredIds.add('msg-fill-0');
+    sender9b._offeredIds.add('msg-overflow-1001');
+    sender9b._offeredIds.add('msg-overflow-1002');
+
+    rec9b.port = chan9b.port2;
+    chan9b.port2.onmessage = rec9b._portListener;
+    rec9b.state = 'connected';
+    rec9b._peerOfferedOnce = true;
+
+    // Fill receiver's GET capacity completely to MAX_BATCH_IDS = 1,000 (1 in-flight + 999 queued = 1,000)
+    rec9b._inFlightGets.set('msg-fill-0', Date.now());
+    for (let q = 1; q < 1000; q++) {
+      rec9b._pendingGetQueue.push(`msg-fill-${q}`);
+    }
+    assert.strictEqual(
+      rec9b._inFlightGets.size + rec9b._pendingGetQueue.length,
+      1000,
+      'Receiver GET queue must be completely full (0 spare GET capacity)'
+    );
+
+    // Peer sends OFFER containing already-accepted IDs AND overflow unaccepted IDs (#1001, #1002)
     await rec9b._handleOffer({
       protocol: PROTOCOL_NAME,
       version: PROTOCOL_VERSION,
       type: 'OFFER',
-      ids: ['msg-missing', 'msg-malformed-bool', 'msg-malformed-rec', 'msg-valid-acc', 'msg-valid-unacc']
+      ids: ['msg-already-1', 'msg-already-2', 'msg-overflow-1001', 'msg-overflow-1002']
     });
 
-    const acks9b = chan9b.port1.sent.filter(m => m.type === 'ACK');
-    assert.strictEqual(acks9b.length, 1);
-    assert.deepStrictEqual(acks9b[0].ids, ['msg-valid-acc'], 'Only explicitly valid accepted entry may produce ACK');
-    const gets9b = chan9b.port1.sent.filter(m => m.type === 'GET');
-    assert.strictEqual(gets9b.length, 1);
-    assert.deepStrictEqual(gets9b[0].ids, ['msg-valid-unacc'], 'Missing or malformed entries must NOT trigger false GETs');
+    const immediateAcks9b = chan9b.port2.sent.filter(m => m.type === 'ACK');
+    assert.strictEqual(immediateAcks9b.length, 1, 'Full GET queue must NOT prevent immediate repeated ACK for already-accepted IDs');
+    assert.deepStrictEqual(immediateAcks9b[0].ids, ['msg-already-1', 'msg-already-2'], 'Repeated ACK must include all already-accepted IDs');
+    assert.strictEqual(immediateAcks9b[0].receipts['msg-already-1'], 'sig-a1', 'Repeated ACK must preserve stored receipt sig-a1');
+    assert.strictEqual(immediateAcks9b[0].receipts['msg-already-2'], 'sig-a2', 'Repeated ACK must preserve stored receipt sig-a2');
+    assert.strictEqual(rec9b._deferredOfferIds.size, 2, 'Unaccepted IDs exceeding MAX_BATCH_IDS GET capacity must be retained in _deferredOfferIds');
 
-    // Verify bounded retry backoff (MAX_AUTO_RETRIES=3) for missing/malformed entries
-    for (let i = 0; i < 5; i++) {
-      await rec9b._handleOffer({
+    // Clear the 999 synthetic filler queue items and complete the 1 active transfer ('msg-fill-0') WITHOUT sending any new OFFER
+    rec9b._pendingGetQueue = [];
+    await rec9b._handlePut({
+      protocol: PROTOCOL_NAME,
+      version: PROTOCOL_VERSION,
+      type: 'PUT',
+      id: 'msg-fill-0',
+      payload: { done: true },
+      attachments: []
+    });
+    await new Promise(r => setTimeout(r, 40));
+
+    assert.strictEqual(rec9b._deferredOfferIds.size, 0, 'Deferred unaccepted IDs must be automatically promoted once GET capacity frees up');
+    assert.strictEqual(acceptedIn9b.has('msg-overflow-1001'), true, 'Deferred overflow ID #1001 must advance and be accepted without a new OFFER');
+    assert.strictEqual(acceptedIn9b.has('msg-overflow-1002'), true, 'Deferred overflow ID #1002 must advance and be accepted without a new OFFER');
+    sender9b.stop();
+    rec9b.stop();
+
+    // --- 9c (Decisive Test 2): Temporary lookup outage (> MAX_AUTO_RETRIES=3 failures) + whole-batch validation + automatic recovery ---
+    let outageLookupCalls = 0;
+    const outageErrors = [];
+    const acceptedIn9c = new Set(['msg-outage-acc']);
+    const chan9c = createMockChannel();
+
+    const sender9c = new UmaiSession({
+      peerOrigin: 'http://peer.example',
+      role: 'host',
+      storage: {
+        getOutboxIds: async () => ['msg-outage-acc', 'msg-outage-new'],
+        getMessage: async (id) => ({ id, payload: { fresh: true }, attachments: [] }),
+        getAcceptance: makeBatchAcceptance(() => ({ accepted: false })),
+        acceptMessage: async () => true,
+        onAcknowledged: async () => {}
+      }
+    });
+
+    const rec9c = new UmaiSession({
+      peerOrigin: 'http://host.example',
+      role: 'embedded',
+      lookupMinIntervalMs: 15,
+      lookupRetryBaseMs: 20,
+      lookupRetryMaxMs: 50,
+      onError: (err) => outageErrors.push(err.message),
+      storage: {
+        getOutboxIds: async () => [],
+        getMessage: async () => null,
+        getAcceptance: async (ids) => {
+          outageLookupCalls++;
+          // Fail 4 consecutive times (> MAX_AUTO_RETRIES=3) across thrown error, Map, missing key, and malformed entry!
+          if (outageLookupCalls === 1) {
+            throw new Error('HTTP 503 Service Unavailable');
+          }
+          if (outageLookupCalls === 2) {
+            // Map must be rejected (plain object only contract)
+            const m = new Map();
+            for (const id of ids) m.set(id, { accepted: true });
+            return m;
+          }
+          if (outageLookupCalls === 3) {
+            // Sparse response missing 'msg-outage-new': whole batch must fail (even valid 'msg-outage-acc' must NOT emit ACK!)
+            return {
+              'msg-outage-acc': { accepted: true, ackReceipt: 'rec-outage' }
+            };
+          }
+          if (outageLookupCalls === 4) {
+            // Malformed non-boolean entry: whole batch must fail
+            return {
+              'msg-outage-acc': { accepted: 'yes' },
+              'msg-outage-new': { accepted: false }
+            };
+          }
+          // Attempt 5+: backend heals completely!
+          const out = Object.create(null);
+          for (const id of ids) {
+            if (acceptedIn9c.has(id)) {
+              out[id] = { accepted: true, ackReceipt: id === 'msg-outage-acc' ? 'rec-outage' : `rec-${id}` };
+            } else {
+              out[id] = { accepted: false };
+            }
+          }
+          return out;
+        },
+        acceptMessage: async (msg) => {
+          acceptedIn9c.add(msg.id);
+          return { accepted: true, ackReceipt: `rec-${msg.id}` };
+        },
+        onAcknowledged: async () => {}
+      }
+    });
+
+    sender9c.port = chan9c.port1;
+    chan9c.port1.onmessage = sender9c._portListener;
+    sender9c.state = 'connected';
+    sender9c._offeredIds.add('msg-outage-acc');
+    sender9c._offeredIds.add('msg-outage-new');
+
+    rec9c.port = chan9c.port2;
+    chan9c.port2.onmessage = rec9c._portListener;
+    rec9c.state = 'connected';
+    rec9c._peerOfferedOnce = true;
+
+    // Trigger initial OFFER (Attempt 1 fails with HTTP 503) + flood 20 duplicate OFFERs during backoff window
+    for (let k = 0; k < 20; k++) {
+      await rec9c._handleOffer({
         protocol: PROTOCOL_NAME,
         version: PROTOCOL_VERSION,
         type: 'OFFER',
-        ids: ['msg-missing']
+        ids: ['msg-outage-acc', 'msg-outage-new']
       });
     }
-    assert.strictEqual(lookupAttempts, 3, 'Missing/malformed getAcceptance entry must back off after MAX_AUTO_RETRIES=3');
-    rec9b.stop();
+    assert.strictEqual(outageLookupCalls, 1, '20 flooded OFFERs during lookup backoff must NOT cause immediate retry amplification');
+    assert.strictEqual(chan9c.port2.sent.filter(m => m.type === 'ACK').length, 0, 'Outage must produce zero false ACKs');
+    assert.strictEqual(chan9c.port2.sent.filter(m => m.type === 'GET').length, 0, 'Outage must produce zero premature GETs');
 
-    // --- 9c: Concurrent acceptance by another session between OFFER lookup and PUT arrival ---
+    // Wait for automatic capped exponential backoff attempts 2 (20ms), 3 (40ms), 4 (50ms), and 5 (50ms) to complete
+    await new Promise(r => setTimeout(r, 250));
+
+    assert.strictEqual(outageErrors.length, 4, 'All 4 failed/malformed lookup batches must report errors via onError');
+    assert.strictEqual(rec9c._failedAttempts.size, 0, 'Lookup outages must NOT increment per-message _failedAttempts cutoff');
+    assert.strictEqual(outageLookupCalls, 6, 'Expected 4 failed batch lookups + 1 recovered batch lookup + 1 pre-acceptMessage [id] lookup (no flood)');
+
+    const recoveredAcks = chan9c.port2.sent.filter(m => m.type === 'ACK');
+    const ackedIds9c = recoveredAcks.flatMap(a => a.ids);
+    assert.strictEqual(ackedIds9c.includes('msg-outage-acc'), true, 'Already-accepted message must be ACKed automatically after outage recovery');
+    assert.strictEqual(ackedIds9c.includes('msg-outage-new'), true, 'Unaccepted message must be fetched, accepted, and ACKed automatically after >3 lookup failures');
+    const outageAccFrame = recoveredAcks.find(a => a.ids.includes('msg-outage-acc'));
+    assert.strictEqual(outageAccFrame.receipts['msg-outage-acc'], 'rec-outage', 'Recovered ACK must preserve stored receipt');
+    assert.strictEqual(acceptedIn9c.has('msg-outage-new'), true, 'msg-outage-new must be committed in storage after outage recovery');
+    assert.strictEqual(rec9c.getSyncStatus().isSyncing, false, 'Session must return to clean in-sync state after automatic recovery');
+    sender9c.stop();
+    rec9c.stop();
+
+    // --- 9d: Concurrent acceptance by another session on PUT + bounded _failedAttempts map (<= 1,000) ---
     let acceptMessageCalledOnDup = false;
-    const chan9c = createMockChannel();
-    const rec9c = new UmaiSession({
+    const chan9d = createMockChannel();
+    const rec9d = new UmaiSession({
       peerOrigin: 'http://host.example',
       role: 'embedded',
       storage: {
         getOutboxIds: async () => [],
         getMessage: async () => null,
         getAcceptance: async (ids) => {
-          // By the time PUT arrives and checks getAcceptance([id]), another session has accepted it!
           const out = {};
           for (const id of ids) {
             out[id] = { accepted: true, ackReceipt: 'concurrent-session-receipt' };
@@ -1144,11 +1320,11 @@ function makeBatchAcceptance(fn) {
         onAcknowledged: async () => {}
       }
     });
-    rec9c.port = chan9c.port1;
-    chan9c.port1.onmessage = rec9c._portListener;
-    rec9c.state = 'connected';
-    rec9c._inFlightGets.set('msg-concurrent-tab', Date.now());
-    await rec9c._handlePut({
+    rec9d.port = chan9d.port1;
+    chan9d.port1.onmessage = rec9d._portListener;
+    rec9d.state = 'connected';
+    rec9d._inFlightGets.set('msg-concurrent-tab', Date.now());
+    await rec9d._handlePut({
       protocol: PROTOCOL_NAME,
       version: PROTOCOL_VERSION,
       type: 'PUT',
@@ -1158,12 +1334,20 @@ function makeBatchAcceptance(fn) {
     });
     await new Promise(r => setTimeout(r, 20));
     assert.strictEqual(acceptMessageCalledOnDup, false, 'Concurrent acceptance detected by getAcceptance([id]) must skip acceptMessage');
-    const acks9c = chan9c.port1.sent.filter(m => m.type === 'ACK');
-    assert.strictEqual(acks9c.length, 1);
-    assert.strictEqual(acks9c[0].receipts['msg-concurrent-tab'], 'concurrent-session-receipt', 'Duplicate PUT check must forward stored ackReceipt');
-    rec9c.stop();
+    const acks9d = chan9d.port1.sent.filter(m => m.type === 'ACK');
+    assert.strictEqual(acks9d.length, 1);
+    assert.strictEqual(acks9d[0].receipts['msg-concurrent-tab'], 'concurrent-session-receipt', 'Duplicate PUT check must forward stored ackReceipt');
+
+    // Verify _setBoundedMap caps _failedAttempts to MAX_BATCH_IDS = 1,000 with FIFO eviction
+    for (let m = 0; m < 1050; m++) {
+      rec9d._setBoundedMap(rec9d._failedAttempts, `msg-fail-${m}`, 3);
+    }
+    assert.strictEqual(rec9d._failedAttempts.size, 1000, '_failedAttempts must remain strictly bounded to MAX_BATCH_IDS (1,000)');
+    assert.strictEqual(rec9d._failedAttempts.has('msg-fail-0'), false, 'Oldest entries must be evicted once _failedAttempts exceeds 1,000');
+    assert.strictEqual(rec9d._failedAttempts.has('msg-fail-1049'), true, 'Newest entries must be retained in _failedAttempts');
+    rec9d.stop();
   }
-  console.log('✓ Test 9: Batch getAcceptance(ids) contract, pre-lookup skip, malformed-entry safety, and concurrent session dedup passed');
+  console.log('✓ Test 9: Batch getAcceptance(ids) full-queue ACK independence, outage backoff recovery, whole-batch validation, and bounded maps passed');
 
   senderPoison.stop();
   receiverPoison.stop();
