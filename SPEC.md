@@ -60,12 +60,12 @@ A `PUT` operation transmits one complete logical message including all associate
 - If a transfer is interrupted before complete acceptance, the receiver discards all staged data. The next reconciliation will request the message again from scratch.
 
 #### Rule 4 — Receiver Acknowledgement
-The receiver issues an `ACK` only AFTER the message and all attachments have been completely stored and the Message ID has been committed to the durable Accepted Set. An error or failure prior to acceptance MUST NEVER result in an `ACK`.
+The receiver issues an `ACK` only AFTER the message and all attachments have been completely stored and the Message ID has been committed to the durable Accepted Set. An error or failure prior to acceptance MUST NEVER result in an `ACK`. In the browser binding, `js/umai.js` enforces protocol ordering and relies on the application's storage adapter fulfilling this durability contract before reporting acceptance; returning `false` (or `{ accepted: false }`) from `acceptMessage` enters failure and retry handling and MUST NOT be used as a session-only or non-durable acceptance mode. Storage implementations MUST also handle concurrent or repeated `acceptMessage` calls for the same Message ID atomically without duplicating imports or overwriting accepted state, returning the original acceptance receipt when an already-accepted message is presented again.
 
 #### Rule 5 — Repeated Acknowledgements (Crucial Invariant)
-Whenever a sender offers a Message ID that the receiver has already accepted in the past, the receiver MUST immediately send `ACK` again for that ID.
-The receiver MUST NOT send `GET` or accept `PUT` for an already-accepted message.
-*Rationale:* Network disruptions or browser closures may cause an initial `ACK` to be lost. Repeated acknowledgements allow the sender to safely clean up its outbox without risking duplicate imports.
+Whenever a sender offers a Message ID that the receiver has already accepted in the past, the receiver MUST immediately send `ACK` again for that ID (including its original `ack_receipt` when receipts are used).
+The receiver MUST NOT send `GET` or re-import `PUT` for an already-accepted message.
+*Rationale:* Network disruptions or browser closures may cause an initial `ACK` to be lost. Repeated acknowledgements allow the sender to safely clean up its outbox without risking duplicate imports, even if the receiver has already archived or deleted the message content from its inbox after processing.
 
 #### Rule 6 — Sender Cleanup & Non-Reuse of Acknowledged IDs
 Upon receiving an `ACK` for a Message ID, the sender MAY remove that message and its attachment snapshots from its outbox. Senders may choose to retain messages longer for auditing purposes. Once a Message ID has been acknowledged and removed from the outbox, the sender MUST NEVER reuse that Message ID for any future message (Rule 1).
@@ -76,18 +76,20 @@ When communication between peers is established or restored, both peers exchange
 #### Rule 8 — User Mediation & Bounded Execution
 Transfers occur exclusively while an active browser session connects both applications. Closing the browser tab pauses the transport immediately. Subsequent sessions resume reconciliation naturally via Rule 7.
 
-### 3.3 Separation of Technical Acceptance (`ACK`) from Business Classification & Legal Delivery
+### 3.3 Separation of Technical Acceptance (`ACK`) from Business Processing, Content Retention & Legal Delivery
 
-UMAI strictly separates **transport-level technical acceptance** from **application-specific business processing**:
+UMAI strictly separates **transport-level technical acceptance** from **application-specific business processing** and **content lifecycle**:
 
 1. **Durable Technical Acceptance (`ACK`):**
-   - Issuing an `ACK` (Rule 4) signifies solely that the receiving application has verified the technical integrity of the message (complete payload and attachments, plus optional cryptographic signature verification) and durably persisted it into an incoming staging store or **"Unassigned Incoming Tray"** alongside its Message ID in the Accepted Set.
+   - Issuing an `ACK` (Rule 4) confirms complete, durable technical acceptance of the logical message (complete payload and attachments, plus optional cryptographic signature verification) and authorizes the sender to remove its outgoing copy (Rule 6).
+   - `ACK` does **not** imply business approval, completed downstream processing, completion of a transformation or background job, or indefinite retention of message content.
+   - A receiver MAY refuse a message prior to acceptance (producing no `ACK`), or durably accept it into an incoming staging store or **"Unassigned Incoming Tray"** and subsequently archive or deliberately discard the message content—provided its durable acceptance record remains intact for Rule 5 reconciliation.
 2. **Deferred Business Classification:**
    - UMAI does **not** decide which business case, dossier, workflow, or category an incoming message belongs to, nor whether a user must supply additional business metadata.
-   - Receiving applications SHOULD accept valid incoming messages into a durable incoming tray first (returning `ACK` immediately so the sender can clean up its outbox) and allow the user or downstream application logic to classify, route, or reject the business record asynchronously afterward.
+   - Receiving applications SHOULD accept valid incoming messages into a durable incoming tray first (returning `ACK` immediately so the sender can clean up its outbox) and allow the user or downstream application logic to classify, route, or discard the business record afterward.
    - Rejecting `acceptMessage()` due to missing interactive business context or downstream domain rules MUST be avoided, as it causes the transport layer to treat the transfer as a technical failure.
 3. **Distinction from Legal or Statutory Delivery Receipts:**
-   - A UMAI `ACK` (and its optional cryptographic `ack_receipt`) is a **technical transport confirmation** proving that the receiving system's storage layer accepted the bytes. It MUST NOT be conflated with a legally effective submission confirmation or statutory delivery receipt unless the application layer explicitly exchanges a separate, domain-level receipt message for that purpose.
+   - A UMAI `ACK` (and its optional cryptographic `ack_receipt`) is a **technical transport confirmation** proving that the receiving system's storage layer accepted the logical message. It MUST NOT be conflated with a legally effective submission confirmation or statutory delivery receipt unless the application layer explicitly exchanges a separate, domain-level receipt message for that purpose.
 
 ---
 
@@ -200,9 +202,11 @@ UMAI does not prescribe internal application schemas or databases, but imposes t
 
 1. **Snapshotting:** Before an outgoing message is offered, any selected documents must be snapshotted into an immutable message directory. Subsequent changes or deletions to local working files must not modify the offered attachment data.
 2. **Crash-Resistant Acceptance:** When accepting a `PUT` message, the receiver must stage incoming files and metadata in a temporary workspace, verify completion and integrity, and atomically commit the files before adding the ID to the durable Accepted Set.
-3. **Accepted ID Durability & Storage Scaling:** The Accepted Set must survive application restarts and browser closures so Rule 5 repeated acknowledgements remain reliable across sessions.
-   - **Compact Storage Footprint:** Because an Accepted Set entry stores only the `umai_message_id` (`<= 128` bytes), creation timestamp, and optional `ack_receipt` (`~128` hex bytes)—not the document attachments themselves—each entry occupies roughly `150–250 bytes`. Even 1,000,000 accepted messages require only `~150–250 MB` in a standard indexed database table (`PRIMARY KEY (umai_message_id)`), providing `O(1)` / `O(log N)` lookups.
-   - **Optional Multi-Year Retention Horizon:** If a deployment wishes to prune Accepted Set entries after a long retention window (e.g., `1–2 years`), both peers SHOULD enforce a shorter maximum outbox lifetime (e.g., unacknowledged outbox messages expire after `90 days`), and the receiver SHOULD verify payload/signature equality if an existing record with the same ID still resides in its long-term archive.
+3. **Accepted ID Durability, Backup Restoration & Retention Semantics:** The Accepted Set MUST survive application restarts and browser closures, and MUST be retained independently of inbox message content so deleting or archiving a processed message never makes its Message ID unaccepted again.
+   - **Compact Storage Footprint:** An Accepted Set entry needs only the `umai_message_id` (`<= 128` bytes) and optional `ack_receipt` (`~128` hex bytes), plus an optional receiver-recorded UTC acceptance timestamp if the implementation tracks retention age (`pkg/umaiserver` currently persists `id -> ack_receipt` in `accepted.json` without timestamps and enforces no automatic expiry). Even 1,000,000 accepted entries occupy only `~150–250 MB` in an indexed table (`PRIMARY KEY (umai_message_id)`).
+   - **Protection Across Sender Backup Restoration:** Retaining acceptance records independently of inbox content ensures that if a sender restores an older backup containing previously acknowledged outgoing messages (preserving their original Message IDs), the receiver recognizes those IDs on `OFFER`, repeats `ACK`s, and allows the sender to remove the restored copies without re-importing them. This protection holds only while the receiver retains the acceptance records; restoring an older receiver backup that lacks recent acceptance records is a separate operational limitation requiring application-level idempotency where duplicate business effects matter.
+   - **Indefinite Default vs. Optional Bounded Retention:** Implementations SHOULD retain acceptance records indefinitely by default and MUST NOT infer transfer completion from the absence of recent `OFFER`s. If an implementation explicitly adds finite acceptance-record retention, it MUST treat that window as a **bounded transport deduplication guarantee** rather than absolute permanent deduplication: measure age strictly from receiver-recorded UTC acceptance time (never from a sender-supplied creation timestamp or a timestamp embedded in the Message ID), coordinate it with a shorter maximum sender outbox retry lifetime while accounting for clock skew/adjustments, in-progress transfers, and backup restoration, and document that repeats arriving after record expiry may be accepted again. Note that expiring an unacknowledged outgoing message on the sender **abandons delivery** (it is not successful delivery), and sender-side outbox expiry does not prevent malicious replay (which would require a separate freshness mechanism).
+   - **Time Representation:** Persisted or exchanged lifecycle timestamps SHOULD be recorded in UTC (or unambiguous epoch / timezone-aware formats, avoiding naive local-time strings) for consistency across systems; UTC eliminates timezone ambiguity, while clock drift and clock adjustments must still be considered separately in any elapsed-time logic.
 
 ---
 

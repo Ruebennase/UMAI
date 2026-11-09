@@ -62,7 +62,7 @@ In a typical hub-and-spoke ecosystem (demonstrated by our [Minimal Production Vi
 - **Application A (Messaging Platform):** Implements UMAI once by providing a lightweight, self-contained embedded sync endpoint (`/sync.html`) that handles its own session management and Federated IdP login bootstrap.
 - **Application B (Specialty Application):** The user works primarily inside Application B, which embeds Application A's `/sync.html` frame (or opens it as a companion window) and implements the tiny 5-method storage adapter against its existing database.
 - **Strict Separation of Concerns:** Application B remains completely unaware of Application A's authentication internals (OIDC, SAML, MFA, government eID), and UMAI's technical delivery (`ACK`) simply places verified incoming items into Application B's durable **Incoming Tray** so the user can classify or assign them to a business case afterward.
-- **Low Integration Cost:** Because the protocol engine (`js/umai.js`) is used verbatim and existing database tables can back the 5-method adapter directly, a typical specialty application can integrate UMAI in **a matter of days rather than weeks or months** (see the detailed engineering breakdown in [`INTEGRATION_GUIDE.md`](INTEGRATION_GUIDE.md#8-integration-economics--effort-estimate)).
+- **Low Integration Cost:** Because the protocol engine (`js/umai.js`) is used verbatim and existing database tables can back the 5-method adapter directly, a typical specialty application can integrate UMAI in **a matter of days rather than weeks or months** (see the detailed engineering breakdown in [`INTEGRATION_GUIDE.md`](INTEGRATION_GUIDE.md#9-integration-economics--effort-estimate)).
 
 ### When UMAI Is (and Isn't) the Right Fit
 
@@ -74,7 +74,7 @@ Because UMAI relies on an active browser session to ferry messages between appli
   - **Standard Document & Record Bundles:** Structured JSON payloads accompanied by typical business attachments (e.g., PDFs, XML/JSON records, spreadsheets, and images up to tens of megabytes per message).
 - **When to Use Conventional Server-to-Server APIs Instead:**
   - **Unattended 24/7 Real-Time Alerting or Sub-Second SLAs:** Because **no messages move while no authorized browser session bridges the two applications**, workflows that require guaranteed middle-of-the-night delivery or sub-second machine-to-machine RPC without a human online must use direct server-to-server webhooks or message queues.
-  - **High-Throughput Bulk Database Migrations or Multi-Gigabyte Media Streams:** Because `js/umai.js` serializes `PUT` transfers one at a time in browser memory, multi-terabyte backfills or continuous high-frequency telemetry streams belong on dedicated backend pipelines.
+  - **High-Throughput Bulk Database Migrations or Multi-Gigabyte Media Streams:** Because `js/umai.js` transfers complete messages in browser memory (`50 MiB` default message bound, `maxConcurrency = 1` by default), multi-terabyte backfills or continuous high-frequency telemetry streams belong on dedicated backend pipelines, and rare oversized files should use the small notification + manual authenticated pickup pattern documented in [`INTEGRATION_GUIDE.md`](INTEGRATION_GUIDE.md#7-handling-oversized-documents-small-notification--manual-authenticated-pickup).
 
 ### Conceptual Lineage: Browsers as Zero-Install Store-Carry-Forward Couriers
 
@@ -336,7 +336,7 @@ UMAI clearly separates **what the browser protocol enforces directly** from **se
 ### Demonstrated as Server-Side Best Practices (`pkg/umaiserver`)
 3. **End-to-End Signed Messages & Signed `ACK` Receipts (`crypto/ed25519`):**
    - UMAI's `PUT` and `ACK` wire schemas provide optional opaque fields (`signature` on `PUT`, and `receipts` on `ACK`) so implementers can verify authenticity server-to-server without browser cryptography.
-   - Our reference server (`pkg/umaiserver`) demonstrates this best practice out of the box: the sending server signs the sender role, message ID, canonical JSON payload hash, and attachment SHA-256 digests (`UMAI-PUT-V1`). The receiving server verifies this signature before atomic commit and returns a signed receipt (`UMAI-ACK-V1`), which the sending server verifies before deleting its outbox copy.
+   - Our reference server (`pkg/umaiserver`) demonstrates this best practice out of the box: the sending server signs the sender role, intended receiver role, message ID, canonical JSON payload hash, and attachment SHA-256 digests (`UMAI-PUT-V1`). The receiving server verifies this signature before atomic commit and returns a signed receipt (`UMAI-ACK-V1`), which the sending server verifies before deleting its outbox copy.
 4. **Same-Origin CSRF & Endpoint Hardening:**
    - `pkg/umaiserver` demonstrates standard web hardening: same-origin `Origin` header checks on state-changing routes, strict `Content-Type: application/json` enforcement, and keeping pending message IDs restricted to authenticated sessions.
 5. **Optional Asymmetric Encryption ("Blind Courier" Mode):**
@@ -372,8 +372,8 @@ For deployment over the public internet with TLS termination on two separate dom
 ## 11. Known Limitations
 
 - **Experimental Reference Status:** UMAI 0.1 is an experimental protocol and reference implementation.
-- **Third-Party Cookies in Cross-Origin Frames:** Certain strict browser privacy configurations block third-party cookies in iframes. Application A provides a top-level fallback login button for these environments.
-- **Single-PUT Concurrency:** To protect browser memory, transfers are serialized one at a time.
+- **Third-Party Cookies in Cross-Origin Frames:** Certain strict browser privacy configurations block third-party cookies in iframes (or external IdPs forbid framing). Applications can switch seamlessly to First-Party Companion Window Mode (`window.open` + `setPeerWindow`) in these environments.
+- **Complete-Message In-Memory Transfers:** To bound browser memory, transfers default to `maxConcurrency = 1` (configurable `1..16`) with a `50 MiB` default message bound in `js/umai.js`; oversized files should use the small notification + manual pickup pattern.
 - **No Partial File Resumption:** Interrupted transfers are restarted from the beginning.
 
 ---

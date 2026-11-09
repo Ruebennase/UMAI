@@ -52,31 +52,35 @@ The browser acts as a secure, sandboxed mediator:
 
 ## 2. Architecture: Separation of Concerns
 
-UMAI is strictly disentangled into three distinct layers:
+UMAI keeps four responsibilities strictly distinct:
 
 ```mermaid
 graph TD
-    subgraph Layer 1: Application UI & Logic
-        A1[Your Application Web Pages]
-        A2[User Actions: Upload, View, Approve]
+    subgraph Layer 1: Application Frontend
+        A1[User Experience & Content Interpretation]
+        A2[Admission Policy & Manual-Transfer Alternatives]
     end
 
-    subgraph Layer 2: UMAI Storage Adapter
-        B1[getOutboxIds]
-        B2[getMessage]
-        B3[getAcceptance]
-        B4[acceptMessage]
-        B5[onAcknowledged]
+    subgraph Layer 2: Storage / Spool Implementation
+        B1[getOutboxIds / Immutable Publication]
+        B2[getMessage / Complete Retrieval]
+        B3[getAcceptance / Duplicate Recognition]
+        B4[acceptMessage / Durable Atomic Commit]
+        B5[onAcknowledged / Verified Outbox Cleanup]
     end
 
-    subgraph Layer 3: UMAI Protocol Engine
+    subgraph Layer 3: Protocol & umai.js
         C1[umai.js / UmaiSession]
-        C2[OFFER / GET / PUT / ACK State Machine]
-        C3[MessageChannel & File Transport]
+        C2[Origin-Pinned MessagePort & Bounded Queues]
+        C3[OFFER / GET / PUT / ACK Reconciliation]
+    end
+
+    subgraph Layer 4: Downstream Business Processing
+        D1[Domain Validation, Case Assignment & Classification]
     end
 
     A1 --> B1
-    A2 --> B4
+    B4 --> D1
     B1 --> C1
     B2 --> C1
     B3 --> C1
@@ -84,22 +88,25 @@ graph TD
     B5 --> C1
 ```
 
-- **Layer 3 (`js/umai.js`):** Pure, standalone protocol engine. Has **zero** DOM knowledge, zero styling, zero framework dependencies, and no knowledge of your server technology.
-- **Layer 2 (The Storage Adapter):** A small 5-method JavaScript object that tells UMAI how your application reads and writes messages.
-- **Layer 1 (Application UI):** Your existing user interface (PHP, Java, ASP.NET, Rails, React, Vue, or static HTML).
+1. **Protocol and `js/umai.js`:** Connection security, bounded protocol processing, reconciliation, transfer coordination, and technical acceptance signaling. Has **zero** DOM knowledge, zero styling, zero framework dependencies, and no knowledge of your server technology.
+2. **Application Frontend:** User experience, content interpretation, application-specific admission policy, business workflow, and manual-transfer alternatives (such as oversized-document pickup).
+3. **Storage / Spool Implementation (via the 5-Method Adapter):** Independent authorization and technical validation, immutable publication, durable acceptance, integrity verification, and duplicate recognition.
+4. **Business Processing (Outside UMAI):** Domain validation, importing into business cases, classification, and subsequent actions—all occurring *after* technical acceptance.
 
 ---
 
 ## 3. The 5-Method Storage Contract
 
-To integrate an application with UMAI, you only need to provide a JavaScript object implementing five methods:
+To integrate an application with UMAI, you provide a JavaScript object implementing five asynchronous methods:
 
 ```typescript
 interface UmaiStorageAdapter {
   // 1. Returns a list of pending message IDs waiting in the local outbox
   getOutboxIds(): Promise<string[]>;
 
-  // 2. Returns the complete message payload, native File objects, and optional server signature
+  // 2. Returns the complete message payload, native File objects, and optional server signature (Rule 3).
+  // Retrieval is all-or-nothing: return null ONLY when the message no longer exists in the outbox;
+  // if metadata or ANY attachment fails to load completely, throw an error rather than returning fewer files.
   getMessage(id: string): Promise<{
     id: string;
     payload: any;
@@ -113,8 +120,12 @@ interface UmaiStorageAdapter {
   // or malformed, the entire batch fails validation (zero ACKs, zero GETs) and retries with capped backoff.
   getAcceptance(ids: string[]): Promise<Record<string, { accepted: boolean; ackReceipt?: string }>>;
 
-  // 4. Commits an incoming complete message and its File attachments (Rule 3 & 4).
-  // Returns { accepted: boolean, ackReceipt?: string } (or a plain boolean for simple unsigned adapters).
+  // 4. Atomically commits an incoming complete message, its File attachments, and its durable Accepted Set
+  // record (Rules 3 & 4). `umai.js` relies on the adapter fulfilling this durability contract before returning
+  // `{ accepted: true, ackReceipt }` (or `true`). Must also handle concurrent or repeated calls for an
+  // already-accepted ID idempotently without duplicate import, returning its original `ackReceipt`.
+  // Returning `false` / `{ accepted: false }` signals failure and triggers retry/cutoff—never use it as a
+  // session-only or non-durable receipt mode.
   acceptMessage(msg: {
     id: string;
     payload: any;
@@ -156,23 +167,36 @@ In Application A's web page (preferably placing the initialization script in an 
 
 ```javascript
 // /js/app-a-umai.js
-  // 1. Implement the 5 storage methods connecting to your existing backend.
-  //    (Supports both signed/receipt-verified servers like pkg/umaiserver and minimal unsigned endpoints.)
+  // 1. Implement the 5 storage methods connecting to your own backend routes.
+  //    Note: The paths below (/custom-api/...) illustrate a custom application backend;
+  //    see Pattern 4 below for the exact HTTP endpoints exposed by `pkg/umaiserver`.
   const storage = {
     async getOutboxIds() {
-      const res = await fetch('/api/outbox/ids');
+      const res = await fetch('/custom-api/outbox/ids');
+      if (!res.ok) throw new Error(`Outbox listing failed (${res.status})`);
       return await res.json(); // e.g. ["inv-2026-001"]
     },
 
     async getMessage(id) {
-      const meta = await (await fetch(`/api/outbox/${id}`)).json();
-      
-      // Fetch attachments as native File objects
+      const metaRes = await fetch(`/custom-api/outbox/${encodeURIComponent(id)}`);
+      if (metaRes.status === 404) return null;
+      if (!metaRes.ok) throw new Error(`Outbox metadata fetch failed (${metaRes.status})`);
+      const meta = await metaRes.json();
+
+      // Fetch all attachments completely (Rule 3: fail the whole message if any file fetch fails)
       const files = [];
-      for (const att of meta.attachments) {
-        const fileRes = await fetch(`/api/outbox/${id}/files/${att.filename}`);
+      for (const att of meta.attachments || []) {
+        const fileRes = await fetch(
+          `/custom-api/outbox/${encodeURIComponent(id)}/files/${encodeURIComponent(att.filename)}`
+        );
+        if (!fileRes.ok) {
+          throw new Error(`Attachment fetch failed for ${att.filename} (${fileRes.status})`);
+        }
         const blob = await fileRes.blob();
-        files.push(new File([blob], att.filename, { type: blob.type }));
+        if (typeof att.size === 'number' && blob.size !== att.size) {
+          throw new Error(`Attachment size mismatch for ${att.filename}`);
+        }
+        files.push(new File([blob], att.filename));
       }
 
       return {
@@ -184,7 +208,7 @@ In Application A's web page (preferably placing the initialization script in an 
     },
 
     async getAcceptance(ids) {
-      const res = await fetch('/api/inbox/acceptance', {
+      const res = await fetch('/custom-api/inbox/acceptance', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ ids })
@@ -193,14 +217,15 @@ In Application A's web page (preferably placing the initialization script in an 
         throw new Error(`Acceptance lookup failed (${res.status})`);
       }
       const data = await res.json();
-      // Returns { [id]: { accepted: boolean, ack_receipt?: string } } for every requested ID
+      // Returns { [id]: { accepted: boolean, ackReceipt?: string } } for every requested ID
       return data.results;
     },
 
     async acceptMessage(msg) {
       const formData = new FormData();
       formData.append('id', msg.id);
-      formData.append('payload', JSON.stringify(msg.payload));
+      const safePayload = (msg.payload !== undefined && msg.payload !== null) ? msg.payload : {};
+      formData.append('payload', JSON.stringify(safePayload));
       if (msg.signature) {
         formData.append('signature', msg.signature);
       }
@@ -208,17 +233,17 @@ In Application A's web page (preferably placing the initialization script in an 
         formData.append('files', file, file.name);
       }
 
-      const res = await fetch('/api/inbox/accept', { method: 'POST', body: formData });
+      const res = await fetch('/custom-api/inbox/accept', { method: 'POST', body: formData });
       if (!res.ok) return { accepted: false };
-      const data = await res.json().catch(() => ({}));
+      const data = await res.json();
       return {
-        accepted: true,
+        accepted: Boolean(data.accepted),
         ackReceipt: data.ack_receipt || ''
       };
     },
 
     async onAcknowledged(ids, receipts) {
-      const res = await fetch('/api/outbox/acknowledge', {
+      const res = await fetch('/custom-api/outbox/acknowledge', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ ids, receipts })
@@ -302,23 +327,23 @@ Below are six common patterns showing how different applications can implement t
 
 ---
 
-### Pattern 1: DOM & HTML Form Hooking (Zero Backend Changes!)
+### Pattern 1: Legacy HTML Form & Existing Backend Submission
 
-In many legacy systems, modifying server-side code or deploying new web APIs requires months of bureaucracy. With UMAI, you don't have to touch the backend at all: you can bridge data **directly through the existing HTML DOM and forms**.
-
-#### Outbox: Reading from Existing Page Elements
-The user is viewing an invoice or record already rendered on screen. The adapter simply extracts the data from the DOM and grabs the user-selected file:
+In many legacy systems, adding brand-new server-to-server APIs is impractical, while the application already has server-rendered HTML pages and form submission handlers. You can read immutable outgoing snapshots from rendered page state and submit incoming messages through an existing server form handler—**provided `ACK` is only emitted after durable server-side persistence**:
 
 ```javascript
-const domStorageAdapter = {
+const legacyFormAdapter = {
   async getOutboxIds() {
-    // If the page has an immutable snapshot ID displayed, treat its ID as the outbox
+    // Only offer an already-snapshotted, immutable record ID rendered by the backend
     const snapshotId = document.getElementById('current-snapshot-id')?.value;
     return snapshotId ? [snapshotId] : [];
   },
 
   async getMessage(id) {
-    const title = document.getElementById('record-title')?.innerText;
+    const snapshotId = document.getElementById('current-snapshot-id')?.value;
+    if (snapshotId !== id) return null;
+
+    const title = document.getElementById('record-title')?.textContent || '';
     const fileInput = document.getElementById('existing-file-upload');
     const files = fileInput && fileInput.files.length > 0 ? Array.from(fileInput.files) : [];
 
@@ -326,76 +351,65 @@ const domStorageAdapter = {
     return {
       id: id,
       payload: { title: title },
-      attachments: files // Native File objects directly from the browser input
+      attachments: files
     };
   },
 
   async getAcceptance(ids) {
-    // Illustrative client-side batch check (production apps should query their backend's durable Accepted Set)
-    const results = Object.create(null);
-    for (const id of ids) {
-      results[id] = { accepted: localStorage.getItem(`accepted_${id}`) !== null };
-    }
-    return results;
+    // Query the legacy backend's durable Accepted Set (e.g. a UNIQUE message_id column)
+    const res = await fetch('/legacy/check-imported-ids', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ids })
+    });
+    if (!res.ok) throw new Error(`Acceptance check failed (${res.status})`);
+    return (await res.json()).results;
   },
 
   async acceptMessage(msg) {
-    // INBOX: Populate the legacy app's existing form and submit it!
+    // Submit complete message + files to the legacy backend's durable import handler.
+    // IMPORTANT: Never return `{ accepted: true }` merely for populating unsaved DOM fields!
     const form = document.getElementById('legacy-import-form');
     if (!form) return { accepted: false };
 
-    // Fill hidden or visible input fields
-    document.getElementById('import-doc-id').value = msg.id;
-    document.getElementById('import-payload-json').value = JSON.stringify(msg.payload);
-
-    // Or submit via classic FormData to the legacy system's existing handler
-    const data = new FormData(form);
+    const data = new FormData();
+    data.append('umai_message_id', msg.id);
+    data.append('payload_json', JSON.stringify(msg.payload));
     for (const file of msg.attachments) {
       data.append('uploaded_file', file, file.name);
     }
-    
+
     const response = await fetch(form.action, { method: form.method || 'POST', body: data });
-    if (response.ok) {
-      localStorage.setItem(`accepted_${msg.id}`, 'true');
-      return { accepted: true };
-    }
-    return { accepted: false };
+    if (!response.ok) return { accepted: false };
+    return { accepted: true };
   },
 
   async onAcknowledged(ids) {
-    // Show visual checkmark in the legacy UI
-    for (const id of ids) {
-      const row = document.getElementById(`record-row-${id}`);
-      if (row) row.classList.add('synced');
-    }
+    // Mark the snapshot as delivered on the backend so it is no longer offered
+    const res = await fetch('/legacy/mark-delivered', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ids })
+    });
+    if (!res.ok) throw new Error(`Failed marking delivered (${res.status})`);
   }
 };
 ```
 
-> [!NOTE]
-> **Caveat on Pure Client-Side Acceptance Tracking (`localStorage`):**
-> Storing accepted IDs in browser `localStorage` is convenient for rapid prototyping, but if a user clears browser site data or switches computers, `localStorage` is lost. Production integrations should persist accepted Message IDs on the backend (e.g., via a `UNIQUE` column in the legacy form handler or Pattern 5/6 below) so Rule 5 deduplication survives across browsers and machines.
+> [!WARNING]
+> **Preserve the Durable Meaning of `ACK`:**
+> Returning `{ accepted: true }` emits `ACK`, authorizing the sender to delete its outgoing copy (Rule 6). Never return `{ accepted: true }` for temporary in-memory DOM pre-fills before the backend has durably saved the message and recorded `msg.id` in its Accepted Set, and avoid relying on browser `localStorage` for production acceptance tracking (clearing browser data or switching devices loses `localStorage` state).
 
 ---
 
-### Pattern 2: Pure Client-Side / Offline Storage (IndexedDB or File System)
+### Pattern 2: Offline-First Client-Side Applications (`IndexedDB`)
 
-For offline-first applications, Progressive Web Apps (PWAs), or environments where files should be saved directly to the user's desktop without touching an intermediary application server:
+For genuinely local-first Progressive Web Apps (PWAs) where the browser's `IndexedDB` **is** the application's primary durable store:
 
-- **Storage via `IndexedDB`:** Incoming messages and binary files (`File` / `Blob`) are stored directly in the browser's persistent client-side database.
-- **Direct Local Disk Access (File System Access API):**
-  ```javascript
-  async function acceptMessage(msg) {
-    // Prompt or save directly to a local directory selected by the user
-    for (const file of msg.attachments) {
-      const handle = await window.showSaveFilePicker({ suggestedName: file.name });
-      const writable = await handle.createWritable();
-      await writable.write(file);
-      await writable.close();
-    }
-    return true;
-  }
-  ```
+- Commit both the incoming message (`payload` + `Blob`/`File` objects) and the Accepted Set entry (`accepted_messages` object store keyed by `id`) inside **a single `readwrite` `IndexedDB` transaction**, resolving `acceptMessage(msg)` with `{ accepted: true }` only inside `tx.oncomplete`.
+- Query that same `accepted_messages` object store inside `getAcceptance(ids)`.
+- **Operational boundary:** Client-only storage ties both message retention and acceptance records to that specific browser profile. If the user clears site storage, both are lost.
+- **Why ad-hoc `showSaveFilePicker` prompts are NOT a valid standalone `acceptMessage` implementation:** Saving files via a one-off browser file picker without recording `msg.id` in a durable Accepted Set breaks Rule 5 deduplication if `ACK` is lost, while returning `false` when a user cancels the picker enters `umai.js` transport failure/retry handling rather than acting as a clean "session-only" mode. If users want to save files to their desktop, accept the message into a durable Incoming Tray first (`ACK`), then offer a normal download/save button in your application UI.
 
 ---
 
@@ -410,15 +424,15 @@ The 5-method adapter simply calls your application's existing client services. N
 
 ---
 
-### Pattern 4: Dedicated Internal HTTP Endpoints (Reference Example)
+### Pattern 4: Dedicated Internal HTTP Endpoints (Shipped `pkg/umaiserver` Routes)
 
-If you *are* developing or extending an application backend and want a clean, dedicated set of internal routes, you can implement lightweight internal endpoints as done in the UMAI reference demo (`examples/app-a` and `examples/app-b`):
+If you are developing or extending an application backend and want a dedicated set of internal routes matching the UMAI reference server (`pkg/umaiserver`, used by `examples/app-a` and `examples/app-b`), `pkg/umaiserver` exposes:
 
-1. `GET /api/outbox`: Returns pending message IDs.
-2. `GET /api/outbox/{id}` & `/files/{name}`: Fetches metadata and streams attachments to the browser.
-3. `POST /api/inbox/acceptance`: Checks a batch of `ids` against the durable Accepted Set in one call, returning `{ results: { [id]: { accepted: boolean, ack_receipt?: string } } }` for every requested ID.
-4. `POST /api/inbox/accept`: Receives a standard multipart form with files and persists them atomically to your database or document store.
-5. `POST /api/outbox/acknowledge`: Marks message IDs as acknowledged.
+1. `GET /api/outbox`: Returns pending outbox message objects (`[{ id, ... }]`).
+2. `GET /api/outbox/{id}` & `GET /api/outbox/{id}/attachments/{filename}`: Fetches message metadata and streams each attachment to the browser (every attachment declared in metadata must succeed as a complete download before assembling a `PUT`).
+3. `POST /api/inbox/acceptance`: Checks a batch of `{ "ids": [...] }` against the durable Accepted Set in one call, returning `{ "results": { [id]: { "accepted": boolean, "ack_receipt"?: string } } }` for every requested ID.
+4. `POST /api/inbox`: Receives a `multipart/form-data` upload (`id`, JSON string `payload`, optional `signature`, and `attachments` file parts) and persists it atomically, returning `{ "accepted": true, "ack_receipt": "..." }`.
+5. `POST /api/outbox/ack`: Verifies `{ "ids": [...], "receipts": { ... } }` and removes acknowledged messages from the outbox.
 
 > [!NOTE]
 > Even in this pattern, these endpoints **only talk to the user's existing, authenticated browser session** via standard internal cookies or headers. They never talk directly to the peer server over the network. Zero firewall rules, zero public exposure, and zero cross-network tunnels.
@@ -468,10 +482,17 @@ When `POST /api/inbox/accept` is called by `acceptMessage(msg)`:
 Many existing specialty or packaged applications already exchange data via local "hot folders" (file spools) or local REST calls and prefer not to add UMAI endpoints directly to their core web application. You can run our Go server (`pkg/umaiserver`) as a **standalone sidecar / file-spool bridge**:
 
 - **How It Works:** Your application embeds `pkg/umaiserver`'s `/sync.html` (or opens it as a companion window) and interacts with `pkg/umaiserver`'s local data directory (`./data/outbox/` and `./data/inbox/`) or localhost HTTP API.
-- **Preventing Partial-Read / Partial-Write Race Conditions & Hot-Folder Collisions on the File Spool:**
+- **Directory Ownership, Direct Filesystem Publication & Inbox Consumption Rules:**
   1. **Collision-Resistant Internal Directory Keys (`m-<sha256(id)>`):** Because valid protocol Message IDs are case-sensitive (`CaseID` vs `caseid`) and may coincide with OS-reserved names on Windows (`CON`, `NUL`, trailing dots), `pkg/umaiserver` stores all messages under collision-resistant internal directory keys `inbox/m-<sha256(id)>/` and `outbox/m-<sha256(id)>/` (`StorageDirKey(id)`), keeping the exact protocol `id` inside `message.json` and verifying `msg.ID == id` on every read.
-  2. **Incoming Messages & Hot-Folder Deletion Rule (`.staging/` → `.committing/` → `accepted.json` + `fsync(dataDir)` → `inbox/`):** `pkg/umaiserver` stages incoming attachments and `message.json` inside `.staging/` (`O_EXCL` + `fsync`), verifies any `Ed25519` signature, moves the staged directory into `.committing/m-<sha256(id)>/`, atomically persists the consolidated `accepted.json` index (`id -> ack_receipt`), **synchronizes `dataDir`**, and **only then** atomically renames the directory into `inbox/m-<sha256(id)>/`, synchronizes `inboxDir`, and marks acceptance confirmed. If directory synchronization fails, the staged copy remains inside `.committing/` (hidden from `inbox/` consumers) and acceptance stays unconfirmed until synchronization succeeds. Consequently, external consumers polling `inbox/` never observe partial or un-flushed commits and **may safely archive or delete any directory visible inside `inbox/` after importing it**, provided they never delete or modify `accepted.json`, `.staging/`, or `.committing/`.
-  3. **Outgoing Messages (`outbox/`):** When your external process creates an outgoing message on disk, either call `POST /api/docs` + `POST /api/outbox` (recommended; stages, signs, and renames atomically into `outbox/m-<sha256(id)>/`) **or** stage the directory inside `.staging/` first (writing all files in `attachments/` and `message.json` before atomically `rename()`-ing the completed directory into `outbox/m-<sha256(id)>/`). As an additional safeguard, `pkg/umaiserver` verifies that `message.json` is valid and that every listed attachment exists as a regular file with its exact declared byte size before offering the message ID via `OFFER`.
+  2. **Server-Owned Internal Directories (`.staging/` & `.committing/` — Hands Off!):** `.staging/` and `.committing/` inside `dataDir` belong exclusively to `pkg/umaiserver`. On startup (`NewStorage`), the server **deletes `.staging/` completely** and reconciles/cleans `.committing/`. External producers and consumers MUST NEVER stage, read, modify, or delete files inside `.staging/`, `.committing/`, or `accepted.json`.
+  3. **Direct Filesystem Publication Contract (`outbox/`):** When an external process publishes an outgoing message:
+     - **Via HTTP:** Call `POST /api/docs` + `POST /api/outbox`, which snapshots attachments, computes SHA-256 digests and `UMAI-PUT-V1` signatures, `fsync`s files, and atomically publishes `outbox/m-<sha256(id)>/`.
+     - **Direct Filesystem Publication:** Prepare the complete message directory (`attachments/<sanitized_name>` + `message.json` with exact byte sizes, SHA-256 hashes, and required `UMAI-PUT-V1` signature) inside a **separate producer-owned staging directory on the same filesystem** (outside `outbox/`, `inbox/`, `.staging/`, and `.committing/`). Close and `fsync` all files and their parent directories according to your filesystem durability model, verify `outbox/m-<sha256(id)>/` does not already exist (never overwrite or modify a published message in place), publish via a single atomic directory `rename()` into `outbox/m-<sha256(id)>/`, and `fsync(outbox/)`. Only published messages may be offered (`pkg/umaiserver`'s attachment existence and size checks in `ListOutboxForSession` supplement atomic publication; they do not replace it).
+  4. **Incoming Messages & Idempotent Inbox Consumption (`inbox/`):**
+     - `pkg/umaiserver` commits incoming messages in four stages: `.staging/` → `.committing/m-<sha256(id)>/` → `accepted.json` (`id -> ack_receipt`) + `fsync(dataDir)` → `inbox/m-<sha256(id)>/` + `fsync(inbox/)`. External consumers polling `inbox/` never observe partial or un-flushed commits.
+     - Consumers **may archive or delete `inbox/m-<sha256(id)>/` after successful import or deliberate discard**, while leaving `accepted.json` intact so `pkg/umaiserver` continues to recognize the accepted ID and repeat `ACK`s (Rule 5).
+     - **Downstream business imports MUST be idempotent by `message.id`:** UMAI deduplicates transport delivery, not distributed transactions in an external business database. If your consumer crashes *after* importing a message into its database *before* deleting `inbox/m-<sha256(id)>/`, the directory will still be present on restart.
+     - **Single-Consumer or Atomic Claiming:** Operate either a single inbox consumer process or claim each directory atomically (`rename("inbox/m-<sha256(id)>", "<consumer-processing-dir>/m-<sha256(id)>")` on the same filesystem) before importing so concurrent workers cannot import the same message twice.
 
 ---
 
@@ -533,7 +554,38 @@ const umai = new UMAI.UmaiSession({
 
 ---
 
-## 7. Browser Security, CSP & Cross-Origin Cookie Checklist
+## 7. Handling Oversized Documents: Small Notification & Manual Authenticated Pickup
+
+UMAI transfers complete logical messages in memory over a browser `MessagePort` (`50 MiB` default combined payload + attachment limit in `js/umai.js`; `100 MiB` default `MaxUploadSize` in `pkg/umaiserver`). Rather than raising in-memory limits arbitrarily for rare multi-hundred-megabyte or multi-gigabyte files, applications should use the **Small Notification + Manual Authenticated Pickup** pattern:
+
+1. **Transfer Ordinary Messages Directly:** Send standard documents and structured records within configured size limits directly as UMAI messages.
+2. **Keep Oversized Files at the Source & Send a Small Notification Message:**
+   - Retain the oversized file inside the source application's normal authenticated interface.
+   - Publish a small UMAI notification message **with its own distinct Message ID** (and zero binary attachments) whose `payload` describes the available pickup:
+     ```json
+     {
+       "kind": "manual_pickup_available",
+       "document_ref": "doc-2026-9941",
+       "title": "Site Survey Orthophoto Archive.zip",
+       "byte_size": 1845493760,
+       "pickup_url": "https://app-a.company.com/cases/9941/downloads/doc-2026-9941"
+     }
+     ```
+3. **`ACK` Confirms the Notification Only — Never Delete the Referenced File on `ACK`:**
+   - When the receiving application accepts the notification into its Incoming Tray, the resulting UMAI `ACK` confirms receipt of **the notification message only**.
+   - `ACK` does **not** confirm that the user has downloaded or imported the referenced oversized document, and **must never** trigger automatic deletion of the oversized file on the source server.
+4. **Security, Snapshot & Lifecycle Boundaries to Keep Explicit:**
+   - **Source Authorization Enforced:** Opening `pickup_url` navigates to the source application, which enforces its own normal user authentication and access control before serving the file.
+   - **Snapshot & Retention Semantics Belong to the Source Application:** Unlike inline UMAI attachments, a URL/ID reference does not automatically guarantee an immutable byte snapshot or permanent availability unless the source application explicitly snapshots and retains referenced documents according to its own retention policy.
+   - **Clear UI State Distinction:** Application UIs should clearly distinguish four distinct states for users:
+     1. **Transferred via UMAI** (complete payload and attachments delivered automatically).
+     2. **Manual Pickup Available** (notification delivered; user opens the authenticated source link to download/upload the oversized file).
+     3. **Unsupported Size** (local outgoing item exceeds the configured UMAI transfer limit and requires manual pickup).
+     4. **Transfer Failure** (technical validation, storage, or retry-cutoff error requiring attention).
+
+---
+
+## 8. Browser Security, CSP & Cross-Origin Cookie Checklist
 
 When integrating two applications running on different origins (`https://app-a.company.com` and `https://app-b.company.org`) with separate user authentications, ensure your deployment satisfies these three browser security requirements:
 
@@ -573,7 +625,7 @@ Both applications must explicitly trust the specific peer origin (never use `*`)
 
 ---
 
-## 8. Integration Economics & Effort Estimate
+## 9. Integration Economics & Effort Estimate
 
 When a messaging platform (Application A) provides a ready-to-embed sync endpoint (`/sync.html`), an independently developed specialty application (Application B) with existing document/message tables can typically integrate UMAI in **4–7 developer-days**:
 
