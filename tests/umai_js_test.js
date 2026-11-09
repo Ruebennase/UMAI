@@ -447,9 +447,9 @@ function makeBatchAcceptance(fn) {
     assert.strictEqual(leakedPuts.length, 0, 'Pending getMessage from old generation must NOT transmit over replacement channel (C1)');
     genSender.stop();
 
-    // Also verify stop() during getAcceptance() prevents acceptMessage() from being called (C1)
+    // Verify stop() during OFFER getAcceptance() emits zero GET/ACK frames, and stop() during PUT acceptMessage() emits zero ACK frames (C1)
     let releaseGetAcceptance = null;
-    let acceptCalledAfterStop = false;
+    let releaseAcceptMessage = null;
     const stopRecChan = createMockChannel();
     const stopReceiver = new UmaiSession({
       peerOrigin: 'http://host.example',
@@ -464,8 +464,8 @@ function makeBatchAcceptance(fn) {
           return out;
         },
         acceptMessage: async () => {
-          acceptCalledAfterStop = true;
-          return { accepted: true };
+          await new Promise(r => { releaseAcceptMessage = r; });
+          return { accepted: true, ackReceipt: 'late-rec' };
         },
         onAcknowledged: async () => {}
       }
@@ -473,20 +473,28 @@ function makeBatchAcceptance(fn) {
     stopReceiver.port = stopRecChan.port1;
     stopRecChan.port1.onmessage = stopReceiver._portListener;
     stopReceiver.state = 'connected';
-    stopReceiver._inFlightGets.set('msg-stop-1', Date.now());
+    stopReceiver._peerOfferedOnce = true;
+    stopReceiver._handleOffer({
+      protocol: PROTOCOL_NAME,
+      version: PROTOCOL_VERSION,
+      type: 'OFFER',
+      ids: ['msg-stop-offer']
+    });
+    stopReceiver._inFlightGets.set('msg-stop-put', Date.now());
     stopReceiver._handlePut({
       protocol: PROTOCOL_NAME,
       version: PROTOCOL_VERSION,
       type: 'PUT',
-      id: 'msg-stop-1',
+      id: 'msg-stop-put',
       payload: {},
       attachments: []
     });
     await new Promise(r => setTimeout(r, 10));
     stopReceiver.stop();
     releaseGetAcceptance();
+    releaseAcceptMessage();
     await new Promise(r => setTimeout(r, 20));
-    assert.strictEqual(acceptCalledAfterStop, false, 'acceptMessage must not be called after stop() (C1)');
+    assert.strictEqual(stopRecChan.port1.sent.length, 0, 'No GET or ACK may be sent after stop() during in-flight getAcceptance/acceptMessage (C1)');
 
     // C2: Offer of 12 messages with default maxConcurrency=1 runs at most 1 acceptMessage at a time
     const batchIds = Array.from({ length: 12 }, (_, i) => `msg-batch-${i + 1}`);
@@ -1292,7 +1300,7 @@ function makeBatchAcceptance(fn) {
 
     assert.strictEqual(outageErrors.length, 4, 'All 4 failed/malformed lookup batches must report errors via onError');
     assert.strictEqual(rec9c._failedAttempts.size, 0, 'Lookup outages must NOT increment per-message _failedAttempts cutoff');
-    assert.strictEqual(outageLookupCalls, 6, 'Expected 4 failed batch lookups + 1 recovered batch lookup + 1 pre-acceptMessage [id] lookup (no flood)');
+    assert.strictEqual(outageLookupCalls, 5, 'Expected 4 failed batch lookups + 1 recovered batch lookup, with zero post-PUT getAcceptance calls');
 
     const recoveredAcks = chan9c.port2.sent.filter(m => m.type === 'ACK');
     const ackedIds9c = recoveredAcks.flatMap(a => a.ids);
@@ -1305,7 +1313,8 @@ function makeBatchAcceptance(fn) {
     sender9c.stop();
     rec9c.stop();
 
-    // --- 9d: Concurrent acceptance by another session on PUT + bounded _failedAttempts map (<= 1,000) ---
+    // --- 9d: Incoming PUT commits directly via idempotent acceptMessage() with ZERO post-PUT getAcceptance calls + bounded _failedAttempts map (<= 1,000) ---
+    let lookupCallsOnPut9d = 0;
     let acceptMessageCalledOnDup = false;
     const chan9d = createMockChannel();
     const rec9d = new UmaiSession({
@@ -1315,15 +1324,16 @@ function makeBatchAcceptance(fn) {
         getOutboxIds: async () => [],
         getMessage: async () => null,
         getAcceptance: async (ids) => {
+          lookupCallsOnPut9d++;
           const out = {};
           for (const id of ids) {
-            out[id] = { accepted: true, ackReceipt: 'concurrent-session-receipt' };
+            out[id] = { accepted: true, ackReceipt: 'unexpected-lookup-receipt' };
           }
           return out;
         },
         acceptMessage: async () => {
           acceptMessageCalledOnDup = true;
-          return { accepted: true };
+          return { accepted: true, ackReceipt: 'concurrent-session-receipt' };
         },
         onAcknowledged: async () => {}
       }
@@ -1341,10 +1351,11 @@ function makeBatchAcceptance(fn) {
       attachments: []
     });
     await new Promise(r => setTimeout(r, 20));
-    assert.strictEqual(acceptMessageCalledOnDup, false, 'Concurrent acceptance detected by getAcceptance([id]) must skip acceptMessage');
+    assert.strictEqual(lookupCallsOnPut9d, 0, 'Incoming PUT must NEVER perform a redundant post-PUT getAcceptance([id]) lookup');
+    assert.strictEqual(acceptMessageCalledOnDup, true, 'Incoming PUT must commit directly via idempotent storage.acceptMessage()');
     const acks9d = chan9d.port1.sent.filter(m => m.type === 'ACK');
     assert.strictEqual(acks9d.length, 1);
-    assert.strictEqual(acks9d[0].receipts['msg-concurrent-tab'], 'concurrent-session-receipt', 'Duplicate PUT check must forward stored ackReceipt');
+    assert.strictEqual(acks9d[0].receipts['msg-concurrent-tab'], 'concurrent-session-receipt', 'Idempotent acceptMessage() duplicate receipt must be forwarded in ACK');
 
     // Verify _setBoundedMap caps _failedAttempts to MAX_BATCH_IDS = 1,000 with FIFO eviction
     for (let m = 0; m < 1050; m++) {
@@ -1418,11 +1429,12 @@ function makeBatchAcceptance(fn) {
     );
     sender10a.stop();
 
-    // --- 10b: Incoming PUT duplicate checks respect lookup outage backoff (20-message reproduction) ---
+    // --- 10b: Zero post-PUT getAcceptance calls across 20 messages + in-flight PUT completes cleanly even while OFFER lookup backoff pauses new GETs ---
     const ids20 = Array.from({ length: 20 }, (_, i) => `msg-cascade-${i + 1}`);
     let lookupCalls10b = 0;
     let backendOutage10b = false;
     let putSentCount10b = 0;
+    let holdFirstPutSend = null;
     const accepted10b = new Set();
     const chan10b = createMockChannel();
 
@@ -1433,6 +1445,9 @@ function makeBatchAcceptance(fn) {
         getOutboxIds: async () => ids20.filter(id => !accepted10b.has(id)),
         getMessage: async (id) => {
           putSentCount10b++;
+          if (putSentCount10b === 1) {
+            await new Promise(r => { holdFirstPutSend = r; });
+          }
           return { id, payload: { seq: id }, attachments: [] };
         },
         getAcceptance: makeBatchAcceptance(() => ({ accepted: false })),
@@ -1454,15 +1469,11 @@ function makeBatchAcceptance(fn) {
         getAcceptance: async (ids) => {
           lookupCalls10b++;
           if (backendOutage10b) {
-            throw new Error('HTTP 503 Lookup Outage During PUT');
+            throw new Error('HTTP 503 OFFER Lookup Outage');
           }
           const out = Object.create(null);
           for (const id of ids) {
             out[id] = { accepted: accepted10b.has(id) };
-          }
-          // Flip backend into outage right after the initial 20-ID OFFER batch lookup succeeds!
-          if (lookupCalls10b === 1) {
-            backendOutage10b = true;
           }
           return out;
         },
@@ -1482,31 +1493,37 @@ function makeBatchAcceptance(fn) {
     rec10b.state = 'connected';
 
     await sender10b.reconcile(true);
-    // Wait 60ms (well inside the 180ms lookupRetryBaseMs window)
-    await new Promise(r => setTimeout(r, 60));
+    await new Promise(r => setTimeout(r, 20));
+    assert.strictEqual(lookupCalls10b, 1, 'Initial 20-ID OFFER must perform 1 batch getAcceptance call');
+    assert.strictEqual(putSentCount10b, 1, 'First GET must be in flight');
 
-    assert.strictEqual(
-      lookupCalls10b,
-      2,
-      `Expected only 1 initial OFFER batch lookup + 1 PUT duplicate lookup before backoff holds the queue, got ${lookupCalls10b}`
-    );
-    assert.strictEqual(
-      putSentCount10b,
-      1,
-      `Expected only 1 message payload transferred before lookup backoff pauses remaining 19 queued GETs, got ${putSentCount10b}`
-    );
-    assert.strictEqual(accepted10b.size, 0, 'Zero messages should be accepted while lookup outage is active');
+    // Trigger an OFFER lookup outage on a newly offered 21st ID while PUT #1 is in flight!
+    ids20.push('msg-cascade-21');
+    backendOutage10b = true;
+    await sender10b.reconcile(false);
+    await new Promise(r => setTimeout(r, 15));
+    assert.strictEqual(lookupCalls10b, 2, 'OFFER for msg-cascade-21 must fail and enter lookup backoff');
 
-    // Heal lookup backend before the 180ms backoff timer fires and verify all 20 messages complete automatically
+    // Now let PUT #1 arrive during active OFFER lookup backoff:
+    // PUT #1 MUST be accepted directly via acceptMessage() (zero getAcceptance calls!), while remaining 19 queued GETs stay paused during backoff!
+    holdFirstPutSend();
+    await new Promise(r => setTimeout(r, 40));
+
+    assert.strictEqual(lookupCalls10b, 2, 'Incoming PUT must NOT invoke getAcceptance([id])');
+    assert.strictEqual(accepted10b.has('msg-cascade-1'), true, 'Already-arrived PUT #1 must commit directly via acceptMessage despite active OFFER lookup backoff');
+    assert.strictEqual(putSentCount10b, 1, 'Remaining queued GETs must stay paused while OFFER lookup backoff is active');
+
+    // Heal lookup backend before the 180ms backoff timer fires and verify all 21 messages complete with zero post-PUT lookups
     backendOutage10b = false;
     await new Promise(r => setTimeout(r, 260));
 
-    assert.strictEqual(accepted10b.size, 20, `All 20 messages must recover and be accepted automatically once lookup heals (got ${accepted10b.size})`);
-    assert.strictEqual(rec10b.getSyncStatus().isSyncing, false, 'Receiver must return to in-sync state after all 20 messages complete');
+    assert.strictEqual(lookupCalls10b, 3, `Expected exactly 3 OFFER batch lookups total (zero post-PUT lookups across 21 messages), got ${lookupCalls10b}`);
+    assert.strictEqual(accepted10b.size, 21, `All 21 messages must recover and be accepted automatically once lookup heals (got ${accepted10b.size})`);
+    assert.strictEqual(rec10b.getSyncStatus().isSyncing, false, 'Receiver must return to in-sync state after all 21 messages complete');
     sender10b.stop();
     rec10b.stop();
   }
-  console.log('✓ Test 10: Slow outbox non-starvation under heartbeat and PUT lookup-backoff cascade prevention passed');
+  console.log('✓ Test 10: Slow outbox non-starvation under heartbeat and direct PUT acceptance without post-PUT lookup passed');
 
   // Test 11: Bidirectional Reconnect Churn (Repeated READY -> INIT -> INIT_ACK Handshakes) + Flaky Adapter Stress Test
   {
@@ -2200,8 +2217,7 @@ function makeBatchAcceptance(fn) {
       realMc.port2.close();
     }
 
-    // --- 13b: Deterministic session.stop() between _queryValidatedAcceptance resolution and caller continuation ---
-    let acceptCalledAfterStop13b = false;
+    // --- 13b: Deterministic session.stop() between _queryValidatedAcceptance resolution and _drainPendingOffers continuation ---
     let resolveLookup13b = null;
     let lookupPromise13b = null;
     const chan13b = createMockChannel();
@@ -2218,45 +2234,41 @@ function makeBatchAcceptance(fn) {
           });
           return lookupPromise13b;
         },
-        acceptMessage: async () => {
-          acceptCalledAfterStop13b = true;
-          return { accepted: true };
-        },
+        acceptMessage: async () => ({ accepted: true }),
         onAcknowledged: async () => {}
       }
     });
     rec13b.port = chan13b.port1;
     chan13b.port1.onmessage = rec13b._portListener;
     rec13b.state = 'connected';
-    rec13b._inFlightGets.set('msg-interleave-stop', Date.now());
+    rec13b._peerOfferedOnce = true;
 
-    const putPromise13b = rec13b._handlePut({
+    const offerPromise13b = rec13b._handleOffer({
       protocol: PROTOCOL_NAME,
       version: PROTOCOL_VERSION,
-      type: 'PUT',
-      id: 'msg-interleave-stop',
-      payload: { ok: true },
-      attachments: []
+      type: 'OFFER',
+      ids: ['msg-interleave-stop']
     });
     await new Promise(r => setTimeout(r, 5));
-    assert.strictEqual(typeof resolveLookup13b, 'function', 'PUT duplicate lookup must be awaiting lookupPromise13b');
+    assert.strictEqual(typeof resolveLookup13b, 'function', 'OFFER batch lookup must be awaiting lookupPromise13b');
 
     // Attach a .then() reaction on lookupPromise13b AFTER _queryValidatedAcceptance's internal `await`:
     // Microtask 1 runs _queryValidatedAcceptance's post-await (while session is still connected!) and resolves outer helper promise;
-    // Microtask 2 runs rec13b.stop() BEFORE Microtask 3 resumes _processIncomingPutQueue!
+    // Microtask 2 runs rec13b.stop() BEFORE Microtask 3 resumes _drainPendingOffers!
     lookupPromise13b.then(() => {
       rec13b.stop();
     });
     resolveLookup13b({ 'msg-interleave-stop': { accepted: false } });
-    await putPromise13b;
+    await offerPromise13b;
     await new Promise(r => setTimeout(r, 15));
 
     assert.strictEqual(rec13b.state, 'disconnected', 'Session must be disconnected');
     assert.strictEqual(
-      acceptCalledAfterStop13b,
-      false,
-      'storage.acceptMessage() must NEVER start when stop() fires between lookup helper return and caller continuation'
+      chan13b.port1.sent.length,
+      0,
+      'Zero GET or ACK frames may be sent when stop() fires between lookup helper return and _drainPendingOffers continuation'
     );
+    assert.strictEqual(rec13b._pendingGetQueue.length, 0, '_pendingGetQueue must remain empty after stop()');
 
     // --- 13c: Stale Generation A lookup completion (resolve & reject) must NOT erase Generation B reservations ---
     for (const mode of ['resolve', 'reject']) {

@@ -1317,14 +1317,13 @@
     }
 
     /**
-     * Shared fail-closed batch acceptance lookup helper used by both OFFER batch draining
-     * and incoming PUT duplicate verification:
+     * Fail-closed OFFER batch acceptance lookup helper:
      * - Records lookup start timestamp (`_lastLookupStartedAt`) for lookup rate pacing.
      * - Invokes `storage.getAcceptance(ids)` with a defensive copy and validates the complete
      *   batch via `validateBatchAcceptance` (failing closed if any requested ID is missing or malformed).
      * - Resets lookup outage backoff counters on success, or delegates to `_recordLookupFailure` on error.
      */
-    async _queryValidatedAcceptance(queryIds, gen = this._generation, port = this.port, onBeforeFailure = null) {
+    async _queryValidatedAcceptance(queryIds, gen = this._generation, port = this.port) {
       if (!this._isGenerationActive(gen, port) || !Array.isArray(queryIds) || queryIds.length === 0) {
         return null;
       }
@@ -1361,9 +1360,6 @@
       } catch (err) {
         if (this._isGenerationActive(gen, port)) {
           releaseReserved();
-          if (typeof onBeforeFailure === 'function') {
-            onBeforeFailure();
-          }
           this._recordLookupFailure(queryIds, err, gen, port);
         }
         return null;
@@ -1964,54 +1960,8 @@
           return;
         }
 
-        // Duplicate check: respect active lookup outage backoff before calling getAcceptance([id])
-        if (this._isLookupBackoffActive()) {
-          this._acceptingIds.delete(id);
-          this._requeueUnresolvedId(id);
-          if (!this._lookupTimer) {
-            this._schedulePendingOfferDrain(this._nextLookupAllowedAt - Date.now(), gen, port);
-          }
-          return;
-        }
-
-        const validatedLookup = await this._queryValidatedAcceptance(
-          [id],
-          gen,
-          port,
-          () => { this._acceptingIds.delete(id); }
-        );
-        if (!validatedLookup || !this._isGenerationActive(gen, port)) {
-          return;
-        }
-
-        const alreadyAcc = validatedLookup[id];
-        if (alreadyAcc.accepted) {
-          this._failedAttempts.delete(id);
-          this._timedOutGets.delete(id);
-          this._expiredGets.delete(id);
-          this._deferredOfferIds.delete(id);
-          this.log('info', `Message ${id} already accepted; sending ACK without re-importing`);
-          if (!this._isGenerationActive(gen, port)) {
-            return;
-          }
-          const receipts = Object.create(null);
-          if (alreadyAcc.ackReceipt) {
-            receipts[id] = alreadyAcc.ackReceipt;
-          }
-          const ackMsg = {
-            protocol: PROTOCOL_NAME,
-            version: PROTOCOL_VERSION,
-            type: 'ACK',
-            ids: [id],
-            receipts: receipts
-          };
-          if (this._sendToPort(ackMsg, gen, port)) {
-            this._emitTransfer({ direction: 'outgoing', type: 'ACK', ids: [id], repeated: true });
-          }
-          return;
-        }
-
-        // Rule 3 & 4: Attempt atomic acceptance with normalized JSON payload
+        // Rules 3, 4 & 5: Commit complete message via atomic, idempotent storage.acceptMessage()
+        // directly (without a redundant post-PUT getAcceptance([id]) round-trip).
         const acceptRes = parseAcceptanceResult(await this.storage.acceptMessage({
           id: id,
           payload: payload,
